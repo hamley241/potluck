@@ -27,7 +27,9 @@ tiebreaker are resolved from **what you have installed and want to use**:
 | tiebreaker | Kimi      | a Claude model       |
 
 `potluck resolve` detects what's on the machine and asks, per external model,
-whether to use it (local CLI or API key). Four outcomes, all valid:
+whether to use it. v1 drives each model through its **local CLI**; if you pick
+"API key" for a model whose CLI isn't installed, that's a documented seam that
+isn't wired yet (see Seams) and resolution tells you so. Four outcomes, all valid:
 
 ```
 all three available   →  doer=Claude   reviewer=Codex    tiebreaker=Kimi
@@ -37,7 +39,10 @@ Claude only            →  doer=Claude   reviewer=Claude   tiebreaker=Claude
 ```
 
 **The Claude-only floor always works** — one `claude` CLI, three distinct models
-across the roles. But be honest about what it buys you: three Claude models share
+across the roles: the doer on your session's default (e.g. Opus), the reviewer on
+Sonnet, the tiebreaker on Haiku. These are passed as `--model` aliases to your
+`claude` CLI; if your account can't reach one, that call escalates as "no signal"
+(never a silent approval). But be honest about what it buys you: three Claude models share
 a lineage, so their mistakes are **correlated**. A fresh-context Claude reviewer
 still catches plenty (it never saw the doer write the code). Adding Codex/Kimi is
 a real upgrade in *independence* — foreign models fail differently, so they catch
@@ -66,15 +71,18 @@ reviewer is the ceiling.
    when the review is clean. The cap is a ceiling, not a target.
 2. **Structured verdicts** — every cross-model exchange is typed JSON
    (`schemas.py`), so deadlock is *detected*, not guessed.
-3. **Human escalation on disagreement** — unresolved blocking issues after the
-   cap are surfaced to you, never silently resolved in either model's favor.
+3. **Human escalation on genuine deadlock** — after the cap, if the tiebreaker
+   forms a 2-of-3 majority the issue resolves (per flow step 6); only a true
+   split — no majority — is surfaced to you, never silently resolved in either
+   model's favor.
 4. **Timeout-with-escalation on hangs** — every external wait is time-boxed; one
    timeout retries transparently, repeated timeouts escalate (scattered slowness
    vs. the same step hanging repeatedly are distinguished). A timeout is **never**
    a verdict — a timed-out review is "no signal", not "approved".
 
-All four are verified in `harness/test_orchestrator.py` (8 cases, no real model
-calls). Model resolution is verified in `harness/test_resolve.py` (8 cases).
+All four are verified in `harness/test_orchestrator.py` (10 cases, no real model
+calls). Model resolution is verified in `harness/test_resolve.py` (12 cases), and
+subprocess cleanup in `harness/test_runner.py`.
 
 ## Layout
 
@@ -88,27 +96,72 @@ harness/                 the invariant core (Python)
   cli.py                 `potluck fix | resolve | doctor`
   test_orchestrator.py   control-logic tests (run first, always)
   test_resolve.py        model-resolution tests
+  test_runner.py         subprocess timeout/cleanup test
 base/                    synced to every device
   rules/                 always-follow guardrails (anti-gaming)
   commands/              /bugfix, /harness-bugfix slash commands
   hooks/                 pre-tool-secret-scan.py — outbound tripwire (secrets+PII)
 profiles/  personal/ phi/ ci/    per-environment overlays (config only)
 potluck                  CLI wrapper (symlinked onto PATH by setup.sh)
+test                     runs all suites via uv (no pytest/venv setup)
 setup.sh                 symlink base + profile into ~/.claude, then resolve
 verify.sh.example        per-PROJECT gate template (copy into each project repo)
 ```
 
+## Prerequisites
+
+- **[uv](https://docs.astral.sh/uv/)** — the only toolchain dependency. `potluck`
+  and `./test` run through `uv run`, which fetches Python 3.11 and pydantic for
+  you, so you don't install those separately.
+- **git** and a **Unix shell (bash)** — macOS or Linux; Windows needs WSL.
+- **[Claude Code](https://claude.com/claude-code) CLI (`claude`)** — required: it
+  is the doer and the fallback for every role. Authenticate it once.
+- **Codex and/or Kimi CLIs** — *optional*. If on your `PATH` (or, on macOS, in
+  their app-bundle default locations) they're auto-detected and offered as the
+  reviewer/tiebreaker. Without them, potluck falls back to Claude models.
+  Authenticate each one you enable.
+
 ## Getting started
 
 ```bash
-git clone <repo> && cd potluck
-./setup.sh personal            # symlinks + interactive model resolution
+git clone https://github.com/hamley241/potluck && cd potluck
+./setup.sh personal            # read "What setup.sh touches" below first
 potluck doctor                 # confirm which models back each role
 
-# run the loop inside any project that has .claude/verify.sh
+# each project you run in needs a gate script:
 cd your-project
+cp /path/to/potluck/verify.sh.example .claude/verify.sh
+$EDITOR .claude/verify.sh       # fill in your test/lint/build commands; exit 0 = pass
+
 potluck fix --spec "Fix the pagination off-by-one" --acceptance "tests pass"
 ```
+
+> **What `setup.sh` touches.** It symlinks `rules/`, `commands/`, and `hooks/`
+> into `~/.claude`, **replacing** any existing symlinks of those names — back up
+> your own Claude config first. It also symlinks the `potluck` CLI into
+> `~/.local/bin` (make sure that's on your `PATH`). To try it without touching
+> your real config: `CLAUDE_HOME=~/.potluck-home ./setup.sh personal`. The
+> `potluck` CLI works straight from the clone without `setup.sh` — setup only
+> adds it to `PATH` and installs the slash commands.
+
+A successful run looks like:
+
+```text
+$ potluck fix --spec "add() subtracts instead of adding; fix to sum" --acceptance "tests pass"
+potluck: profile=personal, debate=on, max_rounds=2
+roles: reviewer=codex, tiebreaker=kimi
+...
+============================================================
+  PASSED  |  Rounds: 0
+============================================================
+Debate log:
+  [gate] {"label": "initial", "passed": true}
+  [early_exit] {"reason": "no_blocking_or_major"}
+```
+
+An unresolved review or an unavailable model instead ends in `ESCALATED (...)`
+with a one-line reason; the diff and debate log are left in place for you to
+judge. A non-answer is never silently treated as "approved".
 
 Re-run `potluck resolve` on each machine (`--auto` uses everything detected,
 `--claude-only` forces the floor). **Credentials and machine-local model paths
@@ -139,6 +192,10 @@ on every new machine to confirm the core is intact before trusting a real run.
 - **API-key backends** — `resolve.py` wires the *local CLI* for Codex/Kimi. When
   a model is chosen as "API key" but no CLI is installed, that direct-API path is
   a documented seam, not yet wired — surfaced at resolve time rather than faked.
+- **Large prompts via argv** — the Kimi backend passes its prompt as a command
+  argument, so a very large diff can exceed the OS `ARG_MAX` limit. This surfaces
+  as a clean `escalated_no_signal` (the tiebreak is skipped, never a crash or a
+  false approval); Codex and Claude use stdin and aren't affected.
 - **Divergent work** (architecture / research) is intentionally out of scope:
   potluck v1 writes code against a deterministic gate. Design review — where two
   models can agree a bad idea is good — needs a different shape and stays a human
