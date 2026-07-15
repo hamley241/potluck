@@ -120,7 +120,8 @@ class HarnessConfig:
                 cfg._apply(tomllib.load(f))
         # Machine-local model resolution takes precedence over the profile.
         if resolved_path is None:
-            resolved_path = Path(__file__).parent.parent / ".resolved.toml"
+            from .paths import resolved_path as _default_resolved
+            resolved_path = _default_resolved()
         if resolved_path and resolved_path.exists():
             with open(resolved_path, "rb") as f:
                 cfg._apply(tomllib.load(f))

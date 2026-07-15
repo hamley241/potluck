@@ -193,8 +193,9 @@ def check_models(models) -> list[str]:
 def render_resolved_toml(roles: dict[str, Backend]) -> str:
     return (
         "# Machine-local model resolution -- written by `potluck resolve`.\n"
-        "# Gitignored on purpose: paths differ per machine, like credentials.\n"
-        "# Re-run `potluck resolve` on each machine; do not commit this file.\n\n"
+        "# Lives in your user config dir (~/.config/potluck), not the source tree:\n"
+        "# paths differ per machine, like credentials. Re-run `potluck resolve`\n"
+        "# on each machine; never commit this file.\n\n"
         "[models.reviewer]\n"
         f"{roles['reviewer'].as_toml_table()}\n"
         "[models.tiebreaker]\n"
@@ -203,11 +204,13 @@ def render_resolved_toml(roles: dict[str, Backend]) -> str:
 
 
 def resolved_path() -> Path:
-    return Path(__file__).parent.parent / ".resolved.toml"
+    from .paths import resolved_path as _rp
+    return _rp()
 
 
 def write_resolved(roles: dict[str, Backend], path: Path | None = None) -> Path:
     path = path or resolved_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_resolved_toml(roles))
     return path
 

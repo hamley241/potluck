@@ -43,9 +43,10 @@ from . import resolve as resolve_mod
 # ---------------------------------------------------------------------------
 
 def load_config(args) -> HarnessConfig:
+    from . import paths
     profile_path = None
     if hasattr(args, "profile") and args.profile:
-        named = Path(__file__).parent.parent / "profiles" / args.profile / "profile.toml"
+        named = paths.profiles_dir() / args.profile / "profile.toml"
         if named.exists():
             profile_path = named
         else:
@@ -169,6 +170,51 @@ def add_doctor_parser(subparsers):
     p.set_defaults(func=lambda a: sys.exit(resolve_mod.cmd_doctor()))
 
 
+def add_setup_parser(subparsers):
+    p = subparsers.add_parser(
+        "setup",
+        help="Install slash commands/hooks/rules into ~/.claude, then resolve models")
+    p.add_argument("--claude-home", type=str, default=None,
+                   help="Target config dir (default: $CLAUDE_HOME or ~/.claude)")
+    p.add_argument("--auto", action="store_true", help="Resolve with everything detected")
+    p.add_argument("--claude-only", action="store_true", help="Resolve to the Claude-only floor")
+    p.set_defaults(func=cmd_setup)
+
+
+def cmd_setup(args):
+    """Install the ~/.claude assets from the packaged base/, then resolve models.
+
+    This is the tool-install counterpart to setup.sh (which symlinks from a
+    clone). It COPIES base/{rules,commands,hooks} file-by-file, so it merges
+    into an existing ~/.claude instead of replacing whole directories.
+    """
+    import os
+    import shutil
+    from . import paths
+
+    dest = Path(args.claude_home or os.environ.get("CLAUDE_HOME")
+                or os.path.join(os.path.expanduser("~"), ".claude"))
+    base = paths.base_dir()
+    if not base.is_dir():
+        print(f"error: packaged assets not found at {base}", file=sys.stderr)
+        sys.exit(1)
+
+    dest.mkdir(parents=True, exist_ok=True)
+    for sub in ("rules", "commands", "hooks"):
+        src = base / sub
+        if not src.is_dir():
+            continue
+        (dest / sub).mkdir(parents=True, exist_ok=True)
+        for f in sorted(src.iterdir()):
+            if f.is_file():
+                shutil.copy2(f, dest / sub / f.name)
+        print(f"  installed {sub}/ → {dest / sub}")
+
+    print(f"\nAssets installed into {dest}. Restart Claude Code to pick up new commands.\n")
+    rc = resolve_mod.cmd_resolve(auto=args.auto, claude_only=args.claude_only)
+    sys.exit(rc)
+
+
 # ---------------------------------------------------------------------------
 # main — dispatch
 # ---------------------------------------------------------------------------
@@ -182,6 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_fix_parser(sub)
     add_resolve_parser(sub)
     add_doctor_parser(sub)
+    add_setup_parser(sub)
 
     # Backward compat: top-level --spec still works (maps to fix)
     p.add_argument("--spec", type=str, default=None, help=argparse.SUPPRESS)

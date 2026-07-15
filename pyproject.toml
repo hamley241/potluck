@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "potluck"
+version = "0.1.0"
+description = "Multi-model code-writing harness — bring whatever models you have (Claude, Codex, Kimi)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Goutham Patley" }]
+keywords = ["claude", "codex", "kimi", "code-review", "agent", "harness"]
+dependencies = ["pydantic>=2"]
+
+[project.scripts]
+potluck = "harness.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/hamley241/potluck"
+Repository = "https://github.com/hamley241/potluck"
+
+[tool.hatch.build.targets.wheel]
+packages = ["harness"]
+
+# Ship profiles/ and base/ inside the package so a `uv tool install` has the
+# per-environment profiles and the ~/.claude assets `potluck setup` installs.
+[tool.hatch.build.targets.wheel.force-include]
+"profiles" = "harness/_data/profiles"
+"base" = "harness/_data/base"
