@@ -1,4 +1,4 @@
-# /harness-bugfix — run the full multi-model loop
+# /potluck — run the full multi-model loop
 
 Run the potluck orchestrator on the current project. This launches the full
 loop: Claude (doer) → gate → reviewer → debate → tiebreaker (if needed) →

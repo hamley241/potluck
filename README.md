@@ -41,7 +41,7 @@ potluck doctor           # confirm which model backs each role
 then runs model resolution. Restart Claude Code afterward to pick up the new
 commands. Override the target dir with `CLAUDE_HOME=… potluck setup`. To review
 or remove what it installed, look in `~/.claude/{commands,hooks,rules}` (potluck's
-files: `bugfix.md`, `harness-bugfix.md`, `pre-tool-secret-scan.py`, `no-*.md`);
+files: `potluck.md`, `potluck-bugfix.md`, `pre-tool-secret-scan.py`, `no-*.md`);
 re-run `potluck setup` to refresh them.
 
 **Alternative — from a clone (to hack on it):**
@@ -131,7 +131,7 @@ with a one-line reason; your changes and the debate log are left in place for yo
 to judge. A non-answer is never silently treated as "approved".
 
 **Inside Claude Code**, the same loop is one command (after `potluck setup` and a
-session restart): `/harness-bugfix <describe the bug>`. It shells out to
+session restart): `/potluck <describe the bug>`. It shells out to
 `potluck fix` in the current repo — which needs the same `.claude/verify.sh` gate
 — and summarizes the outcome back to you.
 
@@ -225,7 +225,7 @@ harness/                 the invariant core (Python)
   test_*.py              deterministic control-logic + resolution + runner tests
 base/                    installed into ~/.claude by setup
   rules/                 always-follow guardrails (anti-gaming)
-  commands/              /bugfix, /harness-bugfix slash commands
+  commands/              /potluck, /potluck-bugfix slash commands
   hooks/                 pre-tool-secret-scan.py — outbound tripwire (secrets+PII)
 profiles/  personal/ phi/ ci/    per-environment overlays (config only)
 pyproject.toml           packaging: `uv tool install`, ships base/ + profiles/

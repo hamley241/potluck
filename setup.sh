@@ -51,7 +51,7 @@ echo "Done. Active profile: $PROFILE"
 echo
 echo "To use potluck:"
 echo "  From a terminal:     cd your-project && potluck fix --spec 'Fix the bug'"
-echo "  From Claude Code:    /harness-bugfix Fix the pagination bug"
+echo "  From Claude Code:    /potluck Fix the pagination bug"
 echo "  Inspect model wiring: potluck doctor"
 echo
 echo "Reminder: authenticate each external model CLI on this machine (codex login, etc.)."

@@ -1,4 +1,4 @@
-# /bugfix — convergent bug-fix loop
+# /potluck-bugfix — convergent bug-fix loop
 
 Fix a bug under the harness's control guarantees. The defining gate for a bug
 fix is a FAILING TEST THAT REPRODUCES THE BUG turning green, plus the full suite
