@@ -164,6 +164,30 @@ def _model_suffix(b: Backend) -> str:
     return ""
 
 
+# --- health checks ---
+
+def check_backend(b: Backend) -> str | None:
+    """Return None if b's executable is runnable, else a short problem string."""
+    exe = b.cmd[0]
+    if "/" not in exe:
+        if shutil.which(exe) is None:
+            return f"{b.name}: '{exe}' not found on PATH"
+        return None
+    if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+        return f"{b.name}: '{exe}' is not an executable file"
+    return None
+
+
+def check_models(models) -> list[str]:
+    """Return problem strings for unhealthy backends; empty list means all healthy."""
+    problems = []
+    for b in (models.reviewer, models.tiebreaker):
+        msg = check_backend(b)
+        if msg is not None:
+            problems.append(msg)
+    return problems
+
+
 # --- writing the resolved plan ---
 
 def render_resolved_toml(roles: dict[str, Backend]) -> str:

@@ -14,6 +14,7 @@ binary), and the resolved plan must round-trip through .resolved.toml back into
 HarnessConfig.
 """
 
+import sys
 import tomllib
 import tempfile
 from pathlib import Path
@@ -21,6 +22,7 @@ from pathlib import Path
 from harness.resolve import (
     resolve_roles, render_resolved_toml, write_resolved, Backend,
     CLAUDE_REVIEWER_MODEL, CLAUDE_TIEBREAKER_MODEL,
+    check_backend, check_models,
 )
 from harness.config import HarnessConfig
 
@@ -146,6 +148,23 @@ def main():
     results["claude_reviewer_read_only"] = (
         "--tools" in cmd and cmd[cmd.index("--tools") + 1] == ""
     )
+
+    # 13. check_backend: missing absolute path returns a problem string.
+    broken = Backend("codex", ["/no/such/bin", "exec"], "codex_jsonl", stdin=True)
+    results["check_backend_missing_path"] = (check_backend(broken) is not None)
+
+    # 14. check_backend: real executable (sys.executable) returns None.
+    good = Backend("claude", [sys.executable, "-p"], "text", stdin=True)
+    results["check_backend_real_exe"] = (check_backend(good) is None)
+
+    # 15. check_models: one broken backend -> non-empty list.
+    from types import SimpleNamespace
+    broken_models = SimpleNamespace(reviewer=broken, tiebreaker=good)
+    results["check_models_one_broken"] = (len(check_models(broken_models)) > 0)
+
+    # 16. check_models: both healthy -> empty list.
+    healthy_models = SimpleNamespace(reviewer=good, tiebreaker=good)
+    results["check_models_both_healthy"] = (check_models(healthy_models) == [])
 
     # 12. Detection ignores non-executable known paths (F3).
     import os as _os
