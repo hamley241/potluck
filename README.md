@@ -90,10 +90,11 @@ subprocess cleanup in `harness/test_runner.py`.
 harness/                 the invariant core (Python)
   schemas.py             typed verdicts — the contracts the loop branches on
   config.py              thresholds + resolved model backends (role → backend)
-  resolve.py             detect installed models, ask, write .resolved.toml
+  resolve.py             detect installed models, ask, write the resolved plan
+  paths.py               data + user-config locations (clone vs. installed)
   runner.py              bounded execution + timeout escalation counter
   orchestrator.py        the loop + all escalation exits + prompt builders
-  cli.py                 `potluck fix | resolve | doctor`
+  cli.py                 `potluck fix | resolve | doctor | setup`
   test_orchestrator.py   control-logic tests (run first, always)
   test_resolve.py        model-resolution tests
   test_runner.py         subprocess timeout/cleanup test
@@ -102,47 +103,93 @@ base/                    synced to every device
   commands/              /bugfix, /harness-bugfix slash commands
   hooks/                 pre-tool-secret-scan.py — outbound tripwire (secrets+PII)
 profiles/  personal/ phi/ ci/    per-environment overlays (config only)
-potluck                  CLI wrapper (symlinked onto PATH by setup.sh)
+pyproject.toml           packaging: `uv tool install`, ships base/ + profiles/
+potluck                  CLI wrapper for the clone path (uv run)
 test                     runs all suites via uv (no pytest/venv setup)
-setup.sh                 symlink base + profile into ~/.claude, then resolve
+setup.sh                 clone-path installer (symlinks into ~/.claude + PATH)
 verify.sh.example        per-PROJECT gate template (copy into each project repo)
 ```
 
+`base/` and `profiles/` ship inside the wheel (as `harness/_data/`) for the `uv
+tool install` path; a clone uses them in place. Machine-local state (`resolved.toml`)
+always lives in `~/.config/potluck/`.
+
 ## Prerequisites
 
-- **[uv](https://docs.astral.sh/uv/)** — the only toolchain dependency. `potluck`
-  and `./test` run through `uv run`, which fetches Python 3.11 and pydantic for
-  you, so you don't install those separately.
-- **git** and a **Unix shell (bash)** — macOS or Linux; Windows needs WSL.
-- **[Claude Code](https://claude.com/claude-code) CLI (`claude`)** — required: it
-  is the doer and the fallback for every role. Authenticate it once.
+- **[uv](https://docs.astral.sh/uv/)** — the only toolchain dependency. Everything
+  runs through `uv`, which fetches Python 3.11 and pydantic for you.
+  Install: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- **[Claude Code](https://claude.com/claude-code) CLI (`claude`)** — **required**:
+  it's the doer and the fallback for every role. Authenticate once by running
+  `claude` and following the login prompt.
+- **git** + a **Unix shell (bash)** — macOS or Linux; Windows via WSL.
 - **Codex and/or Kimi CLIs** — *optional*. If on your `PATH` (or, on macOS, in
-  their app-bundle default locations) they're auto-detected and offered as the
-  reviewer/tiebreaker. Without them, potluck falls back to Claude models.
-  Authenticate each one you enable.
+  their app-bundle locations) they're auto-detected and offered as the reviewer /
+  tiebreaker; authenticate each (`codex login`, and Kimi's own auth). Without
+  them, potluck falls back to Claude models — no setup required.
 
-## Getting started
+## Install
+
+**Recommended — as a CLI tool (`uv`):**
 
 ```bash
-git clone https://github.com/hamley241/potluck && cd potluck
-./setup.sh personal            # read "What setup.sh touches" below first
-potluck doctor                 # confirm which models back each role
-
-# each project you run in needs a gate script:
-cd your-project
-cp /path/to/potluck/verify.sh.example .claude/verify.sh
-$EDITOR .claude/verify.sh       # fill in your test/lint/build commands; exit 0 = pass
-
-potluck fix --spec "Fix the pagination off-by-one" --acceptance "tests pass"
+uv tool install git+https://github.com/hamley241/potluck.git
+potluck setup            # installs slash commands into ~/.claude, then asks which models to use
+potluck doctor           # confirm which model backs each role
 ```
 
-> **What `setup.sh` touches.** It symlinks `rules/`, `commands/`, and `hooks/`
-> into `~/.claude`, **replacing** any existing symlinks of those names — back up
-> your own Claude config first. It also symlinks the `potluck` CLI into
-> `~/.local/bin` (make sure that's on your `PATH`). To try it without touching
-> your real config: `CLAUDE_HOME=~/.potluck-home ./setup.sh personal`. The
-> `potluck` CLI works straight from the clone without `setup.sh` — setup only
-> adds it to `PATH` and installs the slash commands.
+`potluck setup` copies potluck's slash commands, hooks, and guardrail rules into
+`~/.claude` (merging file-by-file — it won't clobber your existing config) and
+runs model resolution. Restart Claude Code afterward to pick up the new commands.
+Override the target with `CLAUDE_HOME=… potluck setup`.
+
+**Alternative — from a clone (to hack on it):**
+
+```bash
+git clone https://github.com/hamley241/potluck.git && cd potluck
+./setup.sh personal      # symlinks base/ into ~/.claude + puts `potluck` on PATH via ~/.local/bin
+./test                   # ALL SUITES PASS
+```
+
+Either way, **machine-local model choices live in `~/.config/potluck/`, never in
+git** — re-run `potluck resolve` (or `potluck setup`) on each machine, and
+re-authenticate each model CLI there.
+
+## Quickstart
+
+potluck runs inside **a project's git repo** and needs a gate script telling it
+what "correct" means for that project:
+
+```bash
+cd your-project                       # must be a git repo
+mkdir -p .claude
+curl -LsSf https://raw.githubusercontent.com/hamley241/potluck/main/verify.sh.example -o .claude/verify.sh
+chmod +x .claude/verify.sh
+$EDITOR .claude/verify.sh             # keep only your stack's commands; exit 0 = pass, non-zero = fail
+
+potluck fix \
+  --spec "Fix the off-by-one in paginate()" \
+  --acceptance "the pagination tests pass"
+```
+
+(Cloned instead? The template is already at `verify.sh.example` in the clone —
+`cp verify.sh.example your-project/.claude/verify.sh`.)
+
+## Examples
+
+```bash
+# Fix a bug, letting the gate define done:
+potluck fix --spec "raise on negative quantity in Order.add_item" --acceptance "tests pass"
+
+# Read the spec from a file (good for longer asks):
+potluck fix --spec-file change.md --acceptance-file criteria.md
+
+# Force the always-available Claude-only floor (no Codex/Kimi needed):
+potluck resolve --claude-only && potluck fix --spec "…" --acceptance "…"
+
+# See what's wired without changing anything:
+potluck doctor
+```
 
 A successful run looks like:
 
@@ -160,13 +207,10 @@ Debate log:
 ```
 
 An unresolved review or an unavailable model instead ends in `ESCALATED (...)`
-with a one-line reason; the diff and debate log are left in place for you to
-judge. A non-answer is never silently treated as "approved".
+with a one-line reason; your changes and the debate log are left in place for you
+to judge. A non-answer is never silently treated as "approved".
 
-Re-run `potluck resolve` on each machine (`--auto` uses everything detected,
-`--claude-only` forces the floor). **Credentials and machine-local model paths
-never sync** — `.gitignore` blocks `.resolved.toml` and any credential files, so
-re-authenticate each model CLI per machine.
+Inside Claude Code, the same loop is one command: `/harness-bugfix <describe the bug>`.
 
 ## Profiles
 
