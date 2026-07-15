@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Run potluck's test suites. No pytest, no venv setup -- these are deterministic
+# harness contracts (no real model calls), so anyone can run them on a fresh
+# clone with just `uv` on PATH.
+#
+#   ./test
+#
+set -uo pipefail
+REPO="$(cd "$(dirname "$0")" && pwd)"
+cd "$REPO"
+
+run() {
+  uv run --no-project --python 3.11 --with pydantic \
+    env PYTHONPATH="$REPO" python3.11 -m "$1"
+}
+
+fail=0
+for suite in harness.test_orchestrator harness.test_resolve harness.test_runner; do
+  echo "=== $suite ==="
+  run "$suite" || fail=1
+  echo
+done
+
+if [[ $fail -eq 0 ]]; then
+  echo "ALL SUITES PASS"
+else
+  echo "SOME SUITES FAILED" >&2
+fi
+exit $fail

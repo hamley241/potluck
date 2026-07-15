@@ -211,4 +211,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    sys.exit(0 if asyncio.run(main()) else 1)

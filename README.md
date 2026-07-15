@@ -126,12 +126,13 @@ re-authenticate each model CLI per machine.
 ## Run the tests
 
 ```bash
-python3.11 -m harness.test_orchestrator   # control logic  → ALL PASS
-python3.11 -m harness.test_resolve        # model resolution → ALL PASS
+./test          # runs all three suites → ALL SUITES PASS
 ```
 
-Do this on every new machine after `setup.sh` to confirm the core is intact
-before trusting a real run.
+No pytest or venv setup — just `uv` on PATH. The suites are deterministic
+harness contracts (no real model calls): `test_orchestrator` (control logic),
+`test_resolve` (model resolution), `test_runner` (subprocess cleanup). Run this
+on every new machine to confirm the core is intact before trusting a real run.
 
 ## Seams (deliberate, honest)
 
