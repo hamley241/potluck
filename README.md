@@ -200,3 +200,7 @@ on every new machine to confirm the core is intact before trusting a real run.
   potluck v1 writes code against a deterministic gate. Design review — where two
   models can agree a bad idea is good — needs a different shape and stays a human
   call.
+
+## License
+
+[MIT](LICENSE) © 2026 Goutham Patley. Use it, fork it, build on it.
