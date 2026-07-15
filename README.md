@@ -81,7 +81,7 @@ reviewer is the ceiling.
    a verdict — a timed-out review is "no signal", not "approved".
 
 All four are verified in `harness/test_orchestrator.py` (10 cases, no real model
-calls). Model resolution is verified in `harness/test_resolve.py` (12 cases), and
+calls). Model resolution is verified in `harness/test_resolve.py` (16 cases), and
 subprocess cleanup in `harness/test_runner.py`.
 
 ## Layout
@@ -186,6 +186,16 @@ No pytest or venv setup — just `uv` on PATH. The suites are deterministic
 harness contracts (no real model calls): `test_orchestrator` (control logic),
 `test_resolve` (model resolution), `test_runner` (subprocess cleanup). Run this
 on every new machine to confirm the core is intact before trusting a real run.
+
+## Self-hosted
+
+potluck builds potluck. The backend health check (`check_backend` /
+`check_models` in `resolve.py`) and its four tests were written by potluck's own
+`fix` loop, not by hand: Claude (doer) implemented against a spec, potluck's gate
+(`./test`) settled correctness, and **Codex** independently reviewed the diff —
+early-exit PASSED, 0 rounds, zero human edits to the code. The repo carries its
+own `.claude/verify.sh`, so you can point `potluck fix` at potluck itself. See
+commit [`ad514f0`](https://github.com/hamley241/potluck/commit/ad514f0).
 
 ## Seams (deliberate, honest)
 
