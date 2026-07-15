@@ -14,11 +14,12 @@ binary), and the resolved plan must round-trip through .resolved.toml back into
 HarnessConfig.
 """
 
+import tomllib
 import tempfile
 from pathlib import Path
 
 from harness.resolve import (
-    resolve_roles, render_resolved_toml, write_resolved,
+    resolve_roles, render_resolved_toml, write_resolved, Backend,
     CLAUDE_REVIEWER_MODEL, CLAUDE_TIEBREAKER_MODEL,
 )
 from harness.config import HarnessConfig
@@ -117,6 +118,24 @@ def main():
         and cfg.models.tiebreaker.name == "claude"
         and cfg.models.reviewer.cmd[0] == "claude"
     )
+
+    # 9. Field-wise overlay (F5): a partial override keeps omitted fields from
+    #    the lower-precedence layer instead of resetting them to Claude defaults.
+    cfg = HarnessConfig()
+    cfg._apply({"models": {"reviewer": {
+        "name": "codex", "cmd": [CODEX, "exec"], "fmt": "codex_jsonl", "stdin": True}}})
+    cfg._apply({"models": {"reviewer": {"cmd": [CODEX, "exec", "--json"]}}})  # only cmd
+    results["fieldwise_overlay"] = (
+        cfg.models.reviewer.name == "codex"          # preserved
+        and cfg.models.reviewer.fmt == "codex_jsonl"  # preserved
+        and cfg.models.reviewer.cmd == [CODEX, "exec", "--json"]  # overridden
+    )
+
+    # 10. TOML escaping (F4): a path with a quote/backslash renders to VALID toml.
+    b = Backend("codex", ['/weird/pa"th\\x', "exec"], "codex_jsonl", stdin=True)
+    rendered = "[models.reviewer]\n" + b.as_toml_table()
+    parsed = tomllib.loads(rendered)  # must not raise
+    results["toml_escaping"] = (parsed["models"]["reviewer"]["cmd"][0] == '/weird/pa"th\\x')
 
     ok = True
     for name, passed in results.items():

@@ -46,6 +46,13 @@ CLAUDE_REVIEWER_MODEL = "sonnet"
 CLAUDE_TIEBREAKER_MODEL = "haiku"
 
 
+def _toml_str(s: str) -> str:
+    """Render a string as a TOML basic string, escaping backslashes and quotes
+    so a path with such characters can't produce an invalid .resolved.toml."""
+    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 @dataclass
 class Backend:
     name: str
@@ -54,10 +61,10 @@ class Backend:
     stdin: bool = True   # True: prompt on stdin; False: prompt appended as argv
 
     def as_toml_table(self) -> str:
-        cmd_items = ", ".join(f'"{c}"' for c in self.cmd)
-        return (f'name = "{self.name}"\n'
+        cmd_items = ", ".join(_toml_str(c) for c in self.cmd)
+        return (f'name = {_toml_str(self.name)}\n'
                 f'cmd = [{cmd_items}]\n'
-                f'fmt = "{self.fmt}"\n'
+                f'fmt = {_toml_str(self.fmt)}\n'
                 f'stdin = {"true" if self.stdin else "false"}\n')
 
 
@@ -77,8 +84,12 @@ def codex_backend(path: str) -> Backend:
 
 def kimi_backend(path: str) -> Backend:
     # `kimi -p <prompt>` takes the prompt as an ARGUMENT, not on stdin, so the
-    # runner appends it to cmd. (Caveat: very large prompts can hit ARG_MAX; the
-    # tiebreaker role keeps prompts small -- one contested issue at a time.)
+    # runner appends it to cmd.
+    # Caveat: the tiebreak prompt embeds the diff, so on a very large change it
+    # can exceed the OS per-arg / ARG_MAX limit. That surfaces as an OSError,
+    # which the StepRunner catches and the loop escalates as ESCALATED_NO_SIGNAL
+    # (a missing adjudication, never a silent "approved"). It is not a crash,
+    # but Kimi tiebreak is unavailable on outsized diffs -- a known v1 limit.
     return Backend("kimi", [path, "-p"], "text", stdin=False)
 
 
@@ -232,6 +243,14 @@ def cmd_doctor() -> int:
 
 def cmd_resolve(auto: bool = False, claude_only: bool = False) -> int:
     detected = detect()
+    # Claude is the doer AND the fallback floor for every role, so it is
+    # required in ALL modes -- not just interactive. Fail loudly rather than
+    # write a resolution that points at a nonexistent `claude` command.
+    if not detected["claude"]:
+        print("error: the required `claude` CLI was not found on PATH.\n"
+              "Claude is the doer and the fallback for every role. Install it, "
+              "then re-run `potluck resolve`.", file=sys.stderr)
+        return 1
     if claude_only:
         roles = auto_resolve(detected, claude_only=True)
     elif auto:

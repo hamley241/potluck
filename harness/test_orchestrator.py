@@ -65,6 +65,13 @@ class ErrorReviewer(ReviewerClient):
         raise RuntimeError("codex exited 1: not logged in")
 
 
+class ErrorTiebreaker(TiebreakerClient):
+    """Tiebreaker whose CLI errors -- must escalate as 'no signal', distinct
+    from a genuine disagreement (F1)."""
+    async def adjudicate(self, spec, diff, issue_id, a, b):
+        raise RuntimeError("kimi exited 1: not authenticated")
+
+
 async def gate_pass(): return (True, "all green")
 async def gate_fail(): return (False, "")
 async def gate_hang():
@@ -167,6 +174,18 @@ async def main():
     r = await orch.run_feature("spec", "acc")
     results["reviewer_no_signal"] = (r.outcome, r.rounds_used)
 
+    # 10. Tiebreaker CLI errors on a real deadlock -> no signal (NOT disagreement).
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]},
+        followups=[{"issues": [{"id": "I1", "severity": "blocking",
+                                "issue": "x", "suggested_fix": "y"}]}] * 3)
+    orch = make(cfg, StubDoer({"I1": "reject"}), reviewer,
+                ErrorTiebreaker(cfg), gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["tiebreaker_no_signal"] = (r.outcome, r.rounds_used)
+
     # report
     expected = {
         "early_exit": (Outcome.PASSED, 0),
@@ -178,6 +197,7 @@ async def main():
         "human_only_routing": (Outcome.ESCALATED_DISAGREEMENT, 0),
         "ci_gate_only": (Outcome.PASSED, 0),
         "reviewer_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
+        "tiebreaker_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
     }
     ok = True
     for name, got in results.items():

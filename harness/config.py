@@ -138,14 +138,19 @@ class HarnessConfig:
             self._apply_models(data["models"])
 
     def _apply_models(self, m: dict) -> None:
+        # Merge field-wise onto the current backend so a partial override (e.g.
+        # a .resolved.toml table that sets only `cmd`) keeps the lower-precedence
+        # values for the fields it omits -- honouring the documented layering
+        # (defaults <- profile <- resolved <- env) at the field level.
         for role in ("reviewer", "tiebreaker"):
             if role in m and isinstance(m[role], dict):
                 b = m[role]
+                cur = getattr(self.models, role)
                 setattr(self.models, role, Backend(
-                    name=b.get("name", "claude"),
-                    cmd=list(b.get("cmd", ["claude", "-p"])),
-                    fmt=b.get("fmt", "text"),
-                    stdin=b.get("stdin", True),
+                    name=b.get("name", cur.name),
+                    cmd=list(b.get("cmd", cur.cmd)),
+                    fmt=b.get("fmt", cur.fmt),
+                    stdin=b.get("stdin", cur.stdin),
                 ))
 
     def _apply_env(self) -> None:

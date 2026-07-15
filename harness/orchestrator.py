@@ -341,11 +341,17 @@ class Orchestrator:
                                                    "<doer-arg>", "<reviewer-arg>"),
                 self.cfg.timeouts.model_call_seconds,
             )
-            if not res.ok:
-                # Timed out OR errored -> no signal from the tiebreaker, so the
-                # issue stays contested (and will escalate to human).
+            if res.timed_out:
+                # A timeout is no signal on THIS issue: it stays contested and
+                # escalates to human (ESCALATED_DISAGREEMENT) -- the human is the
+                # correct fallback for a specific unadjudicated dispute.
                 still_blocking.add(issue_id)
                 continue
+            if not res.ok:
+                # An ERRORED tiebreaker (unauthenticated / missing binary) is a
+                # different signal: the adjudicator itself is unavailable, so we
+                # escalate as no-signal rather than mislabel it as disagreement.
+                raise ModelUnavailable("tiebreaker", res.error or "tiebreaker call errored")
             tb = _parse_tiebreak(res.output)
             self._log("tiebreak", id=issue_id, sides_with=tb.sides_with)
             # 2-of-3: reviewer + tiebreaker agree it blocks -> stays blocking;
