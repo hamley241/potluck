@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Convenience wrapper: run potluck from anywhere.
+#   potluck resolve --auto
+#   potluck fix --spec "Fix the bug" --acceptance "Tests pass"
+#
+# This sets PYTHONPATH automatically so you don't have to remember it.
+set -euo pipefail
+HARNESS_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
+exec uv run --no-project --python 3.11 --with pydantic \
+  env PYTHONPATH="$HARNESS_DIR" python3.11 -m harness.cli "$@"

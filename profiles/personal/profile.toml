@@ -1,0 +1,21 @@
+# Personal machines: full setup, all three models, interactive.
+profile = "personal"
+interactive = true
+debate_enabled = true
+# Flip on after checking with security: paths whose diffs skip external review.
+human_only_paths = []
+
+[timeouts]
+model_call_seconds = 120
+gate_seconds = 300
+round_seconds = 400
+feature_seconds = 1800
+
+[debate]
+max_rounds = 2
+use_tiebreaker = true
+
+[escalation]
+retries_before_counting = 1
+timeout_count_threshold = 3
+consecutive_same_step_threshold = 2

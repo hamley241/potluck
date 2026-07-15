@@ -1,0 +1,29 @@
+# HIPAA/PHI codebase machines.
+# Code is assumed PII-free, so the external debate stays ENABLED for ordinary
+# feature/bug work -- the base tripwire hook guards against accidental leaks.
+# The one differentiator from personal: security-critical paths are routed to
+# human-only review. Set these to your actual PHI-handling / auth modules and
+# confirm the list with your security team.
+profile = "phi"
+interactive = true
+debate_enabled = true
+human_only_paths = [
+  # "src/security/",
+  # "src/phi/",
+  # "src/auth/",
+]
+
+[timeouts]
+model_call_seconds = 120
+gate_seconds = 300
+round_seconds = 400
+feature_seconds = 1800
+
+[debate]
+max_rounds = 2
+use_tiebreaker = true
+
+[escalation]
+retries_before_counting = 1
+timeout_count_threshold = 3
+consecutive_same_step_threshold = 2

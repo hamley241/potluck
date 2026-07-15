@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Per-PROJECT verification gate. Copy this into each project's repo as
+# .claude/verify.sh and fill in the real commands for that project's stack.
+# This file is the source of truth for "correct" — the loop drives toward it.
+#
+# It lives WITH THE PROJECT, not in the global harness, so each project's gate
+# (and acceptance criteria) travel with the project's own git repo.
+set -euo pipefail
+
+# --- Python + TypeScript example (delete what you don't use) ---
+echo "→ python typecheck"; mypy . 2>/dev/null || { echo "mypy failed"; exit 1; }
+echo "→ python tests";     pytest -q
+echo "→ ts typecheck";     npm run typecheck
+echo "→ ts lint";          npm run lint
+echo "→ ts test";          npm run test
+echo "→ build";            npm run build
+
+echo "✓ all gates green"

@@ -1,0 +1,24 @@
+# CI runners / containers / sandboxes: non-interactive, no human to escalate to.
+# Therefore deterministic-gate-only -- the debate's human-escalation exit has
+# nowhere to go, and the model-review steps are the likeliest to hang. CI's
+# "escalation" is: fail the job loudly with the report in the logs.
+profile = "ci"
+interactive = false
+debate_enabled = false
+human_only_paths = []
+
+[timeouts]
+# Tighter than interactive -- CI should fail fast, not wait 30 min.
+model_call_seconds = 90
+gate_seconds = 600
+round_seconds = 0
+feature_seconds = 900
+
+[debate]
+max_rounds = 0
+use_tiebreaker = false
+
+[escalation]
+retries_before_counting = 1
+timeout_count_threshold = 2
+consecutive_same_step_threshold = 2

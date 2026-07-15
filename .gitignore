@@ -1,0 +1,16 @@
+# NEVER sync credentials. Re-authenticate per machine.
+.credentials.json
+*.credentials.json
+.env
+.env.*
+*.key
+*.pem
+credentials/
+# Machine-local model resolution -- paths differ per machine, written by
+# `potluck resolve`. Never commit (same rule as credentials).
+.resolved.toml
+# Local-only Claude Code state (do not sync)
+projects/
+history.jsonl
+__pycache__/
+*.pyc
