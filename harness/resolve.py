@@ -71,8 +71,12 @@ class Backend:
 # --- backend builders ---
 
 def claude_backend(model: str, claude_path: str = "claude") -> Backend:
-    # `claude -p` reads the prompt from stdin.
-    return Backend("claude", [claude_path, "-p", "--model", model], "text", stdin=True)
+    # `claude -p` reads the prompt from stdin. `--tools ""` disables ALL tools so
+    # the reviewer/tiebreaker are genuinely read-only judgment calls -- they
+    # cannot edit the workspace or run commands, matching Codex's read-only
+    # sandbox. (The doer is a separate call that keeps its edit tools.)
+    return Backend("claude", [claude_path, "-p", "--tools", "", "--model", model],
+                   "text", stdin=True)
 
 
 def codex_backend(path: str) -> Backend:
@@ -100,7 +104,10 @@ def _find(name: str, extra_paths: list[str]) -> str | None:
     if on_path:
         return on_path
     for candidate in extra_paths:
-        if os.path.exists(candidate):
+        # Must be an executable FILE -- a directory or non-executable file at a
+        # known path is not a usable backend, so fall through to the Claude
+        # fallback rather than write a dead command into .resolved.toml.
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return None
 

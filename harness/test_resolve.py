@@ -117,6 +117,9 @@ def main():
         cfg.models.reviewer.name == "claude"
         and cfg.models.tiebreaker.name == "claude"
         and cfg.models.reviewer.cmd[0] == "claude"
+        # the floor must be read-only too (F1): tools disabled by default
+        and "--tools" in cfg.models.reviewer.cmd
+        and "--tools" in cfg.models.tiebreaker.cmd
     )
 
     # 9. Field-wise overlay (F5): a partial override keeps omitted fields from
@@ -136,6 +139,27 @@ def main():
     rendered = "[models.reviewer]\n" + b.as_toml_table()
     parsed = tomllib.loads(rendered)  # must not raise
     results["toml_escaping"] = (parsed["models"]["reviewer"]["cmd"][0] == '/weird/pa"th\\x')
+
+    # 11. Claude fallback is read-only (F1): tools disabled via `--tools ""`.
+    r = resolve_roles(CLAUDE_ONLY, use_codex=True, use_kimi=True)
+    cmd = r["reviewer"].cmd
+    results["claude_reviewer_read_only"] = (
+        "--tools" in cmd and cmd[cmd.index("--tools") + 1] == ""
+    )
+
+    # 12. Detection ignores non-executable known paths (F3).
+    import os as _os
+    with tempfile.TemporaryDirectory() as d:
+        from harness.resolve import _find
+        nonexec = Path(d) / "codex"          # exists but not executable
+        nonexec.write_text("#!/bin/sh\n")
+        _os.chmod(nonexec, 0o644)
+        miss = _find("____nope____", [str(nonexec)])
+        execbin = Path(d) / "kimi"
+        execbin.write_text("#!/bin/sh\n")
+        _os.chmod(execbin, 0o755)
+        hit = _find("____nope____", [str(execbin)])
+    results["detect_requires_executable"] = (miss is None and hit == str(execbin))
 
     ok = True
     for name, passed in results.items():

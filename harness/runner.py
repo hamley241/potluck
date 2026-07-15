@@ -133,9 +133,22 @@ async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate(
-        input=stdin_text.encode() if stdin_text is not None else None
-    )
+    try:
+        stdout, stderr = await proc.communicate(
+            input=stdin_text.encode() if stdin_text is not None else None
+        )
+    except BaseException:
+        # On cancellation (the StepRunner's wait_for timing us out) the child
+        # would otherwise keep running -- leaking a process and burning model
+        # tokens in the background, and a retry would spawn a second one. Kill
+        # and reap it before propagating.
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+        raise
     if proc.returncode != 0:
         raise RuntimeError(
             f"command {cmd[0]} exited {proc.returncode}: {stderr.decode()[:500]}"

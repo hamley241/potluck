@@ -83,11 +83,17 @@ class Models:
     fresh clone runs with nothing installed but the `claude` CLI. `potluck
     resolve` overrides these (via .resolved.toml) with Codex/Kimi when present.
     """
+    # `--tools ""` disables all tools so the Claude reviewer/tiebreaker are
+    # read-only judgment calls, matching resolve.claude_backend(). This is the
+    # floor used when no .resolved.toml exists, so the read-only guarantee must
+    # hold here too.
     reviewer: Backend = field(
-        default_factory=lambda: Backend("claude", ["claude", "-p", "--model", "sonnet"], "text")
+        default_factory=lambda: Backend(
+            "claude", ["claude", "-p", "--tools", "", "--model", "sonnet"], "text")
     )
     tiebreaker: Backend = field(
-        default_factory=lambda: Backend("claude", ["claude", "-p", "--model", "haiku"], "text")
+        default_factory=lambda: Backend(
+            "claude", ["claude", "-p", "--tools", "", "--model", "haiku"], "text")
     )
 
 
