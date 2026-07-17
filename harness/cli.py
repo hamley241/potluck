@@ -210,6 +210,17 @@ def cmd_setup(args):
                 shutil.copy2(f, dest / sub / f.name)
         print(f"  installed {sub}/ → {dest / sub}")
 
+    # Register the secret-scan hook in ~/.claude/settings.json so it actually
+    # runs. Merge-semantic: preserves other tools' hooks, idempotent by
+    # script-path identity (running setup twice is a no-op on the hook list).
+    from . import hook_setup
+    hook_script = dest / "hooks" / "pre-tool-secret-scan.py"
+    try:
+        result = hook_setup.register(dest, hook_script)
+        print(f"  hook {result['status']}: {result['settings_path']}")
+    except RuntimeError as e:
+        print(f"  hook registration skipped: {e}", file=sys.stderr)
+
     print(f"\nAssets installed into {dest}. Restart Claude Code to pick up new commands.\n")
     rc = resolve_mod.cmd_resolve(auto=args.auto, claude_only=args.claude_only)
     sys.exit(rc)

@@ -98,6 +98,20 @@ class Models:
 
 
 @dataclass
+class DiffConfig:
+    # Untracked files above this size are omitted from the review diff with
+    # a `# skipped: <path> (size N bytes)` marker (so absence isn't silent).
+    # 4 MB catches accidentally-checked-in node_modules blobs and generated
+    # artifacts without truncating anything a reviewer would actually read.
+    # A repo with large legitimate untracked source files can raise this.
+    max_untracked_bytes: int = 4 * 1024 * 1024
+    # Untracked files whose first 8 KB contains a NUL byte are treated as
+    # binary and omitted (with a `# skipped: <path> (binary)` marker).
+    # Reviewers can't act on binary blobs and diffing them wastes budget.
+    binary_probe_bytes: int = 8 * 1024
+
+
+@dataclass
 class HarnessConfig:
     profile: str = "personal"
     interactive: bool = True          # CI sets this False -> no human escalation target
@@ -110,6 +124,7 @@ class HarnessConfig:
     debate: DebateConfig = field(default_factory=DebateConfig)
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
     models: Models = field(default_factory=Models)
+    diff: DiffConfig = field(default_factory=DiffConfig)
 
     @classmethod
     def load(cls, profile_path: Path | None = None,
@@ -136,6 +151,7 @@ class HarnessConfig:
             ("timeouts", self.timeouts),
             ("debate", self.debate),
             ("escalation", self.escalation),
+            ("diff", self.diff),
         ):
             if section in data:
                 for k, v in data[section].items():

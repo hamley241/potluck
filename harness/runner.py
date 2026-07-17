@@ -14,10 +14,18 @@ Design points we agreed on:
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 from collections import defaultdict
 
 from .config import HarnessConfig
 from .schemas import StepResult
+
+# How long to give the process group to exit gracefully after SIGTERM before
+# escalating to SIGKILL. Short enough that a hung process doesn't delay
+# escalation reporting; long enough that a well-behaved child can flush logs
+# and clean up before we force-kill.
+_GRACE_SECONDS = 0.5
 
 
 class TimeoutEscalation(Exception):
@@ -126,12 +134,19 @@ async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
 
     No timeout here on purpose -- the StepRunner wraps the call and owns the
     wall-clock bound, so timeout policy lives in exactly one place.
+
+    Spawns each child in its own POSIX process group (via `os.setsid`) so
+    cancellation can kill the WHOLE group. Model CLIs often fork helper
+    processes -- killing only the direct child would leak grandchildren
+    that continue running (burning tokens, holding locks), and a retry
+    would spawn a second copy of the work.
     """
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE if stdin_text is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        preexec_fn=os.setsid,  # new session -> distinct process group
     )
     try:
         stdout, stderr = await proc.communicate(
@@ -140,14 +155,36 @@ async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
     except BaseException:
         # On cancellation (the StepRunner's wait_for timing us out) the child
         # would otherwise keep running -- leaking a process and burning model
-        # tokens in the background, and a retry would spawn a second one. Kill
-        # and reap it before propagating.
+        # tokens in the background, and a retry would spawn a second one.
+        # Two-phase teardown: SIGTERM the group first, give it a grace window
+        # to flush logs and exit cleanly, then SIGKILL if still alive.
+        # SIGKILL-only would guarantee lost final output; SIGTERM-only would
+        # never end if a child ignores it.
         if proc.returncode is None:
+            pgid = None
             try:
-                proc.kill()
+                pgid = os.getpgid(proc.pid)
             except ProcessLookupError:
                 pass
-            await proc.wait()
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=_GRACE_SECONDS)
+                except asyncio.TimeoutError:
+                    # Grace expired; child ignored SIGTERM or grandchildren
+                    # kept the group alive. Force-kill the whole group.
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+            else:
+                # Couldn't get pgid (child already exited between check and
+                # kill); fall through to plain wait.
+                await proc.wait()
         raise
     if proc.returncode != 0:
         raise RuntimeError(
