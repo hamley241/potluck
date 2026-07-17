@@ -49,10 +49,25 @@ class StubReviewer(ReviewerClient):
 
 
 class StubTiebreaker(TiebreakerClient):
-    def __init__(self, cfg, sides):  # sides: {issue_id: "reviewer"|"doer"|"unclear"}
+    def __init__(self, cfg, sides):  # sides: {issue_id: "a"|"b"|"unclear"}
         super().__init__(cfg)
         self.sides = sides
     async def adjudicate(self, spec, diff, issue_id, a, b):
+        return json.dumps({"id": issue_id,
+                           "sides_with": self.sides.get(issue_id, "unclear"),
+                           "reasoning": "stub"})
+
+
+class RecordingTiebreaker(TiebreakerClient):
+    """Records what actually reached adjudicate() so tests can assert on the
+    real arguments -- catches regressions like passing '<doer-arg>' placeholder
+    strings instead of the real doer/reviewer reasoning."""
+    def __init__(self, cfg, sides):
+        super().__init__(cfg)
+        self.sides = sides
+        self.calls: list[dict] = []
+    async def adjudicate(self, spec, diff, issue_id, a, b):
+        self.calls.append({"id": issue_id, "a": a, "b": b})
         return json.dumps({"id": issue_id,
                            "sides_with": self.sides.get(issue_id, "unclear"),
                            "reasoning": "stub"})
@@ -81,12 +96,16 @@ async def diff_security(): return "modified src/security/phi_crypto.py"
 async def diff_plain(): return "modified src/feature.py"
 
 
-def make(cfg, doer, reviewer, tb, gate, diff):
+def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None):
     # adapt run_gate to return just ok+output the orchestrator expects
     async def run_gate():
         ok, out = await gate()
         return out if ok else ""
-    return Orchestrator(cfg, doer, reviewer, tb, run_gate, diff)
+    # Default: no swap -> A=doer, B=reviewer. Deterministic so tests can encode
+    # "kimi sides with doer" as sides_with="a" without also asserting on the
+    # (real-run) random A/B position.
+    return Orchestrator(cfg, doer, reviewer, tb, run_gate, diff,
+                        ab_swap=ab_swap or (lambda _id: False))
 
 
 async def main():
@@ -110,6 +129,7 @@ async def main():
     results["convergence"] = (r.outcome, r.rounds_used)
 
     # 3. Tiebreaker resolves: deadlock, Kimi sides with doer -> passes.
+    # With the default no-swap ab_swap, A=doer, so sides_with="a" == doer wins.
     cfg = HarnessConfig()
     reviewer = StubReviewer(cfg,
         first={"issues": [{"id": "I1", "severity": "blocking",
@@ -118,7 +138,7 @@ async def main():
                                 "issue": "x", "suggested_fix": "y"}]},  # holds
                    {"issues": [{"id": "I1", "severity": "blocking",
                                 "issue": "x", "suggested_fix": "y"}]}])
-    tb = StubTiebreaker(cfg, {"I1": "doer"})
+    tb = StubTiebreaker(cfg, {"I1": "a"})
     orch = make(cfg, StubDoer({"I1": "reject"}), reviewer, tb, gate_pass, diff_plain)
     r = await orch.run_feature("spec", "acc")
     results["tiebreak_resolves"] = (r.outcome, r.rounds_used)
@@ -186,6 +206,62 @@ async def main():
     r = await orch.run_feature("spec", "acc")
     results["tiebreaker_no_signal"] = (r.outcome, r.rounds_used)
 
+    # 11. INVARIANT: real doer & reviewer arguments reach the tiebreaker.
+    # Regression guard for the bug where _tiebreak passed literal
+    # "<doer-arg>", "<reviewer-arg>" placeholder strings -- so Kimi was judging
+    # empty prompts. If this ever regresses, the tiebreaker silently loses its
+    # inputs while the loop keeps "working".
+    class RejectingDoer(StubDoer):
+        async def respond_to_review(self, spec, verdict):
+            return DoerResponse(responses=[
+                IssueResponse(id="I1", decision="reject",
+                              reasoning="doer-rejection-text")
+            ])
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "reviewer-issue-text",
+                           "suggested_fix": "reviewer-fix-text"}]},
+        followups=[{"issues": [{"id": "I1", "severity": "blocking",
+                                "issue": "reviewer-issue-text",
+                                "suggested_fix": "reviewer-fix-text"}]}] * 3)
+    tb = RecordingTiebreaker(cfg, {"I1": "a"})  # A wins; with no-swap A=doer
+    orch = make(cfg, RejectingDoer({}), reviewer, tb, gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert len(tb.calls) == 1, f"expected 1 tiebreak call, got {len(tb.calls)}"
+    call = tb.calls[0]
+    combined = call["a"] + call["b"]
+    assert "<doer-arg>" not in combined, \
+        f"placeholder leaked to tiebreaker: a={call['a']!r}, b={call['b']!r}"
+    assert "<reviewer-arg>" not in combined, \
+        f"placeholder leaked to tiebreaker: a={call['a']!r}, b={call['b']!r}"
+    # With default no-swap: A=doer, B=reviewer.
+    assert call["a"] == "doer-rejection-text", \
+        f"expected doer reasoning in slot A, got {call['a']!r}"
+    assert "reviewer-issue-text" in call["b"], \
+        f"expected reviewer issue text in slot B, got {call['b']!r}"
+    assert "reviewer-fix-text" in call["b"], \
+        f"expected reviewer suggested_fix in slot B, got {call['b']!r}"
+    results["invariant_real_args"] = (r.outcome, r.rounds_used)
+
+    # 12. INVARIANT: TiebreakVerdict schema is A/B, not doer/reviewer.
+    # The tiebreaker is blind to which model authored which argument; asking it
+    # for a role label is asking it to guess. The schema enforces slot answers;
+    # the orchestrator does the role translation. If this ever regresses to
+    # accepting role labels, blinding degrades to "aspirational".
+    from harness.schemas import TiebreakVerdict  # noqa: E402
+    from pydantic import ValidationError  # noqa: E402
+    for legacy in ("doer", "reviewer"):
+        try:
+            TiebreakVerdict(id="I1", sides_with=legacy, reasoning="stub")
+        except ValidationError:
+            pass  # expected
+        else:
+            raise AssertionError(
+                f"TiebreakVerdict must reject legacy sides_with={legacy!r}")
+    for valid in ("a", "b", "unclear"):
+        TiebreakVerdict(id="I1", sides_with=valid, reasoning="stub")
+
     # report
     expected = {
         "early_exit": (Outcome.PASSED, 0),
@@ -198,6 +274,7 @@ async def main():
         "ci_gate_only": (Outcome.PASSED, 0),
         "reviewer_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
         "tiebreaker_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
+        "invariant_real_args": (Outcome.PASSED, 2),
     }
     ok = True
     for name, got in results.items():

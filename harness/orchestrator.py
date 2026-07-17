@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .config import HarnessConfig
@@ -174,6 +176,7 @@ class Orchestrator:
         tiebreaker: TiebreakerClient | None,
         run_gate,             # async callable -> (ok: bool, output: str)
         get_diff,             # async callable -> str
+        ab_swap: Callable[[str], bool] | None = None,
     ):
         self.cfg = config
         self.doer = doer
@@ -182,6 +185,11 @@ class Orchestrator:
         self.run_gate = run_gate
         self.get_diff = get_diff
         self.runner = StepRunner(config)
+        # ab_swap decides per issue_id whether to place the reviewer's argument
+        # in slot A (True) or the doer's (False). Randomized by default so a
+        # tiebreaker that guesses by position gets no free signal; tests inject
+        # a deterministic function so they can assert on which side "wins".
+        self._ab_swap = ab_swap or (lambda _id: random.random() < 0.5)
         self.log: list[dict] = []
 
     async def run_feature(self, spec: str, acceptance: str) -> FeatureResult:
@@ -258,7 +266,8 @@ class Orchestrator:
 
         # 6. Resolve any remaining deadlock
         if unresolved_blocking:
-            unresolved_blocking = await self._tiebreak(spec, diff, unresolved_blocking)
+            unresolved_blocking = await self._tiebreak(
+                spec, diff, unresolved_blocking, verdict, response)
             if unresolved_blocking:
                 return self._escalated(
                     Outcome.ESCALATED_DISAGREEMENT, rounds_used,
@@ -330,15 +339,47 @@ class Orchestrator:
             raise ModelUnavailable("reviewer", res.error or "reviewer follow-up errored")
         return _parse_verdict(res.output)
 
-    async def _tiebreak(self, spec, diff, blocking: set[str]) -> set[str]:
+    async def _tiebreak(self, spec, diff, blocking: set[str],
+                        verdict: ReviewVerdict,
+                        response: DoerResponse) -> set[str]:
         if not (self.cfg.debate.use_tiebreaker and self.tiebreaker):
             return blocking  # no tiebreaker -> any unresolved blocking escalates
+        # Both lookups are invariants: by construction (line ~253) an id in
+        # `blocking` must be a held reviewer issue AND a rejected doer response.
+        # If either is missing the loop upstream is broken -- raise so it fails
+        # loud, don't silently escalate and hide the bug.
+        reviewer_issues = {i.id: i for i in verdict.issues}
+        doer_rejections = {r.id: r for r in response.responses
+                           if r.decision == "reject"}
         still_blocking: set[str] = set()
         for issue_id in sorted(blocking):
+            r_issue = reviewer_issues.get(issue_id)
+            d_resp = doer_rejections.get(issue_id)
+            if r_issue is None or d_resp is None:
+                raise RuntimeError(
+                    f"tiebreak invariant violated for {issue_id}: "
+                    f"reviewer_issue={r_issue is not None}, "
+                    f"doer_rejection={d_resp is not None}"
+                )
+            reviewer_arg = (
+                f"{r_issue.issue}\n\nSuggested fix: {r_issue.suggested_fix}"
+            )
+            doer_arg = d_resp.reasoning
+            # Randomize which argument lands in slot A vs B, per issue, so a
+            # tiebreaker that leans on position gets no free signal. The
+            # orchestrator remembers the mapping and translates the slot
+            # answer back to a role answer.
+            swap = bool(self._ab_swap(issue_id))
+            if swap:
+                arg_a, arg_b = reviewer_arg, doer_arg
+                role_of_a, role_of_b = "reviewer", "doer"
+            else:
+                arg_a, arg_b = doer_arg, reviewer_arg
+                role_of_a, role_of_b = "doer", "reviewer"
             res = await self.runner.run(
                 "tiebreaker:adjudicate",
-                lambda: self.tiebreaker.adjudicate(spec, diff, issue_id,
-                                                   "<doer-arg>", "<reviewer-arg>"),
+                lambda: self.tiebreaker.adjudicate(
+                    spec, diff, issue_id, arg_a, arg_b),
                 self.cfg.timeouts.model_call_seconds,
             )
             if res.timed_out:
@@ -353,12 +394,17 @@ class Orchestrator:
                 # escalate as no-signal rather than mislabel it as disagreement.
                 raise ModelUnavailable("tiebreaker", res.error or "tiebreaker call errored")
             tb = _parse_tiebreak(res.output)
-            self._log("tiebreak", id=issue_id, sides_with=tb.sides_with)
+            if tb.sides_with == "a":
+                winning_role = role_of_a
+            elif tb.sides_with == "b":
+                winning_role = role_of_b
+            else:
+                winning_role = "unclear"
+            self._log("tiebreak", id=issue_id,
+                      sides_with=tb.sides_with, winning_role=winning_role)
             # 2-of-3: reviewer + tiebreaker agree it blocks -> stays blocking;
             # doer + tiebreaker agree -> resolved; unclear -> escalate.
-            if tb.sides_with == "reviewer":
-                still_blocking.add(issue_id)
-            elif tb.sides_with == "unclear":
+            if winning_role in ("reviewer", "unclear"):
                 still_blocking.add(issue_id)
             # "doer" -> resolved, drops out
         return still_blocking
@@ -495,8 +541,11 @@ def _tiebreak_prompt(spec, diff, issue_id, arg_a, arg_b) -> str:
 know which is the author and which is the reviewer -- judge the ARGUMENTS, not the
 source. Decide which argument is correct given the acceptance criteria.
 
-Return ONLY JSON: {{"id": "{issue_id}", "sides_with": "reviewer|doer|unclear",
+Return ONLY JSON: {{"id": "{issue_id}", "sides_with": "a|b|unclear",
 "reasoning": "..."}}
+  "a"        -> ARGUMENT A is correct
+  "b"        -> ARGUMENT B is correct
+  "unclear"  -> the arguments do not settle it (escalates to a human)
 
 ACCEPTANCE CRITERIA:
 {spec}
