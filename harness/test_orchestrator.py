@@ -262,6 +262,118 @@ async def main():
     for valid in ("a", "b", "unclear"):
         TiebreakVerdict(id="I1", sides_with=valid, reasoning="stub")
 
+    # 13. INVARIANT: full debate transcript present in log with new event
+    # shapes. Regression guard for the whole point of this feature: reviewer
+    # issue text, per-issue doer reasoning, held-issue text, and tiebreak
+    # positions must all be readable from FeatureResult.debate_log without
+    # re-running. Also enforces the v2 dropped-field discipline: accepted/
+    # rejected/still_blocking must NOT appear on their respective v2 events.
+    class DoerWithDistinctiveText(StubDoer):
+        async def respond_to_review(self, spec, verdict):
+            return DoerResponse(responses=[
+                IssueResponse(id="I1", decision="reject",
+                              reasoning="DOER_REASONING_MARKER")
+            ])
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "REVIEWER_ISSUE_MARKER",
+                           "suggested_fix": "REVIEWER_FIX_MARKER"}]},
+        followups=[{"issues": [{"id": "I1", "severity": "blocking",
+                                "issue": "REVIEWER_HELD_MARKER",
+                                "suggested_fix": "y"}]}] * 3)
+    class StubTiebreakerWithReasoning(TiebreakerClient):
+        async def adjudicate(self, spec, diff, issue_id, a, b):
+            return json.dumps({"id": issue_id, "sides_with": "unclear",
+                               "reasoning": "TB_REASONING_MARKER"})
+    tb = StubTiebreakerWithReasoning(cfg)
+    orch = make(cfg, DoerWithDistinctiveText({}), reviewer, tb,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    log = r.debate_log
+    # Every event has envelope fields.
+    for ev in log:
+        assert "event" in ev, f"event missing 'event': {ev}"
+        assert "event_version" in ev, f"event missing 'event_version': {ev}"
+        assert "ts" in ev, f"event missing 'ts': {ev}"
+        assert isinstance(ev["event_version"], int)
+        assert isinstance(ev["ts"], str) and "T" in ev["ts"], \
+            f"ts must be ISO 8601: {ev['ts']!r}"
+    # `review` event carries the reviewer's issues verbatim.
+    reviews = [e for e in log if e["event"] == "review"]
+    assert len(reviews) == 1, f"expected 1 review event, got {len(reviews)}"
+    rev = reviews[0]
+    assert rev["event_version"] == 1
+    assert any(i["issue"] == "REVIEWER_ISSUE_MARKER" for i in rev["issues"]), \
+        f"review event missing issue text: {rev['issues']}"
+    # `doer_response` v2 carries per-issue reasoning; no accepted/rejected lists.
+    doer_events = [e for e in log if e["event"] == "doer_response"]
+    assert doer_events, "expected at least one doer_response event"
+    for de in doer_events:
+        assert de["event_version"] == 2, \
+            f"doer_response must be v2: {de['event_version']}"
+        assert "accepted" not in de, \
+            f"v2 doer_response must not emit 'accepted' field: {de}"
+        assert "rejected" not in de, \
+            f"v2 doer_response must not emit 'rejected' field: {de}"
+        assert "responses" in de, "v2 doer_response must have 'responses'"
+    assert any(r["reasoning"] == "DOER_REASONING_MARKER"
+               for de in doer_events for r in de["responses"]), \
+        "doer reasoning text missing from log"
+    # `reviewer_followup` v2 carries held_issues; no still_blocking id list.
+    followups = [e for e in log if e["event"] == "reviewer_followup"]
+    assert followups, "expected at least one reviewer_followup event"
+    for fu in followups:
+        assert fu["event_version"] == 2
+        assert "still_blocking" not in fu, \
+            f"v2 reviewer_followup must not emit 'still_blocking': {fu}"
+        assert "held_issues" in fu
+    assert any(i["issue"] == "REVIEWER_HELD_MARKER"
+               for fu in followups for i in fu["held_issues"]), \
+        "reviewer held-issue text missing from log"
+    # `tiebreak` v2 carries doer_position/reviewer_position/tb_reasoning;
+    # slot labels (arg_a/arg_b) never leak into the log.
+    tiebreaks = [e for e in log if e["event"] == "tiebreak"]
+    assert tiebreaks, "expected at least one tiebreak event"
+    for tbe in tiebreaks:
+        assert tbe["event_version"] == 2
+        assert "arg_a" not in tbe and "arg_b" not in tbe, \
+            f"tiebreak must not leak slot labels: {tbe}"
+        assert "doer_position" in tbe
+        assert "reviewer_position" in tbe
+        assert "tb_reasoning" in tbe
+        assert tbe["doer_position"] == "DOER_REASONING_MARKER"
+        assert "REVIEWER_HELD_MARKER" in tbe["reviewer_position"]
+        assert tbe["tb_reasoning"] == "TB_REASONING_MARKER"
+    results["invariant_transcript"] = (r.outcome, r.rounds_used)
+
+    # 14. INVARIANT: strings above 16KB cap are truncated and metadata is
+    # emitted at event-level `truncations`. Field type stays str (no
+    # str|dict unions) so consumers don't have to branch on type.
+    big = "X" * (20 * 1024)  # 20KB, well above the 16KB cap
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "minor",
+                           "issue": big, "suggested_fix": "y"}]})
+    orch = make(cfg, StubDoer({}), reviewer, None, gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    review_events = [e for e in r.debate_log if e["event"] == "review"]
+    assert review_events, "expected review event even on early exit"
+    rev = review_events[0]
+    assert "truncations" in rev, \
+        f"expected truncations sibling on oversized event: {rev}"
+    # Path is dotted+bracketed: issues[0].issue for the truncated field.
+    assert "issues[0].issue" in rev["truncations"], \
+        f"expected path 'issues[0].issue' in truncations: {rev['truncations']}"
+    assert rev["truncations"]["issues[0].issue"] == 20 * 1024, \
+        f"truncations must record original length: {rev['truncations']}"
+    truncated_issue = rev["issues"][0]["issue"]
+    assert isinstance(truncated_issue, str), \
+        f"truncated field must stay str, not union: {type(truncated_issue)}"
+    assert len(truncated_issue) == 16 * 1024, \
+        f"truncated str must be exactly cap chars: {len(truncated_issue)}"
+    results["invariant_truncation"] = (r.outcome, r.rounds_used)
+
     # report
     expected = {
         "early_exit": (Outcome.PASSED, 0),
@@ -275,6 +387,8 @@ async def main():
         "reviewer_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
         "tiebreaker_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
         "invariant_real_args": (Outcome.PASSED, 2),
+        "invariant_transcript": (Outcome.ESCALATED_DISAGREEMENT, 2),
+        "invariant_truncation": (Outcome.PASSED, 0),
     }
     ok = True
     for name, got in results.items():
