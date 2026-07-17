@@ -16,6 +16,7 @@ import json
 from harness.config import HarnessConfig
 from harness.orchestrator import (
     Orchestrator, DoerClient, ReviewerClient, TiebreakerClient, GateResult,
+    _parse_verdict,
 )
 from harness.schemas import DoerResponse, IssueResponse, Outcome
 
@@ -50,6 +51,20 @@ class StubReviewer(ReviewerClient):
         out = self.followups[self._n] if self._n < len(self.followups) else {"issues": []}
         self._n += 1
         return json.dumps(out)
+
+
+class RawFollowupReviewer(StubReviewer):
+    """Followup reviewer that returns its followup entries as raw model output
+    (verbatim strings, not json.dumps'd) so tests can feed a literal top-level
+    array like "[]" straight through respond() -> _parse_verdict."""
+    async def respond(self, spec, acceptance, diff, rejections):
+        # Signature was 3-arg (spec, diff, rejections) when drift-12 landed; upstream
+        # 5805f48 threaded `acceptance` through every reviewer / tiebreaker method.
+        # Rebase-aligned: RawFollowupReviewer accepts it and ignores it (the raw
+        # output is what the whole class exists to inject).
+        out = self.followups[self._n] if self._n < len(self.followups) else "[]"
+        self._n += 1
+        return out
 
 
 class StubTiebreaker(TiebreakerClient):
@@ -525,6 +540,44 @@ async def main():
         f"truncated str must be exactly cap chars: {len(truncated_issue)}"
     results["invariant_truncation"] = (r.outcome, r.rounds_used)
 
+    # 15. INVARIANT: a bare top-level empty array parses as an empty verdict.
+    # `[]` is the happy-path shape of a clean followup review ("no remaining
+    # issues held"). Before the fix, _extract_json found no {...} window and
+    # raised, crashing run_feature preferentially when the reviewer was
+    # SATISFIED. Direct-call assertion: no exception, issues == [].
+    verdict = _parse_verdict("[]")
+    assert verdict.issues == [], \
+        f"bare [] must parse to empty issues, got {verdict.issues!r}"
+    results["invariant_bare_empty_array_verdict_parses"] = (Outcome.PASSED, 0)
+
+    # 16. INVARIANT: a bare top-level populated array parses with full schema
+    # validation -- coerced to {"issues": [...]} at the parse boundary.
+    verdict = _parse_verdict(
+        '[{"id": "I1", "severity": "blocking", '
+        '"issue": "x", "suggested_fix": "y"}]')
+    assert len(verdict.issues) == 1, \
+        f"expected 1 issue, got {len(verdict.issues)}"
+    assert verdict.issues[0].id == "I1"
+    assert verdict.issues[0].severity == "blocking"
+    assert verdict.issues[0].issue == "x"
+    assert verdict.issues[0].suggested_fix == "y"
+    results["invariant_bare_populated_array_verdict_parses"] = (Outcome.PASSED, 1)
+
+    # 17. INVARIANT: a followup reviewer that returns literal "[]" ends the
+    # debate cleanly with PASSED and does NOT crash. End-to-end regression
+    # against the menu traceability-slice crash: reviewer holds one blocking
+    # issue, doer rejects, followup returns bare "[]" -> loop converges.
+    cfg = HarnessConfig()
+    reviewer = RawFollowupReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]},
+        followups=["[]"])  # reviewer drops it via bare top-level array
+    orch = make(cfg, StubDoer({"I1": "reject"}), reviewer, None,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["invariant_followup_bare_array_ends_debate_cleanly"] = (
+        r.outcome, r.rounds_used)
+
     # report
     expected = {
         "early_exit": (Outcome.PASSED, 0),
@@ -543,6 +596,9 @@ async def main():
         "invariant_silent_green_gate": (Outcome.PASSED, 0),
         "invariant_accepted_major_full_context": (Outcome.PASSED, 1),
         "invariant_major_deadlocks": (Outcome.ESCALATED_DISAGREEMENT, 2),
+        "invariant_bare_empty_array_verdict_parses": (Outcome.PASSED, 0),
+        "invariant_bare_populated_array_verdict_parses": (Outcome.PASSED, 1),
+        "invariant_followup_bare_array_ends_debate_cleanly": (Outcome.PASSED, 1),
     }
     ok = True
     for name, got in results.items():

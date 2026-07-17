@@ -706,8 +706,31 @@ def _extract_json(text: str) -> dict:
         raise ValueError(f"no parseable JSON object in model output: {text[:200]}")
 
 
+def _extract_verdict_json(text: str) -> dict:
+    """Like _extract_json, but tolerates a top-level JSON array as shorthand
+    for {"issues": [...]}. A clean followup review returns bare `[]` ("no
+    remaining issues held"), which _extract_json (object-only) would reject.
+    Scoped to verdict parsing; _parse_tiebreak still demands an object."""
+    stripped = text.strip()
+    if "```" in stripped:
+        # pull the fenced block; accept either array- or object-leading payloads
+        parts = stripped.split("```")
+        for p in parts:
+            p = p.lstrip("json").strip()
+            if p.startswith("[") or p.startswith("{"):
+                stripped = p
+                break
+    if stripped.startswith("["):
+        end = stripped.rfind("]")
+        if end == -1:
+            raise ValueError(f"no JSON array found in model output: {stripped[:200]}")
+        issues = json.loads(stripped[: end + 1])
+        return {"issues": issues}
+    return _extract_json(text)
+
+
 def _parse_verdict(text: str) -> ReviewVerdict:
-    return ReviewVerdict.model_validate(_extract_json(text))
+    return ReviewVerdict.model_validate(_extract_verdict_json(text))
 
 
 def _parse_tiebreak(text: str) -> TiebreakVerdict:
