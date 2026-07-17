@@ -572,6 +572,76 @@ async def main():
     assert "OK_MARKER" in diff, \
         f"non-oversized non-binary untracked must be included: {diff!r}"
 
+    # 15e. INVARIANT: `_untracked_skip_reason` short-circuits on non-regular
+    # paths (FIFO, socket, device, symlink) instead of calling open() on
+    # them. Regression guard for the hang scenario: pre-fix, `open(fifo,
+    # "rb")` would block indefinitely, and because that's synchronous
+    # inside the async coroutine, wait_for(feature_seconds) could not
+    # preempt it -- the whole feature would hang past every timeout.
+    # Tested directly on the helper because git's ls-files skips FIFOs
+    # itself (defense-in-depth: if any other caller ever hands us one, the
+    # guard must fire without the hang).
+    from harness.orchestrator import _untracked_skip_reason  # noqa: E402
+    with tempfile.TemporaryDirectory() as tmp:
+        fifo_path = f"{tmp}/trap"
+        os.mkfifo(fifo_path)
+        reason = _untracked_skip_reason(fifo_path, 1_000_000, 8192)
+        assert reason == "non-regular", \
+            f"FIFO must produce 'non-regular' skip reason, got {reason!r}"
+        # Symlink case too -- following symlinks blindly is a similar
+        # class of risk (dangling symlink -> stat error, symlink loop ->
+        # untold pain). Explicit "symlink" marker so the reviewer sees why
+        # it wasn't included.
+        target = f"{tmp}/target.txt"
+        (open(target, "w")).write("hello\n")
+        link_path = f"{tmp}/link"
+        os.symlink(target, link_path)
+        reason = _untracked_skip_reason(link_path, 1_000_000, 8192)
+        assert reason == "symlink", \
+            f"symlink must produce 'symlink' skip reason, got {reason!r}"
+        # A vanished path (referenced but doesn't exist) must surface as
+        # "unreadable", not raise.
+        reason = _untracked_skip_reason(
+            f"{tmp}/does-not-exist", 1_000_000, 8192)
+        assert reason == "unreadable", \
+            f"missing path must produce 'unreadable' skip reason, got {reason!r}"
+
+    # 15f. INVARIANT: `human_only_paths` matching handles git-quoted paths.
+    # A sensitive filename with special characters would previously slip
+    # past routing because the regex-based header parser didn't unquote.
+    from harness.orchestrator import _extract_changed_paths  # noqa: E402
+    # Quoted header from a rename of "src/security/a b.py" (space in name).
+    quoted_diff = (
+        'diff --git "a/src/security/a b.py" "b/src/security/a b.py"\n'
+        '@@ -1 +1 @@\n-old\n+new\n'
+    )
+    paths = _extract_changed_paths(quoted_diff)
+    assert "src/security/a b.py" in paths, \
+        f"quoted path must be extracted with space intact: {paths!r}"
+    # Escaped-quote inside a filename, non-ASCII via octal.
+    tricky_diff = 'diff --git "a/x\\"y.py" "b/f\\303\\251\\.py"\n@@ -1 +1 @@\n-a\n+b\n'
+    paths = _extract_changed_paths(tricky_diff)
+    assert 'x"y.py' in paths, \
+        f"escaped-quote path must decode: {paths!r}"
+    assert "fé\\.py" in paths, \
+        f"octal-encoded non-ASCII path must decode: {paths!r}"
+
+    # 15g. INVARIANT: end-to-end path-aware routing still triggers on
+    # quoted paths. A rename involving a sensitive-tree filename with a
+    # space must route to human-only.
+    async def diff_quoted_sensitive():
+        return (
+            'diff --git "a/src/security/a b.py" "b/src/security/a b.py"\n'
+            '@@ -1 +1 @@\n-old\n+new\n'
+        )
+    cfg = HarnessConfig()
+    cfg.human_only_paths = ["src/security/"]
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                None, gate_pass, diff_quoted_sensitive)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_DISAGREEMENT, \
+        f"quoted sensitive path must trigger human-only: {r.outcome}"
+
     # 16. INVARIANT: rejected `major` issues reach the deadlock/tiebreak path
     # instead of being silently discarded. Pre-fix, `unresolved_blocking` was
     # computed from `blocking_ids` only, so a rejected major left it empty and

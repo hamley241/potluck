@@ -73,13 +73,24 @@ def register(claude_home: Path, hook_script: Path) -> dict:
             f"{settings_path} top level is not an object; refusing to edit."
         )
 
-    hooks_root = settings.setdefault("hooks", {})
-    pretool = hooks_root.setdefault("PreToolUse", [])
-    if not isinstance(pretool, list):
+    # Validate nested types BEFORE mutating. setdefault on a non-dict returns
+    # the existing (wrong-type) value and downstream .setdefault raises
+    # AttributeError -- callers only catch RuntimeError, so an unexpected
+    # `{"hooks": []}` shape would abort setup instead of reporting refusal.
+    existing_hooks = settings.get("hooks")
+    if existing_hooks is not None and not isinstance(existing_hooks, dict):
         raise RuntimeError(
-            f"{settings_path} hooks.PreToolUse is not a list; "
+            f"{settings_path} `hooks` is present but not an object; "
             f"refusing to edit."
         )
+    hooks_root = settings.setdefault("hooks", {})
+    existing_pretool = hooks_root.get("PreToolUse")
+    if existing_pretool is not None and not isinstance(existing_pretool, list):
+        raise RuntimeError(
+            f"{settings_path} hooks.PreToolUse is present but not a list; "
+            f"refusing to edit."
+        )
+    pretool = hooks_root.setdefault("PreToolUse", [])
 
     script_str = str(hook_script)
     for existing in pretool:
@@ -88,8 +99,30 @@ def register(claude_home: Path, hook_script: Path) -> dict:
             return {"status": "already_present", "settings_path": str(settings_path)}
 
     pretool.append(_hook_entry(hook_script))
-    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    _atomic_write_text(settings_path, json.dumps(settings, indent=2) + "\n")
     return {"status": "added", "settings_path": str(settings_path)}
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write via a same-directory temp file and `os.replace` so an interrupt
+    mid-write can't leave a truncated settings.json. Same directory matters:
+    `os.replace` is only guaranteed atomic within a single filesystem, and
+    tempfile.NamedTemporaryFile in TMPDIR may land on a different one."""
+    import tempfile
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(parent))
+    try:
+        with os.fdopen(fd, "w") as fp:
+            fp.write(content)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def main() -> int:

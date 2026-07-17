@@ -47,7 +47,6 @@ import asyncio
 import json
 import os
 import random
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -76,19 +75,116 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# Parses unified-diff headers of the form `diff --git a/<OLD> b/<NEW>`. Both
-# sides captured so rename/copy hunks yield BOTH the old and new paths --
-# either matching a human-only prefix must trigger routing.
-_DIFF_HEADER_RE = re.compile(r'^diff --git "?a/(.+?)"? "?b/(.+?)"?$', re.M)
+_DIFF_HEADER_PREFIX = "diff --git "
+
+# Git-quote escape map for single-character escapes. Octal escapes (`\NNN`)
+# are handled separately in _parse_git_quoted since they need lookahead.
+_GIT_QUOTE_ESCAPES = {
+    "a": "\a", "b": "\b", "t": "\t", "n": "\n",
+    "v": "\v", "f": "\f", "r": "\r",
+    '"': '"', "\\": "\\",
+}
+
+
+def _parse_git_quoted(s: str, start: int) -> tuple[str, int] | None:
+    """Parse a git-quoted string starting at s[start] (must be `"`). Returns
+    (decoded_contents, index_after_closing_quote), or None if the quote is
+    unterminated. Handles git's C-style escapes: `\\n`, `\\t`, `\\"`, `\\\\`,
+    and octal `\\NNN`.
+
+    Octal escapes encode individual BYTES (not code points) -- for a
+    multi-byte UTF-8 character like `é`, git emits `\\303\\251` (2 octal
+    escapes for 2 bytes). We accumulate everything as bytes and decode as
+    UTF-8 at the closing quote so the byte pairs recompose correctly.
+    Unknown escapes after `\\` pass through literally."""
+    if start >= len(s) or s[start] != '"':
+        return None
+    i = start + 1
+    out = bytearray()
+    while i < len(s):
+        c = s[i]
+        if c == '"':
+            return out.decode("utf-8", errors="replace"), i + 1
+        if c == "\\" and i + 1 < len(s):
+            nxt = s[i + 1]
+            if nxt in _GIT_QUOTE_ESCAPES:
+                out.append(ord(_GIT_QUOTE_ESCAPES[nxt]))
+                i += 2
+                continue
+            # Octal \NNN (three digits, each 0-7).
+            if (nxt.isdigit() and i + 4 <= len(s)
+                    and all("0" <= ch <= "7" for ch in s[i + 1:i + 4])):
+                out.append(int(s[i + 1:i + 4], 8))
+                i += 4
+                continue
+            # Unknown escape -- pass the backslash through literally.
+            out.append(ord(c))
+            i += 1
+            continue
+        out.extend(c.encode("utf-8"))
+        i += 1
+    return None  # unterminated quote
+
+
+def _parse_diff_git_header(line: str) -> tuple[str, str] | None:
+    """Parse `diff --git <a-spec> <b-spec>` into (old_path, new_path).
+    Handles git-quoted paths (spaces, non-ASCII, control chars). Returns None
+    on any line that isn't a valid header -- regex-only parsing (as previously)
+    silently mis-extracted quoted paths, so a sensitive filename with special
+    characters could slip past human_only_paths routing.
+    """
+    if not line.startswith(_DIFF_HEADER_PREFIX):
+        return None
+    rest = line[len(_DIFF_HEADER_PREFIX):]
+
+    # a-spec: either quoted or bare.
+    if rest.startswith('"'):
+        parsed = _parse_git_quoted(rest, 0)
+        if parsed is None:
+            return None
+        a_spec, next_i = parsed
+    else:
+        # Bare a-spec ends at the space before the b-spec (which starts with
+        # `b/` or `"b/`). This is unambiguous because git's own escaping
+        # wraps any spaces inside a path in quotes.
+        b_bare = rest.find(" b/")
+        b_quoted = rest.find(' "b/')
+        candidates = [i for i in (b_bare, b_quoted) if i >= 0]
+        if not candidates:
+            return None
+        next_i = min(candidates)
+        a_spec = rest[:next_i]
+
+    if next_i >= len(rest) or rest[next_i] != " ":
+        return None
+    next_i += 1
+
+    # b-spec.
+    if rest[next_i:].startswith('"'):
+        parsed = _parse_git_quoted(rest, next_i)
+        if parsed is None:
+            return None
+        b_spec, _ = parsed
+    else:
+        b_spec = rest[next_i:]
+
+    if a_spec.startswith("a/"):
+        a_spec = a_spec[2:]
+    if b_spec.startswith("b/"):
+        b_spec = b_spec[2:]
+    return a_spec, b_spec
 
 
 def _extract_changed_paths(diff: str) -> list[str]:
-    """Return every file path (both `a/` old and `b/` new sides) mentioned
-    by a `diff --git` header. Preserves order + duplicates so callers can
-    reason about them if they need to; deduping is cheap for callers that
-    don't care. Handles git's quoting of paths with unusual characters."""
+    """Return every file path (both `a/` old and `b/` new sides) mentioned by
+    a `diff --git` header. Preserves order + duplicates; deduping is cheap
+    for callers that don't care. Handles git-quoted paths correctly."""
     paths: list[str] = []
-    for old, new in _DIFF_HEADER_RE.findall(diff):
+    for line in diff.splitlines():
+        parsed = _parse_diff_git_header(line)
+        if parsed is None:
+            continue
+        old, new = parsed
         paths.append(old)
         paths.append(new)
     return paths
@@ -1023,14 +1119,24 @@ def _untracked_skip_reason(path: str, max_bytes: int,
     """Reason to omit this untracked file from the review diff, or None to
     include it. Reasons come out as human-readable strings that go into the
     `# skipped: <path> (<reason>)` marker."""
+    # lstat first so we don't follow symlinks and never open a non-regular
+    # file. A FIFO or socket left in the working tree (e.g. `mkfifo trap`)
+    # would otherwise block `open()` indefinitely, and because this is
+    # synchronous code inside the async coroutine, wait_for(feature_seconds)
+    # cannot preempt it. Explicit skip with a visible marker instead.
     try:
-        size = os.path.getsize(path)
+        st = os.lstat(path)
     except OSError:
-        # File vanished between listing and stat. Skip with a diagnostic
-        # rather than propagate the error -- diffing is best-effort.
         return "unreadable"
-    if size > max_bytes:
-        return f"size {size} bytes"
+    import stat as _stat
+    mode = st.st_mode
+    if _stat.S_ISLNK(mode):
+        return "symlink"
+    if not _stat.S_ISREG(mode):
+        # FIFOs, sockets, char/block devices -- anything we shouldn't open.
+        return "non-regular"
+    if st.st_size > max_bytes:
+        return f"size {st.st_size} bytes"
     try:
         with open(path, "rb") as fp:
             probe = fp.read(probe_bytes)

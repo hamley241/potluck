@@ -167,6 +167,55 @@ def _register_refuses_malformed_settings() -> bool:
             return True
 
 
+def _register_refuses_wrong_shape_hooks_key() -> bool:
+    """If some other tool wrote `{"hooks": [...]}` (list instead of dict),
+    the previous code would `.setdefault("PreToolUse", [])` on a list and
+    raise AttributeError -- callers only catch RuntimeError, so setup would
+    abort with a stack trace instead of a clean refusal message."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        (home / "settings.json").write_text(json.dumps({"hooks": []}))
+        script = home / "hooks" / "pre-tool-secret-scan.py"
+        try:
+            register(home, script)
+            return False  # should have raised
+        except RuntimeError:
+            return True
+        except AttributeError:
+            return False  # unclean crash -- exactly the bug we're guarding
+
+
+def _register_refuses_wrong_shape_pretool_key() -> bool:
+    """Similarly for `{"hooks": {"PreToolUse": "not a list"}}` -- must be a
+    clean RuntimeError, not an unhandled AttributeError from setdefault."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        (home / "settings.json").write_text(
+            json.dumps({"hooks": {"PreToolUse": "oops"}}))
+        script = home / "hooks" / "pre-tool-secret-scan.py"
+        try:
+            register(home, script)
+            return False
+        except RuntimeError:
+            return True
+        except AttributeError:
+            return False
+
+
+def _register_write_is_atomic() -> bool:
+    """After registration, no temp-file leftovers should sit next to
+    settings.json -- atomic write via tempfile + os.replace, with cleanup on
+    exception path. Absence of stragglers is what the atomic-write plumbing
+    is for; regressions would leave `.tmp` files behind."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        script = home / "hooks" / "pre-tool-secret-scan.py"
+        register(home, script)
+        leftovers = [p.name for p in home.iterdir()
+                     if p.name != "settings.json"]
+        return leftovers == []
+
+
 def main() -> bool:
     results: dict[str, bool] = {}
     results["hook_clean_payload_passes"] = asyncio.run(_clean_payload_passes())
@@ -184,6 +233,11 @@ def main() -> bool:
         _register_preserves_unrelated_hooks())
     results["register_refuses_malformed_settings"] = (
         _register_refuses_malformed_settings())
+    results["register_refuses_wrong_shape_hooks_key"] = (
+        _register_refuses_wrong_shape_hooks_key())
+    results["register_refuses_wrong_shape_pretool_key"] = (
+        _register_refuses_wrong_shape_pretool_key())
+    results["register_write_is_atomic"] = _register_write_is_atomic()
 
     ok = True
     for name, passed in results.items():
