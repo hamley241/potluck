@@ -133,8 +133,24 @@ async def gate_fail(): return (False, "")
 async def gate_hang():
     await asyncio.sleep(10)  # longer than the tiny test timeout
     return (True, "green")
-async def diff_security(): return "modified src/security/phi_crypto.py"
-async def diff_plain(): return "modified src/feature.py"
+async def diff_security():
+    return ("diff --git a/src/security/phi_crypto.py b/src/security/phi_crypto.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n")
+async def diff_plain():
+    return ("diff --git a/src/feature.py b/src/feature.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n")
+# Comment mentioning a sensitive path but no diff header touching it.
+# Previously (substring match) this would have wrongly triggered human-only
+# routing; the path-aware check must not fire.
+async def diff_comment_only():
+    return ("diff --git a/src/notes.py b/src/notes.py\n"
+            "@@ -1 +1 @@\n-old\n+# see src/security/ for details\n")
+# File renamed OUT of a sensitive tree: `a/` is under human-only, `b/` isn't.
+# Either-side rule: this MUST trigger human-only.
+async def diff_rename_out_of_sensitive():
+    return ("diff --git a/src/security/legacy.py b/src/util/legacy.py\n"
+            "similarity index 100%\nrename from src/security/legacy.py\n"
+            "rename to src/util/legacy.py\n")
 
 
 def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None):
@@ -290,7 +306,7 @@ async def main():
     assert call["spec"] == "spec", f"spec not threaded: {call['spec']!r}"
     assert call["acceptance"] == "acc", \
         f"acceptance not threaded: {call['acceptance']!r}"
-    assert call["diff"] == "modified src/feature.py", \
+    assert "src/feature.py" in call["diff"], \
         f"diff not threaded: {call['diff']!r}"
     results["invariant_real_args"] = (r.outcome, r.rounds_used)
 
@@ -425,6 +441,71 @@ async def main():
     r = await orch.run_feature("spec", "acc")
     results["invariant_silent_green_gate"] = (r.outcome, r.rounds_used)
 
+    # 15aa. INVARIANT: hanging doer at implement stage hits the doer's own
+    # step timeout and escalates as ESCALATED_TIMEOUT (previously the doer
+    # calls were unbounded, so this hang would wait forever).
+    class HangingDoerImplement(StubDoer):
+        async def implement(self, spec, acceptance):
+            await asyncio.sleep(10)  # much longer than the tiny test timeout
+            return "never"
+    cfg = HarnessConfig()
+    cfg.timeouts.model_call_seconds = 0
+    cfg.escalation.retries_before_counting = 0
+    cfg.escalation.consecutive_same_step_threshold = 2
+    orch = make(cfg, HangingDoerImplement({}), StubReviewer(cfg, {"issues": []}),
+                None, gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["invariant_doer_timeout"] = (r.outcome, r.rounds_used)
+
+    # 15ab. INVARIANT: feature-wall-clock timeout emits ABORTED_BUDGET, but
+    # ONLY when no finer-grained step signal fired first. The rule: "a
+    # finer-grained signal is never overwritten by a coarser one." Step
+    # TimeoutEscalation names WHICH step hung; ABORTED_BUDGET only says "too
+    # long overall." Both firing => step wins. This test proves the outer
+    # wall-clock catches a case where each individual step is fast enough
+    # to not trigger step-timeout, but the SUM exceeds feature_seconds.
+    class SlowButAliveDoer(StubDoer):
+        async def implement(self, spec, acceptance):
+            # Long enough that feature_seconds fires, short enough that the
+            # step timeout (higher) does not.
+            await asyncio.sleep(10)
+            return "done"
+    cfg = HarnessConfig()
+    cfg.timeouts.model_call_seconds = 60  # step timeout NOT hit
+    cfg.timeouts.feature_seconds = 0      # feature timeout WILL fire immediately
+    orch = make(cfg, SlowButAliveDoer({}), StubReviewer(cfg, {"issues": []}),
+                None, gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["invariant_feature_budget"] = (r.outcome, r.rounds_used)
+
+    # 15ac. INVARIANT: human_only_paths matches file paths from `diff --git`
+    # headers, not substrings of the diff text. Guards three regressions:
+    # (a) a code COMMENT mentioning a sensitive path must NOT trigger; the
+    # old p in diff check would false-positive.
+    # (b) A file renamed OUT of a sensitive tree MUST still trigger --
+    # either the `a/` or `b/` side matching is enough.
+    # (c) A normal change under the sensitive tree DOES trigger.
+    cfg = HarnessConfig()
+    cfg.human_only_paths = ["src/security/"]
+    # (a) Comment-only: should NOT trigger; outcome is normal PASSED.
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                None, gate_pass, diff_comment_only)
+    r_comment = await orch.run_feature("spec", "acc")
+    assert r_comment.outcome == Outcome.PASSED, \
+        f"comment mentioning sensitive path must not trigger routing: got {r_comment.outcome}"
+    # (b) Rename out of sensitive tree: MUST trigger human-only routing.
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                None, gate_pass, diff_rename_out_of_sensitive)
+    r_rename = await orch.run_feature("spec", "acc")
+    assert r_rename.outcome == Outcome.ESCALATED_DISAGREEMENT, \
+        f"rename out of sensitive tree must trigger human-only: got {r_rename.outcome}"
+    # (c) Normal edit under sensitive tree: triggers.
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                None, gate_pass, diff_security)
+    r_normal = await orch.run_feature("spec", "acc")
+    assert r_normal.outcome == Outcome.ESCALATED_DISAGREEMENT, \
+        f"real change under sensitive tree must trigger human-only: got {r_normal.outcome}"
+
     # 15b. INVARIANT: real_get_diff includes untracked files. Pre-fix,
     # `git diff HEAD` skipped them entirely; a whole new file the doer added
     # was invisible to the reviewer.
@@ -482,10 +563,217 @@ async def main():
     fix_texts = {i["suggested_fix"] for i in call["issues"]}
     assert "MAJOR_FIX_TEXT" in fix_texts, \
         f"apply_fixes must get suggested_fix text: {call['issues']!r}"
-    assert call["diff"] == "modified src/feature.py", \
+    assert "src/feature.py" in call["diff"], \
         f"apply_fixes must receive current diff: {call['diff']!r}"
     results["invariant_accepted_major_full_context"] = (
         r.outcome, r.rounds_used)
+
+    # 15d. INVARIANT: real_get_diff omits oversized untracked files with a
+    # visible marker (not silent absence). A doer that adds a 100 MB blob
+    # could otherwise let it slip past review by omission.
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"],
+                       cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"],
+                       cwd=tmp, check=True)
+        # Small tracked file so the "no tracked changes" path is exercised
+        # separately from the untracked-guard path.
+        (open(f"{tmp}/README", "w")).write("hello\n")
+        subprocess.run(["git", "add", "README"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"],
+                       cwd=tmp, check=True)
+        # Oversized untracked file (10 KB > our 4 KB probe below).
+        with open(f"{tmp}/big.txt", "wb") as fp:
+            fp.write(b"A" * 10_000)
+        # Untracked binary file (small enough for size, NUL in probe).
+        with open(f"{tmp}/blob.bin", "wb") as fp:
+            fp.write(b"header\x00binary payload\n")
+        # Untracked source file that should be included as normal.
+        (open(f"{tmp}/ok.py", "w")).write("def OK_MARKER(): pass\n")
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            diff = await real_get_diff(
+                max_untracked_bytes=4 * 1024,
+                binary_probe_bytes=1024,
+            )
+        finally:
+            os.chdir(prev_cwd)
+    assert "# skipped: big.txt (size" in diff, \
+        f"oversized untracked must be omitted with size marker: {diff!r}"
+    assert "# skipped: blob.bin (binary)" in diff, \
+        f"binary untracked must be omitted with binary marker: {diff!r}"
+    assert "OK_MARKER" in diff, \
+        f"non-oversized non-binary untracked must be included: {diff!r}"
+
+    # 15e-inject. INVARIANT: `# skipped:` markers encode filenames git-quotePath
+    # style so a filename containing `\n`, `"`, or non-ASCII bytes CAN'T
+    # inject fake diff content. Filter-based approaches (e.g. reject-if-newline)
+    # are brittle; encoding is correct-by-construction.
+    from harness.orchestrator import _git_quote_path  # noqa: E402
+    # Newline: must be encoded as \n and the whole path quoted.
+    encoded = _git_quote_path("evil\nname.py")
+    assert "\n" not in encoded, \
+        f"encoded path must not contain literal newline: {encoded!r}"
+    assert encoded == r'"evil\nname.py"', \
+        f"encoded path must be git-quoted: {encoded!r}"
+    # Plain ASCII no-special-chars: pass-through.
+    assert _git_quote_path("normal/path.py") == "normal/path.py"
+    # Non-ASCII UTF-8: octal-encoded per git convention.
+    encoded_utf8 = _git_quote_path("café.py")
+    assert encoded_utf8 == r'"caf\303\251.py"', \
+        f"non-ASCII path must be octal-encoded: {encoded_utf8!r}"
+
+    # 15e. INVARIANT: `_untracked_skip_reason` short-circuits on non-regular
+    # paths (FIFO, socket, device, symlink) instead of calling open() on
+    # them. Regression guard for the hang scenario: pre-fix, `open(fifo,
+    # "rb")` would block indefinitely, and because that's synchronous
+    # inside the async coroutine, wait_for(feature_seconds) could not
+    # preempt it -- the whole feature would hang past every timeout.
+    # Tested directly on the helper because git's ls-files skips FIFOs
+    # itself (defense-in-depth: if any other caller ever hands us one, the
+    # guard must fire without the hang).
+    from harness.orchestrator import _untracked_skip_reason  # noqa: E402
+    with tempfile.TemporaryDirectory() as tmp:
+        fifo_path = f"{tmp}/trap"
+        os.mkfifo(fifo_path)
+        reason = _untracked_skip_reason(fifo_path, 1_000_000, 8192)
+        assert reason == "non-regular", \
+            f"FIFO must produce 'non-regular' skip reason, got {reason!r}"
+        # Symlink case too -- following symlinks blindly is a similar
+        # class of risk (dangling symlink -> stat error, symlink loop ->
+        # untold pain). Explicit "symlink" marker so the reviewer sees why
+        # it wasn't included.
+        target = f"{tmp}/target.txt"
+        (open(target, "w")).write("hello\n")
+        link_path = f"{tmp}/link"
+        os.symlink(target, link_path)
+        reason = _untracked_skip_reason(link_path, 1_000_000, 8192)
+        assert reason == "symlink", \
+            f"symlink must produce 'symlink' skip reason, got {reason!r}"
+        # A vanished path (referenced but doesn't exist) must surface as
+        # "unreadable", not raise.
+        reason = _untracked_skip_reason(
+            f"{tmp}/does-not-exist", 1_000_000, 8192)
+        assert reason == "unreadable", \
+            f"missing path must produce 'unreadable' skip reason, got {reason!r}"
+
+    # 15f. INVARIANT: `human_only_paths` matching handles git-quoted paths.
+    # A sensitive filename with special characters would previously slip
+    # past routing because the regex-based header parser didn't unquote.
+    from harness.orchestrator import _extract_changed_paths  # noqa: E402
+    # Quoted header from a rename of "src/security/a b.py" (space in name).
+    quoted_diff = (
+        'diff --git "a/src/security/a b.py" "b/src/security/a b.py"\n'
+        '@@ -1 +1 @@\n-old\n+new\n'
+    )
+    paths = _extract_changed_paths(quoted_diff)
+    assert "src/security/a b.py" in paths, \
+        f"quoted path must be extracted with space intact: {paths!r}"
+    # Escaped-quote inside a filename, non-ASCII via octal.
+    tricky_diff = 'diff --git "a/x\\"y.py" "b/f\\303\\251\\.py"\n@@ -1 +1 @@\n-a\n+b\n'
+    paths = _extract_changed_paths(tricky_diff)
+    assert 'x"y.py' in paths, \
+        f"escaped-quote path must decode: {paths!r}"
+    assert "fé\\.py" in paths, \
+        f"octal-encoded non-ASCII path must decode: {paths!r}"
+
+    # 15f-cc. INVARIANT: merge/combined diff headers (`diff --cc`,
+    # `diff --combined`) trigger human_only_paths routing. Pre-fix, only
+    # `diff --git` headers were parsed; a merge conflict touching a
+    # sensitive file would silently be sent to the external reviewer.
+    cc_paths = _extract_changed_paths(
+        'diff --cc src/security/merged.py\n@@@ @@@\n-a\n+b\n')
+    assert cc_paths == ["src/security/merged.py"], \
+        f"diff --cc header must extract path: {cc_paths!r}"
+    combined_paths = _extract_changed_paths(
+        'diff --combined src/security/x.py\n@@@ @@@\n')
+    assert combined_paths == ["src/security/x.py"], \
+        f"diff --combined header must extract path: {combined_paths!r}"
+    # Quoted merged path.
+    quoted_cc_paths = _extract_changed_paths(
+        'diff --cc "src/security/a b.py"\n@@@ @@@\n')
+    assert quoted_cc_paths == ["src/security/a b.py"], \
+        f"quoted diff --cc must decode: {quoted_cc_paths!r}"
+
+    # 15f-prefix. INVARIANT: human_only_paths prefix match respects path
+    # boundaries. `["src/security"]` must NOT match `src/security_bypass.py`.
+    async def diff_bypass_lookalike():
+        return ('diff --git a/src/security_bypass.py b/src/security_bypass.py\n'
+                '@@ -1 +1 @@\n-a\n+b\n')
+    cfg = HarnessConfig()
+    cfg.human_only_paths = ["src/security"]  # NO trailing slash
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                None, gate_pass, diff_bypass_lookalike)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.PASSED, \
+        f"src/security_bypass.py must not match human_only_paths=['src/security']: {r.outcome}"
+
+    # 15g. INVARIANT: end-to-end path-aware routing still triggers on
+    # quoted paths. A rename involving a sensitive-tree filename with a
+    # space must route to human-only.
+    async def diff_quoted_sensitive():
+        return (
+            'diff --git "a/src/security/a b.py" "b/src/security/a b.py"\n'
+            '@@ -1 +1 @@\n-old\n+new\n'
+        )
+    cfg = HarnessConfig()
+    cfg.human_only_paths = ["src/security/"]
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                None, gate_pass, diff_quoted_sensitive)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_DISAGREEMENT, \
+        f"quoted sensitive path must trigger human-only: {r.outcome}"
+
+    # 15h. INVARIANT: malformed doer JSON escalates cleanly as
+    # ESCALATED_NO_SIGNAL, not an uncaught Pydantic ValidationError. The
+    # doer's `respond_to_review` return is validated OUTSIDE StepRunner's
+    # error boundary, so ValidationError previously propagated to run_feature
+    # which doesn't know about pydantic -> uncaught traceback.
+    class MalformedDoer(StubDoer):
+        async def respond_to_review(self, spec, acceptance, diff, verdict):
+            class FakeResp:
+                def model_dump_json(self):
+                    return "this is not valid json"
+            return FakeResp()
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]},
+        followups=[{"issues": []}])
+    orch = make(cfg, MalformedDoer({"I1": "reject"}), reviewer, None,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["invariant_doer_malformed_response"] = (r.outcome, r.rounds_used)
+
+    # 15i. INVARIANT: HarnessConfig.validate() rejects feature_seconds smaller
+    # than the largest step timeout. The "finer signal never overwritten"
+    # guarantee only holds when steps can raise TimeoutEscalation before the
+    # outer wall-clock cancels the task; making the violating config
+    # unrepresentable at load time is stronger than handling the runtime race.
+    from harness.config import HarnessConfig as _HC  # noqa: E402
+    bad = _HC()
+    bad.timeouts.feature_seconds = 30
+    bad.timeouts.model_call_seconds = 120
+    try:
+        bad.validate()
+        assert False, "validate() must reject feature_seconds < max step timeout"
+    except ValueError:
+        pass  # expected
+    # Zero feature_seconds is the deliberate "fire immediately" test case;
+    # validate() must NOT reject it (used by invariant_feature_budget above).
+    ok = _HC()
+    ok.timeouts.feature_seconds = 0
+    ok.validate()  # must not raise
+    # Negative timeouts rejected.
+    neg = _HC()
+    neg.timeouts.model_call_seconds = -1
+    try:
+        neg.validate()
+        assert False, "validate() must reject negative timeouts"
+    except ValueError:
+        pass
 
     # 16. INVARIANT: rejected `major` issues reach the deadlock/tiebreak path
     # instead of being silently discarded. Pre-fix, `unresolved_blocking` was
@@ -694,13 +982,18 @@ async def main():
         "human_only_routing": (Outcome.ESCALATED_DISAGREEMENT, 0),
         "ci_gate_only": (Outcome.PASSED, 0),
         "reviewer_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
-        "tiebreaker_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
+        "tiebreaker_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 2),
         "invariant_real_args": (Outcome.PASSED, 2),
         "invariant_transcript": (Outcome.PASSED, 2),
         "invariant_truncation": (Outcome.PASSED, 0),
         "invariant_silent_green_gate": (Outcome.PASSED, 0),
+        "invariant_doer_timeout": (Outcome.ESCALATED_TIMEOUT, 0),
+        "invariant_feature_budget": (Outcome.ABORTED_BUDGET, 0),
         "invariant_accepted_major_full_context": (Outcome.PASSED, 1),
         "invariant_major_deadlocks": (Outcome.ESCALATED_DISAGREEMENT, 2),
+        # rounds_used=0 because the failure fires mid-round-1; per
+        # completed-round semantics, the round didn't finish.
+        "invariant_doer_malformed_response": (Outcome.ESCALATED_NO_SIGNAL, 0),
         "invariant_bare_empty_array_verdict_parses": (Outcome.PASSED, 0),
         "invariant_bare_populated_array_verdict_parses": (Outcome.PASSED, 1),
         "invariant_followup_bare_array_ends_debate_cleanly": (Outcome.PASSED, 1),

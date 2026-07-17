@@ -35,6 +35,13 @@ BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
 link "$REPO/potluck" "$BIN_DIR/potluck"
 
+# Register the secret-scan hook in Claude Code's settings.json. Merge-safe
+# and idempotent -- won't clobber existing hooks other tools installed.
+# Same helper the `potluck setup` (install path) uses, so both paths stay
+# feature-matched. Pure stdlib -- no uv/pydantic needed.
+CLAUDE_HOME="$DEST" PYTHONPATH="$REPO" python3 -m harness.hook_setup \
+  || echo "  (hook registration skipped -- run 'potluck setup' manually)"
+
 # Resolve which models fill each role on THIS machine. CI is non-interactive,
 # so auto-resolve there; personal/phi ask per external model.
 echo

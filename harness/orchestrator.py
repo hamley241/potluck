@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -94,6 +95,179 @@ class DoerProtocolViolation(Exception):
             f"doer omitted {len(missing_ids)} verdict issue id(s) "
             f"{sorted(missing_ids)} in round {round}"
         )
+
+
+_DIFF_HEADER_PREFIX = "diff --git "
+
+# Git-quote escape map for single-character escapes. Octal escapes (`\NNN`)
+# are handled separately in _parse_git_quoted since they need lookahead.
+_GIT_QUOTE_ESCAPES = {
+    "a": "\a", "b": "\b", "t": "\t", "n": "\n",
+    "v": "\v", "f": "\f", "r": "\r",
+    '"': '"', "\\": "\\",
+}
+# Reverse map for encoding.
+_GIT_ENCODE_ESCAPES = {
+    ord("\a"): r"\a", ord("\b"): r"\b", ord("\t"): r"\t", ord("\n"): r"\n",
+    ord("\v"): r"\v", ord("\f"): r"\f", ord("\r"): r"\r",
+    ord('"'): r"\"", ord("\\"): r"\\",
+}
+
+
+def _git_quote_path(path: str) -> str:
+    """Encode `path` in git's `core.quotePath` style so newlines, quotes,
+    and non-ASCII bytes CAN'T inject content into the surrounding stream.
+    Returns the path unquoted if it's plain ASCII with no special chars,
+    or a double-quoted C-style-escaped form otherwise. Uses git's own
+    convention so downstream parsers that already handle git-quoted paths
+    handle these markers correctly too."""
+    needs_quote = False
+    encoded_bytes = bytearray()
+    for b in path.encode("utf-8"):
+        if b in _GIT_ENCODE_ESCAPES:
+            needs_quote = True
+            encoded_bytes.extend(_GIT_ENCODE_ESCAPES[b].encode("ascii"))
+        elif b < 0x20 or b >= 0x80:
+            needs_quote = True
+            # Octal \NNN, three digits.
+            encoded_bytes.extend(f"\\{b:03o}".encode("ascii"))
+        else:
+            encoded_bytes.append(b)
+    if not needs_quote:
+        return path
+    return '"' + encoded_bytes.decode("ascii") + '"'
+
+
+def _parse_git_quoted(s: str, start: int) -> tuple[str, int] | None:
+    """Parse a git-quoted string starting at s[start] (must be `"`). Returns
+    (decoded_contents, index_after_closing_quote), or None if the quote is
+    unterminated. Handles git's C-style escapes: `\\n`, `\\t`, `\\"`, `\\\\`,
+    and octal `\\NNN`.
+
+    Octal escapes encode individual BYTES (not code points) -- for a
+    multi-byte UTF-8 character like `é`, git emits `\\303\\251` (2 octal
+    escapes for 2 bytes). We accumulate everything as bytes and decode as
+    UTF-8 at the closing quote so the byte pairs recompose correctly.
+    Unknown escapes after `\\` pass through literally."""
+    if start >= len(s) or s[start] != '"':
+        return None
+    i = start + 1
+    out = bytearray()
+    while i < len(s):
+        c = s[i]
+        if c == '"':
+            return out.decode("utf-8", errors="replace"), i + 1
+        if c == "\\" and i + 1 < len(s):
+            nxt = s[i + 1]
+            if nxt in _GIT_QUOTE_ESCAPES:
+                out.append(ord(_GIT_QUOTE_ESCAPES[nxt]))
+                i += 2
+                continue
+            # Octal \NNN (three digits, each 0-7).
+            if (nxt.isdigit() and i + 4 <= len(s)
+                    and all("0" <= ch <= "7" for ch in s[i + 1:i + 4])):
+                out.append(int(s[i + 1:i + 4], 8))
+                i += 4
+                continue
+            # Unknown escape -- pass the backslash through literally.
+            out.append(ord(c))
+            i += 1
+            continue
+        out.extend(c.encode("utf-8"))
+        i += 1
+    return None  # unterminated quote
+
+
+def _parse_diff_git_header(line: str) -> tuple[str, str] | None:
+    """Parse `diff --git <a-spec> <b-spec>` into (old_path, new_path).
+    Handles git-quoted paths (spaces, non-ASCII, control chars). Returns None
+    on any line that isn't a valid header -- regex-only parsing (as previously)
+    silently mis-extracted quoted paths, so a sensitive filename with special
+    characters could slip past human_only_paths routing.
+    """
+    if not line.startswith(_DIFF_HEADER_PREFIX):
+        return None
+    rest = line[len(_DIFF_HEADER_PREFIX):]
+
+    # a-spec: either quoted or bare.
+    if rest.startswith('"'):
+        parsed = _parse_git_quoted(rest, 0)
+        if parsed is None:
+            return None
+        a_spec, next_i = parsed
+    else:
+        # Bare a-spec ends at the space before the b-spec (which starts with
+        # `b/` or `"b/`). This is unambiguous because git's own escaping
+        # wraps any spaces inside a path in quotes.
+        b_bare = rest.find(" b/")
+        b_quoted = rest.find(' "b/')
+        candidates = [i for i in (b_bare, b_quoted) if i >= 0]
+        if not candidates:
+            return None
+        next_i = min(candidates)
+        a_spec = rest[:next_i]
+
+    if next_i >= len(rest) or rest[next_i] != " ":
+        return None
+    next_i += 1
+
+    # b-spec.
+    if rest[next_i:].startswith('"'):
+        parsed = _parse_git_quoted(rest, next_i)
+        if parsed is None:
+            return None
+        b_spec, _ = parsed
+    else:
+        b_spec = rest[next_i:]
+
+    if a_spec.startswith("a/"):
+        a_spec = a_spec[2:]
+    if b_spec.startswith("b/"):
+        b_spec = b_spec[2:]
+    return a_spec, b_spec
+
+
+# Merge/combined diff header prefixes. Distinct from `diff --git` because
+# merge-conflict diffs identify a SINGLE path (the merged file) rather than
+# an a/OLD b/NEW pair. Ignoring these leaked sensitive-path changes past
+# human_only_paths routing whenever a merge touched a protected file.
+_DIFF_CC_PREFIX = "diff --cc "
+_DIFF_COMBINED_PREFIX = "diff --combined "
+
+
+def _parse_diff_cc_header(line: str) -> str | None:
+    """`diff --cc <path>` and `diff --combined <path>` -- merge/conflict
+    combined diffs. Return the merged path (unquoted if needed), or None.
+    The trailing path may be git-quoted just like `diff --git`."""
+    for prefix in (_DIFF_CC_PREFIX, _DIFF_COMBINED_PREFIX):
+        if line.startswith(prefix):
+            rest = line[len(prefix):]
+            if rest.startswith('"'):
+                parsed = _parse_git_quoted(rest, 0)
+                return parsed[0] if parsed is not None else None
+            return rest or None
+    return None
+
+
+def _extract_changed_paths(diff: str) -> list[str]:
+    """Return every file path (both `a/` old and `b/` new sides) mentioned by
+    a `diff --git`, `diff --cc`, or `diff --combined` header. Preserves order
+    + duplicates; deduping is cheap for callers that don't care. Handles
+    git-quoted paths correctly. Ignoring merge/combined headers previously
+    let sensitive-path changes slip past human_only_paths routing whenever
+    a conflict resolution touched a protected file."""
+    paths: list[str] = []
+    for line in diff.splitlines():
+        parsed = _parse_diff_git_header(line)
+        if parsed is not None:
+            old, new = parsed
+            paths.append(old)
+            paths.append(new)
+            continue
+        merged = _parse_diff_cc_header(line)
+        if merged is not None:
+            paths.append(merged)
+    return paths
 
 
 # Depth cap for _truncate_walk. Log payloads are shallow by construction
@@ -162,6 +336,17 @@ def _pack_event(event: str, event_version: int, **fields) -> dict:
     if truncations:
         packed["truncations"] = truncations
     return packed
+
+
+@dataclass
+class _RunState:
+    """Per-invocation mutable state, threaded through `_run` so the outer
+    exception handlers in `run_feature` can read the last known "safe" round
+    count. NOT on `self` -- Orchestrator could be reused across features and
+    per-feature counters must never leak. `rounds_used` is COMPLETED rounds:
+    incremented at the end of the round body, not the top, so a mid-round
+    exception attributes to the previous round (the last one that finished)."""
+    rounds_used: int = 0
 
 
 class GateResult(NamedTuple):
@@ -361,30 +546,47 @@ class Orchestrator:
         self.log: list[dict] = []
 
     async def run_feature(self, spec: str, acceptance: str) -> FeatureResult:
+        # Per-invocation state box, not mutable `self` attribute -- if this
+        # Orchestrator instance is ever reused across features, per-feature
+        # counters would otherwise leak across.
+        state = _RunState()
+        # Exception-handler order encodes the precedence rule: a finer-grained
+        # signal is never overwritten by a coarser one. Step-level
+        # TimeoutEscalation names WHICH step hung; ABORTED_BUDGET only says
+        # "too long overall." If a step's TimeoutEscalation already raised
+        # inside _run, it propagates through wait_for and is caught HERE
+        # before asyncio.TimeoutError is even considered.
         try:
-            return await self._run(spec, acceptance)
+            return await asyncio.wait_for(
+                self._run(spec, acceptance, state),
+                timeout=self.cfg.timeouts.feature_seconds,
+            )
         except TimeoutEscalation as te:
-            self._log("timeout_escalation", pattern=te.pattern, detail=te.detail)
+            self._log("timeout_escalation", pattern=te.pattern,
+                      detail=te.detail, rounds_used=state.rounds_used)
             return FeatureResult(
                 outcome=Outcome.ESCALATED_TIMEOUT,
-                rounds_used=0,
+                rounds_used=state.rounds_used,
                 debate_log=self.log,
                 escalation_reason=f"[{te.pattern}] {te.detail}",
             )
         except ModelUnavailable as mu:
-            self._log("model_unavailable", role=mu.role, detail=mu.detail)
+            self._log("model_unavailable", role=mu.role,
+                      detail=mu.detail, rounds_used=state.rounds_used)
             return FeatureResult(
                 outcome=Outcome.ESCALATED_NO_SIGNAL,
-                rounds_used=0,
+                rounds_used=state.rounds_used,
                 debate_log=self.log,
                 escalation_reason=f"[{mu.role}] {mu.detail}",
             )
         except DoerProtocolViolation as dpv:
             # The doer responded, but non-conformantly: it failed to take a
             # stance on every reviewer issue. Neither a hang (TimeoutEscalation)
-            # nor an unavailable model (ModelUnavailable) -- but semantically the
-            # same no-signal bucket, so ESCALATED_NO_SIGNAL rather than a new
-            # Outcome value. rounds_used is the round the violation fired in.
+            # nor an unavailable model (ModelUnavailable) -- but semantically
+            # the same no-signal bucket, so ESCALATED_NO_SIGNAL rather than a
+            # new Outcome value. rounds_used comes from the exception (round
+            # the violation fired in) rather than state.rounds_used because the
+            # round did NOT complete -- state is still at N-1.
             return FeatureResult(
                 outcome=Outcome.ESCALATED_NO_SIGNAL,
                 rounds_used=dpv.round,
@@ -394,10 +596,32 @@ class Orchestrator:
                     f"omitted verdict issue id(s) {sorted(dpv.missing_ids)}"
                 ),
             )
+        except asyncio.TimeoutError:
+            # Outer feature budget expired and NO finer-grained escalation
+            # fired first -- any step-level TimeoutEscalation would have
+            # propagated through wait_for and been caught above. This branch
+            # only runs when the total wall-clock exceeded feature_seconds
+            # without any single step hitting its own timeout threshold
+            # (e.g. many short calls that add up to > feature_seconds).
+            self._log("aborted_budget",
+                      feature_seconds=self.cfg.timeouts.feature_seconds,
+                      rounds_used=state.rounds_used)
+            return FeatureResult(
+                outcome=Outcome.ABORTED_BUDGET,
+                rounds_used=state.rounds_used,
+                debate_log=self.log,
+                escalation_reason=(
+                    f"feature exceeded {self.cfg.timeouts.feature_seconds}s "
+                    f"wall-clock budget"
+                ),
+            )
 
-    async def _run(self, spec: str, acceptance: str) -> FeatureResult:
-        # 1. Implement
-        await self.doer.implement(spec, acceptance)
+    async def _run(self, spec: str, acceptance: str,
+                   state: "_RunState") -> FeatureResult:
+        # 1. Implement (bounded by StepRunner -- previously unbounded, so a
+        #    hanging `claude -p` at the implement stage would wait forever
+        #    with no step-level signal).
+        await self._doer_implement(spec, acceptance)
 
         # 2. Gate (correctness is settled by tools, not opinion)
         passed, detail = await self._gate_or_escalate("initial")
@@ -430,16 +654,14 @@ class Orchestrator:
         # full ReviewIssue objects with descriptions and suggested_fix to the
         # doer -- IDs alone are not actionable for a stateless subprocess.
         accepted_issues_by_id: dict[str, ReviewIssue] = {}
-        rounds_used = 0
         # deadlock_ids covers both blocking AND major -- reviewer flagged a
         # major concern as materially wrong, so a rejected major deserves the
         # same deadlock/tiebreak path as a rejected blocking.
         unresolved = verdict.deadlock_ids
 
         for rnd in range(1, self.cfg.debate.max_rounds + 1):
-            rounds_used = rnd
             # 4. Doer responds per issue
-            response = await self.doer.respond_to_review(
+            response = await self._doer_respond_to_review(
                 spec, acceptance, diff, verdict)
             # Protocol invariant: the doer must take a stance (accept/reject)
             # on every issue the reviewer raised. A DoerResponse that omits any
@@ -473,6 +695,10 @@ class Orchestrator:
 
             rejected = response.rejected_ids() & unresolved
             if not rejected:
+                # rounds_used = COMPLETED rounds only. This round succeeded
+                # (nothing left to argue about), so it counts. Increment
+                # BEFORE break so escalation reporting is accurate.
+                state.rounds_used = rnd
                 unresolved = set()
                 break  # everything blocking-or-major accepted -> done debating
 
@@ -489,6 +715,11 @@ class Orchestrator:
                       held_issues=[i.model_dump(mode="json")
                                    for i in verdict.issues
                                    if i.id in unresolved])
+            # Round is COMPLETED at this point (both doer & reviewer replied,
+            # both events logged). An exception raised beyond here reports
+            # this round as done; an exception raised inside the round body
+            # reports the PREVIOUS round as the last one that finished.
+            state.rounds_used = rnd
             if not unresolved:
                 break
 
@@ -496,16 +727,16 @@ class Orchestrator:
         if unresolved:
             unresolved = await self._tiebreak(
                 spec, acceptance, diff, unresolved, verdict, response,
-                rounds_used)
+                state.rounds_used)
             if unresolved:
                 return self._escalated(
-                    Outcome.ESCALATED_DISAGREEMENT, rounds_used,
-                    f"unresolved issues after {rounds_used} rounds: "
+                    Outcome.ESCALATED_DISAGREEMENT, state.rounds_used,
+                    f"unresolved issues after {state.rounds_used} rounds: "
                     f"{sorted(unresolved)}",
                 )
 
         # 7. Apply agreed fixes
-        await self.doer.apply_fixes(
+        await self._doer_apply_fixes(
             [accepted_issues_by_id[k] for k in sorted(accepted_issues_by_id)],
             diff)
 
@@ -515,11 +746,12 @@ class Orchestrator:
             reason = "gate failed after applying fixes"
             if detail:
                 reason = f"{reason}: {detail}"
-            return self._escalated(Outcome.ESCALATED_GATE, rounds_used, reason)
+            return self._escalated(
+                Outcome.ESCALATED_GATE, state.rounds_used, reason)
 
         # 9. Done
-        self._log("passed", rounds=rounds_used)
-        return FeatureResult(Outcome.PASSED, rounds_used, self.log)
+        self._log("passed", rounds=state.rounds_used)
+        return FeatureResult(Outcome.PASSED, state.rounds_used, self.log)
 
     # --- bounded wrappers around external steps ---
 
@@ -568,6 +800,73 @@ class Orchestrator:
         self._log("gate", label=label, passed=gate_res.ok,
                   output=gate_res.output)
         return gate_res.ok, gate_res.output if not gate_res.ok else ""
+
+    # --- bounded wrappers around the doer (Claude Code) ---
+    # These mirror the reviewer/tiebreaker wrappers: every external call runs
+    # under StepRunner so a hanging doer is caught by the same timeout policy
+    # that governs the reviewer. Previously these were awaited directly,
+    # making the doer the only unbounded path in the loop.
+
+    async def _doer_implement(self, spec: str, acceptance: str) -> str:
+        res = await self.runner.run(
+            "doer:implement",
+            lambda: self.doer.implement(spec, acceptance),
+            self.cfg.timeouts.model_call_seconds,
+        )
+        if res.timed_out:
+            raise TimeoutEscalation("doer_no_signal",
+                                    "doer timed out during implement")
+        if not res.ok:
+            raise ModelUnavailable(
+                "doer", res.error or "doer implement errored")
+        return res.output
+
+    async def _doer_respond_to_review(self, spec: str, acceptance: str,
+                                      diff: str,
+                                      verdict: ReviewVerdict) -> DoerResponse:
+        # respond_to_review returns a structured DoerResponse, but StepResult
+        # carries `output: str` (kept strict so model backends returning
+        # bytes/dict get rejected at the boundary rather than crashing in
+        # _parse_verdict). Serialize to JSON at the runner boundary; the
+        # extra round-trip is trivial compared to the model call itself.
+        async def _call() -> str:
+            resp = await self.doer.respond_to_review(
+                spec, acceptance, diff, verdict)
+            return resp.model_dump_json()
+
+        res = await self.runner.run(
+            "doer:respond", _call, self.cfg.timeouts.model_call_seconds)
+        if res.timed_out:
+            raise TimeoutEscalation("doer_no_signal",
+                                    "doer timed out during respond_to_review")
+        if not res.ok:
+            raise ModelUnavailable(
+                "doer", res.error or "doer respond errored")
+        # Pydantic ValidationError from a malformed doer JSON must NOT
+        # propagate as an uncaught traceback -- run_feature's escalation
+        # handlers don't know about pydantic. Convert to ModelUnavailable
+        # so the outcome is a clean ESCALATED_NO_SIGNAL, same as any other
+        # unusable doer response.
+        try:
+            return DoerResponse.model_validate_json(res.output)
+        except Exception as e:  # pydantic ValidationError, JSONDecodeError, ...
+            raise ModelUnavailable(
+                "doer", f"doer returned malformed response: {e}") from e
+
+    async def _doer_apply_fixes(self, issues: list[ReviewIssue],
+                                diff: str) -> str:
+        res = await self.runner.run(
+            "doer:apply_fixes",
+            lambda: self.doer.apply_fixes(issues, diff),
+            self.cfg.timeouts.model_call_seconds,
+        )
+        if res.timed_out:
+            raise TimeoutEscalation("doer_no_signal",
+                                    "doer timed out during apply_fixes")
+        if not res.ok:
+            raise ModelUnavailable(
+                "doer", res.error or "doer apply_fixes errored")
+        return res.output
 
     async def _review(self, spec: str, acceptance: str,
                       diff: str) -> ReviewVerdict:
@@ -682,7 +981,24 @@ class Orchestrator:
     # --- helpers ---
 
     def _is_human_only(self, diff: str) -> bool:
-        return any(p and p in diff for p in self.cfg.human_only_paths)
+        """True if any file touched by the diff is under a human-only path.
+        Path-aware: parses `diff --git`, `diff --cc`, and `diff --combined`
+        headers rather than substring-matching the diff text. For
+        renames/copies, EITHER side matching triggers routing -- a file
+        moving OUT of a sensitive tree still touched it. Configured paths
+        are normalized to end with `/` so `human_only_paths=["src/security"]`
+        does NOT match `src/security_bypass.py` (previously did)."""
+        configured = [
+            p if p.endswith("/") else p + "/"
+            for p in self.cfg.human_only_paths if p
+        ]
+        if not configured:
+            return False
+        for path in _extract_changed_paths(diff):
+            for p in configured:
+                if path.startswith(p):
+                    return True
+        return False
 
     def _escalated(self, outcome: Outcome, rounds: int, reason: str) -> FeatureResult:
         self._log("escalated", outcome=outcome.value, reason=reason)
@@ -891,7 +1207,8 @@ async def real_run_gate(gate_path: str = "./.claude/verify.sh") -> str:
         ok=False, output=stderr.decode(errors="replace")).to_json_str()
 
 
-async def real_get_diff() -> str:
+async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
+                        binary_probe_bytes: int = 8 * 1024) -> str:
     """Return the current change set for review: tracked changes vs HEAD, plus
     each untracked file rendered as a real `git diff --no-index` patch. Bare
     `git diff HEAD` skips untracked files, so a doer that adds a whole new
@@ -900,6 +1217,16 @@ async def real_get_diff() -> str:
     Untracked patches are appended with real unified-diff format (via git
     itself) rather than hand-rolled synthetic hunks -- downstream parsers
     would break on ad-hoc patch shapes.
+
+    Untracked-file guards (see HarnessConfig.diff):
+      * files above `max_untracked_bytes` are omitted with a
+        `# skipped: <path> (size N bytes)` marker
+      * files whose first `binary_probe_bytes` contains a NUL byte are
+        treated as binary and omitted with a `# skipped: <path> (binary)`
+        marker
+    The markers are important: silent absence would let a doer bypass review
+    by dropping a large file. A visible marker means the reviewer can see
+    something was omitted and ask for it.
 
     No timeout here -- the Orchestrator wraps this via StepRunner.
     """
@@ -917,6 +1244,16 @@ async def real_get_diff() -> str:
                  for name in listing_bytes.split(b"\0") if name]
     parts = [tracked] if tracked else []
     for f in untracked:
+        skip_reason = _untracked_skip_reason(
+            f, max_untracked_bytes, binary_probe_bytes)
+        if skip_reason:
+            # Encode the path git-quotePath style so a filename containing
+            # `\n`, `"`, or non-ASCII bytes CAN'T inject fake diff content
+            # into the marker line. Filtering would be brittle; encoding is
+            # correct-by-construction and matches git's own convention.
+            parts.append(
+                f"\n# skipped: {_git_quote_path(f)} ({skip_reason})\n")
+            continue
         # `git diff --no-index` exits 0 when files are identical and 1 when
         # they differ. We're diffing /dev/null against a non-empty new file,
         # so it will exit 1 -- capture stdout regardless via a direct
@@ -930,3 +1267,54 @@ async def real_get_diff() -> str:
         if stdout:
             parts.append(stdout.decode(errors="replace"))
     return "".join(parts)
+
+
+def _untracked_skip_reason(path: str, max_bytes: int,
+                           probe_bytes: int) -> str | None:
+    """Reason to omit this untracked file from the review diff, or None to
+    include it. Reasons come out as human-readable strings that go into the
+    `# skipped: <path> (<reason>)` marker.
+
+    TOCTOU-safe: we NEVER stat the path and then open it -- an attacker with
+    local access could swap a FIFO between the two calls, and `open()`
+    blocking on a FIFO would hang the async coroutine past every timeout
+    (synchronous code can't be preempted by `wait_for`). Instead: open with
+    `O_NOFOLLOW | O_NONBLOCK`, then `fstat` the FD to check type on the
+    actual opened file. `O_NONBLOCK` also guarantees a FIFO opens or errors
+    immediately (never blocks) even if it wins the race."""
+    import stat as _stat
+    try:
+        # O_NOFOLLOW: fail on symlink (attacker can't redirect us).
+        # O_NONBLOCK: a FIFO on the write side opens instantly with ENXIO
+        #             instead of hanging; a FIFO on read waits for a writer
+        #             normally, but with O_NONBLOCK the open returns an fd
+        #             backed by an empty pipe that we then reject via fstat.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as e:
+        # ELOOP (symlink caught by O_NOFOLLOW), ENOENT (vanished), EACCES,
+        # ENXIO (FIFO write-side with no reader). Bucket everything as
+        # "unreadable" or "symlink" for the specific ELOOP case that
+        # confirms redirection.
+        import errno
+        if e.errno == errno.ELOOP:
+            return "symlink"
+        return "unreadable"
+    try:
+        st = os.fstat(fd)
+        mode = st.st_mode
+        if not _stat.S_ISREG(mode):
+            return "non-regular"
+        if st.st_size > max_bytes:
+            return f"size {st.st_size} bytes"
+        try:
+            probe = os.read(fd, probe_bytes)
+        except OSError:
+            return "unreadable"
+        if b"\x00" in probe:
+            return "binary"
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
