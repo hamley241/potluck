@@ -62,11 +62,14 @@ class DoerResponse(BaseModel):
 class TiebreakVerdict(BaseModel):
     """Kimi's adjudication on a single contested issue.
 
-    Kimi is given the spec, the diff, and both arguments -- but NOT which model
-    made which argument (anti-brand-bias). It judges the arguments, not the names.
+    The tiebreaker sees ARGUMENT A and ARGUMENT B with no hint of which model
+    authored which (anti-brand-bias) and no fixed role→slot mapping
+    (anti-position-bias -- A/B is randomized per issue by the orchestrator).
+    It picks a slot; the orchestrator, which holds the mapping, translates
+    that slot back to doer/reviewer.
     """
     id: str
-    sides_with: Literal["reviewer", "doer", "unclear"]
+    sides_with: Literal["a", "b", "unclear"]
     reasoning: str
 
 
