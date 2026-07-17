@@ -15,7 +15,7 @@ import json
 
 from harness.config import HarnessConfig
 from harness.orchestrator import (
-    Orchestrator, DoerClient, ReviewerClient, TiebreakerClient,
+    Orchestrator, DoerClient, ReviewerClient, TiebreakerClient, GateResult,
 )
 from harness.schemas import DoerResponse, IssueResponse, Outcome
 
@@ -26,13 +26,13 @@ class StubDoer(DoerClient):
     def __init__(self, decisions):  # decisions: {issue_id: "accept"|"reject"}
         self.decisions = decisions
     async def implement(self, spec, acceptance): return "implemented"
-    async def respond_to_review(self, spec, verdict):
+    async def respond_to_review(self, spec, acceptance, diff, verdict):
         return DoerResponse(responses=[
             IssueResponse(id=i.id, decision=self.decisions.get(i.id, "accept"),
                           reasoning="stub")
             for i in verdict.issues
         ])
-    async def apply_fixes(self, ids): return "applied"
+    async def apply_fixes(self, issues, diff): return "applied"
 
 
 class StubReviewer(ReviewerClient):
@@ -41,8 +41,8 @@ class StubReviewer(ReviewerClient):
         self.first = first
         self.followups = followups or []
         self._n = 0
-    async def review(self, spec, diff): return json.dumps(self.first)
-    async def respond(self, spec, diff, rejections):
+    async def review(self, spec, acceptance, diff): return json.dumps(self.first)
+    async def respond(self, spec, acceptance, diff, rejections):
         out = self.followups[self._n] if self._n < len(self.followups) else {"issues": []}
         self._n += 1
         return json.dumps(out)
@@ -52,7 +52,7 @@ class StubTiebreaker(TiebreakerClient):
     def __init__(self, cfg, sides):  # sides: {issue_id: "a"|"b"|"unclear"}
         super().__init__(cfg)
         self.sides = sides
-    async def adjudicate(self, spec, diff, issue_id, a, b):
+    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
         return json.dumps({"id": issue_id,
                            "sides_with": self.sides.get(issue_id, "unclear"),
                            "reasoning": "stub"})
@@ -66,8 +66,9 @@ class RecordingTiebreaker(TiebreakerClient):
         super().__init__(cfg)
         self.sides = sides
         self.calls: list[dict] = []
-    async def adjudicate(self, spec, diff, issue_id, a, b):
-        self.calls.append({"id": issue_id, "a": a, "b": b})
+    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
+        self.calls.append({"id": issue_id, "a": a, "b": b,
+                           "spec": spec, "acceptance": acceptance, "diff": diff})
         return json.dumps({"id": issue_id,
                            "sides_with": self.sides.get(issue_id, "unclear"),
                            "reasoning": "stub"})
@@ -76,18 +77,19 @@ class RecordingTiebreaker(TiebreakerClient):
 class ErrorReviewer(ReviewerClient):
     """Reviewer whose CLI errors (e.g. unauthenticated) -- must escalate as
     'no signal', never be treated as approval."""
-    async def review(self, spec, diff):
+    async def review(self, spec, acceptance, diff):
         raise RuntimeError("codex exited 1: not logged in")
 
 
 class ErrorTiebreaker(TiebreakerClient):
     """Tiebreaker whose CLI errors -- must escalate as 'no signal', distinct
     from a genuine disagreement (F1)."""
-    async def adjudicate(self, spec, diff, issue_id, a, b):
+    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
         raise RuntimeError("kimi exited 1: not authenticated")
 
 
 async def gate_pass(): return (True, "all green")
+async def gate_pass_silent(): return (True, "")  # exit 0 but no stdout
 async def gate_fail(): return (False, "")
 async def gate_hang():
     await asyncio.sleep(10)  # longer than the tiny test timeout
@@ -97,10 +99,11 @@ async def diff_plain(): return "modified src/feature.py"
 
 
 def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None):
-    # adapt run_gate to return just ok+output the orchestrator expects
+    # Adapt the test gate fixtures (which return (ok, out)) into the real
+    # orchestrator contract: () -> GateResult.
     async def run_gate():
         ok, out = await gate()
-        return out if ok else ""
+        return GateResult(ok=ok, output=out)
     # Default: no swap -> A=doer, B=reviewer. Deterministic so tests can encode
     # "kimi sides with doer" as sides_with="a" without also asserting on the
     # (real-run) random A/B position.
@@ -212,7 +215,7 @@ async def main():
     # empty prompts. If this ever regresses, the tiebreaker silently loses its
     # inputs while the loop keeps "working".
     class RejectingDoer(StubDoer):
-        async def respond_to_review(self, spec, verdict):
+        async def respond_to_review(self, spec, acceptance, diff, verdict):
             return DoerResponse(responses=[
                 IssueResponse(id="I1", decision="reject",
                               reasoning="doer-rejection-text")
@@ -242,6 +245,14 @@ async def main():
         f"expected reviewer issue text in slot B, got {call['b']!r}"
     assert "reviewer-fix-text" in call["b"], \
         f"expected reviewer suggested_fix in slot B, got {call['b']!r}"
+    # Spec, acceptance, and diff all reached the tiebreaker (regression guard
+    # for the bug where acceptance was silently dropped from reviewer/tiebreak
+    # prompts even though it was passed to run_feature).
+    assert call["spec"] == "spec", f"spec not threaded: {call['spec']!r}"
+    assert call["acceptance"] == "acc", \
+        f"acceptance not threaded: {call['acceptance']!r}"
+    assert call["diff"] == "modified src/feature.py", \
+        f"diff not threaded: {call['diff']!r}"
     results["invariant_real_args"] = (r.outcome, r.rounds_used)
 
     # 12. INVARIANT: TiebreakVerdict schema is A/B, not doer/reviewer.
@@ -269,7 +280,7 @@ async def main():
     # re-running. Also enforces the v2 dropped-field discipline: accepted/
     # rejected/still_blocking must NOT appear on their respective v2 events.
     class DoerWithDistinctiveText(StubDoer):
-        async def respond_to_review(self, spec, verdict):
+        async def respond_to_review(self, spec, acceptance, diff, verdict):
             return DoerResponse(responses=[
                 IssueResponse(id="I1", decision="reject",
                               reasoning="DOER_REASONING_MARKER")
@@ -286,7 +297,7 @@ async def main():
     # produce a literal "a" in the emitted event. sides_with="unclear" is a
     # blind spot -- it survives even the buggy "leak slots" behavior.
     class StubTiebreakerWithReasoning(TiebreakerClient):
-        async def adjudicate(self, spec, diff, issue_id, a, b):
+        async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
             return json.dumps({"id": issue_id, "sides_with": "a",
                                "reasoning": "TB_REASONING_MARKER"})
     tb = StubTiebreakerWithReasoning(cfg)
@@ -366,6 +377,64 @@ async def main():
             f"held_issues must be filtered to actual holds, got {held_ids}"
     results["invariant_transcript"] = (r.outcome, r.rounds_used)
 
+    # 15. INVARIANT: silently-green gates pass. `pytest -q` / `ruff check .` /
+    # `mypy` on a clean tree exit 0 and print nothing; the pre-fix code
+    # required non-empty stdout and misclassified these as gate failures.
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                None, gate_pass_silent, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["invariant_silent_green_gate"] = (r.outcome, r.rounds_used)
+
+    # 15b. INVARIANT: real_get_diff includes untracked files. Pre-fix,
+    # `git diff HEAD` skipped them entirely; a whole new file the doer added
+    # was invisible to the reviewer.
+    import os  # noqa: E402
+    import subprocess  # noqa: E402
+    import tempfile  # noqa: E402
+    from harness.orchestrator import real_get_diff  # noqa: E402
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"],
+                       cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("v1\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("v2 TRACKED_MARKER\n")
+        (open(f"{tmp}/new_file.py", "w")).write(
+            "def UNTRACKED_MARKER(): pass\n")
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            diff = await real_get_diff()
+        finally:
+            os.chdir(prev_cwd)
+    assert "TRACKED_MARKER" in diff, \
+        f"tracked change missing from diff: {diff[:200]!r}"
+    assert "UNTRACKED_MARKER" in diff, \
+        f"untracked file contents missing from diff: {diff[:500]!r}"
+    assert "new_file.py" in diff, \
+        f"untracked file path missing from diff: {diff[:500]!r}"
+
+    # 16. INVARIANT: rejected `major` issues reach the deadlock/tiebreak path
+    # instead of being silently discarded. Pre-fix, `unresolved_blocking` was
+    # computed from `blocking_ids` only, so a rejected major left it empty and
+    # the loop exited PASSED with the concern unresolved.
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "major",
+                           "issue": "x", "suggested_fix": "y"}]},
+        followups=[{"issues": [{"id": "I1", "severity": "major",
+                                "issue": "x", "suggested_fix": "y"}]}] * 3)
+    # No tiebreaker -> any unresolved deadlock escalates directly.
+    orch = make(cfg, StubDoer({"I1": "reject"}), reviewer, None,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["invariant_major_deadlocks"] = (r.outcome, r.rounds_used)
+
     # 14a. INVARIANT: _pack_event rejects invalid event_version. A compliant
     # consumer drops unknown versions, so 0/negative/bool/non-int would make
     # the event silently disappear at the reader. Fail loud at emit instead.
@@ -438,6 +507,8 @@ async def main():
         "invariant_real_args": (Outcome.PASSED, 2),
         "invariant_transcript": (Outcome.PASSED, 2),
         "invariant_truncation": (Outcome.PASSED, 0),
+        "invariant_silent_green_gate": (Outcome.PASSED, 0),
+        "invariant_major_deadlocks": (Outcome.ESCALATED_DISAGREEMENT, 2),
     }
     ok = True
     for name, got in results.items():
