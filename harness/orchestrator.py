@@ -72,11 +72,23 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _truncate_walk(node, path: str = ""):
+# Depth cap for _truncate_walk. Log payloads are shallow by construction
+# (pydantic-dumped issues/responses, 2-3 levels deep), so the cap only bites
+# on adversarial input (cycles, deeply-nested dicts). Beyond the cap the
+# subtree becomes a sentinel dict so logging still succeeds -- the "log
+# parsing never hard-fails" contract cuts both ways.
+_MAX_WALK_DEPTH = 32
+
+
+def _truncate_walk(node, path: str = "", depth: int = 0):
     """Return (possibly-rewritten node, {field_path: original_len} for any
     strings that exceeded _MAX_STR). Walks lists and dicts; leaves anything
     that isn't str/list/dict untouched. Field paths are dotted for dict keys
-    and bracketed for list indices, e.g. `issues[2].suggested_fix`."""
+    and bracketed for list indices, e.g. `issues[2].suggested_fix`. Recursion
+    is capped at _MAX_WALK_DEPTH to survive cycles or pathological nesting
+    without RecursionError -- the walker never hard-fails logging."""
+    if depth >= _MAX_WALK_DEPTH:
+        return {"_truncated_depth": True, "_path": path}, {}
     if isinstance(node, str):
         if len(node) > _MAX_STR:
             return node[:_MAX_STR], {path: len(node)}
@@ -85,7 +97,7 @@ def _truncate_walk(node, path: str = ""):
         out_list = []
         trunc: dict[str, int] = {}
         for i, item in enumerate(node):
-            new_item, sub = _truncate_walk(item, f"{path}[{i}]")
+            new_item, sub = _truncate_walk(item, f"{path}[{i}]", depth + 1)
             out_list.append(new_item)
             trunc.update(sub)
         return out_list, trunc
@@ -94,7 +106,7 @@ def _truncate_walk(node, path: str = ""):
         trunc = {}
         for k, v in node.items():
             child_path = f"{path}.{k}" if path else k
-            new_v, sub = _truncate_walk(v, child_path)
+            new_v, sub = _truncate_walk(v, child_path, depth + 1)
             out_dict[k] = new_v
             trunc.update(sub)
         return out_dict, trunc
@@ -105,7 +117,13 @@ def _pack_event(event: str, event_version: int, **fields) -> dict:
     """Build a debate-log event dict. Applies per-string truncation, stamps ts
     and event_version, and attaches a `truncations` sibling only when at least
     one string was cut. Keys `event`, `event_version`, `ts`, `truncations` are
-    reserved and cannot appear in **fields."""
+    reserved and cannot appear in **fields. `event_version` must be >= 1 -- a
+    compliant consumer drops unknown versions, so 0/negative would make the
+    event silently disappear at the reader."""
+    if not isinstance(event_version, int) or isinstance(event_version, bool) \
+            or event_version < 1:
+        raise ValueError(
+            f"event_version must be a positive int, got {event_version!r}")
     reserved = {"event", "event_version", "ts", "truncations"}
     clash = reserved & fields.keys()
     if clash:
@@ -339,10 +357,14 @@ class Orchestrator:
             verdict = await self._review_followup(spec, diff, response)
             unresolved_blocking = verdict.blocking_ids & rejected
             # v2 payload: `held_issues` replaces `still_blocking` id list;
-            # id set derivable via {i["id"] for i in held_issues}.
+            # id set derivable via {i["id"] for i in held_issues}. Filtered to
+            # unresolved_blocking so a followup verdict that (against the
+            # prompt) contains non-rejected or non-blocking issues doesn't
+            # mislead consumers into thinking they were still held blocking.
             self._log("reviewer_followup", event_version=2, round=rnd,
                       held_issues=[i.model_dump(mode="json")
-                                   for i in verdict.issues])
+                                   for i in verdict.issues
+                                   if i.id in unresolved_blocking])
             if not unresolved_blocking:
                 break
 
@@ -486,10 +508,11 @@ class Orchestrator:
             # v2 payload: adds doer_position / reviewer_position / tb_reasoning
             # so post-mortems can see what each side argued and why the
             # tiebreaker landed where it did. Slot labels (a/b) are prompt
-            # artifacts and never appear in the log.
+            # artifacts -- winning_role is the semantic answer, so sides_with
+            # (which is still "a"/"b"/"unclear") is NOT logged.
             self._log("tiebreak", event_version=2, round=round_num,
                       id=issue_id,
-                      sides_with=tb.sides_with, winning_role=winning_role,
+                      winning_role=winning_role,
                       doer_position=doer_arg,
                       reviewer_position=reviewer_arg,
                       tb_reasoning=tb.reasoning)

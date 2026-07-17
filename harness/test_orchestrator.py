@@ -282,9 +282,12 @@ async def main():
         followups=[{"issues": [{"id": "I1", "severity": "blocking",
                                 "issue": "REVIEWER_HELD_MARKER",
                                 "suggested_fix": "y"}]}] * 3)
+    # Use sides_with="a" so a regression that logs the raw slot label would
+    # produce a literal "a" in the emitted event. sides_with="unclear" is a
+    # blind spot -- it survives even the buggy "leak slots" behavior.
     class StubTiebreakerWithReasoning(TiebreakerClient):
         async def adjudicate(self, spec, diff, issue_id, a, b):
-            return json.dumps({"id": issue_id, "sides_with": "unclear",
+            return json.dumps({"id": issue_id, "sides_with": "a",
                                "reasoning": "TB_REASONING_MARKER"})
     tb = StubTiebreakerWithReasoning(cfg)
     orch = make(cfg, DoerWithDistinctiveText({}), reviewer, tb,
@@ -337,15 +340,61 @@ async def main():
     assert tiebreaks, "expected at least one tiebreak event"
     for tbe in tiebreaks:
         assert tbe["event_version"] == 2
-        assert "arg_a" not in tbe and "arg_b" not in tbe, \
-            f"tiebreak must not leak slot labels: {tbe}"
+        # No slot artifacts of any name.
+        for banned in ("arg_a", "arg_b", "sides_with"):
+            assert banned not in tbe, \
+                f"tiebreak must not leak slot key '{banned}': {tbe}"
+        # No slot VALUES either -- a future regression could rename the field
+        # but still store "a"/"b". Guard against that too.
+        assert tbe.get("winning_role") not in ("a", "b"), \
+            f"tiebreak winning_role must be semantic role, not slot: {tbe}"
         assert "doer_position" in tbe
         assert "reviewer_position" in tbe
         assert "tb_reasoning" in tbe
         assert tbe["doer_position"] == "DOER_REASONING_MARKER"
         assert "REVIEWER_HELD_MARKER" in tbe["reviewer_position"]
         assert tbe["tb_reasoning"] == "TB_REASONING_MARKER"
+        # winning_role must be a semantic role (or "unclear").
+        assert tbe["winning_role"] in ("doer", "reviewer", "unclear"), \
+            f"winning_role must be semantic: {tbe['winning_role']}"
+    # held_issues must be filtered to actual holds. Reviewer stub above returns
+    # only I1 (blocking) in followups, and doer rejects I1, so held_issues in
+    # each followup event must contain exactly I1 and no stray issues.
+    for fu in followups:
+        held_ids = {i["id"] for i in fu["held_issues"]}
+        assert held_ids <= {"I1"}, \
+            f"held_issues must be filtered to actual holds, got {held_ids}"
     results["invariant_transcript"] = (r.outcome, r.rounds_used)
+
+    # 14a. INVARIANT: _pack_event rejects invalid event_version. A compliant
+    # consumer drops unknown versions, so 0/negative/bool/non-int would make
+    # the event silently disappear at the reader. Fail loud at emit instead.
+    from harness.orchestrator import _pack_event, _truncate_walk  # noqa: E402
+    for bad in (0, -1, "1", 1.0, True, False, None):
+        try:
+            _pack_event("test", bad, foo="bar")
+        except (ValueError, TypeError):
+            pass
+        else:
+            raise AssertionError(
+                f"_pack_event must reject event_version={bad!r}")
+    # Sanity: valid version accepted.
+    _pack_event("test", 1, foo="bar")
+
+    # 14b. INVARIANT: _truncate_walk survives cycles and pathological depth
+    # without RecursionError. Logging must never hard-fail; the walker either
+    # descends or emits a depth-truncation sentinel.
+    cycle: list = []
+    cycle.append(cycle)  # self-referential list
+    packed = _pack_event("test", 1, cyclic=cycle)  # must not raise
+    assert "cyclic" in packed
+    # Same for a very deep dict.
+    deep: dict = {}
+    cur = deep
+    for _ in range(200):
+        cur["nested"] = {}
+        cur = cur["nested"]
+    _pack_event("test", 1, deep=deep)  # must not raise
 
     # 14. INVARIANT: strings above 16KB cap are truncated and metadata is
     # emitted at event-level `truncations`. Field type stays str (no
@@ -387,7 +436,7 @@ async def main():
         "reviewer_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
         "tiebreaker_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
         "invariant_real_args": (Outcome.PASSED, 2),
-        "invariant_transcript": (Outcome.ESCALATED_DISAGREEMENT, 2),
+        "invariant_transcript": (Outcome.PASSED, 2),
         "invariant_truncation": (Outcome.PASSED, 0),
     }
     ok = True
