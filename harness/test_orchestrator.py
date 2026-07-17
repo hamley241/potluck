@@ -25,6 +25,7 @@ from harness.schemas import DoerResponse, IssueResponse, Outcome
 class StubDoer(DoerClient):
     def __init__(self, decisions):  # decisions: {issue_id: "accept"|"reject"}
         self.decisions = decisions
+        self.apply_fixes_calls: list[dict] = []
     async def implement(self, spec, acceptance): return "implemented"
     async def respond_to_review(self, spec, acceptance, diff, verdict):
         return DoerResponse(responses=[
@@ -32,7 +33,10 @@ class StubDoer(DoerClient):
                           reasoning="stub")
             for i in verdict.issues
         ])
-    async def apply_fixes(self, issues, diff): return "applied"
+    async def apply_fixes(self, issues, diff):
+        self.apply_fixes_calls.append(
+            {"issues": [i.model_dump() for i in issues], "diff": diff})
+        return "applied"
 
 
 class StubReviewer(ReviewerClient):
@@ -100,10 +104,10 @@ async def diff_plain(): return "modified src/feature.py"
 
 def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None):
     # Adapt the test gate fixtures (which return (ok, out)) into the real
-    # orchestrator contract: () -> GateResult.
+    # orchestrator contract: () -> GateResult.to_json_str().
     async def run_gate():
         ok, out = await gate()
-        return GateResult(ok=ok, output=out)
+        return GateResult(ok=ok, output=out).to_json_str()
     # Default: no swap -> A=doer, B=reviewer. Deterministic so tests can encode
     # "kimi sides with doer" as sides_with="a" without also asserting on the
     # (real-run) random A/B position.
@@ -419,6 +423,35 @@ async def main():
     assert "new_file.py" in diff, \
         f"untracked file path missing from diff: {diff[:500]!r}"
 
+    # 15c. INVARIANT: accepted `major` issues reach apply_fixes with the full
+    # ReviewIssue (description, severity, suggested_fix), not just the ID.
+    # Guards two composed changes in this tier: (a) major triggers debate,
+    # (b) apply_fixes now takes list[ReviewIssue]+diff instead of list[str].
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "M1", "severity": "major",
+                           "issue": "MAJOR_ISSUE_TEXT",
+                           "suggested_fix": "MAJOR_FIX_TEXT"}]})
+    doer = StubDoer({"M1": "accept"})
+    orch = make(cfg, doer, reviewer, None, gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert len(doer.apply_fixes_calls) == 1, \
+        f"expected 1 apply_fixes call, got {len(doer.apply_fixes_calls)}"
+    call = doer.apply_fixes_calls[0]
+    issue_ids = {i["id"] for i in call["issues"]}
+    assert "M1" in issue_ids, \
+        f"accepted major must reach apply_fixes: {call['issues']!r}"
+    issue_texts = {i["issue"] for i in call["issues"]}
+    assert "MAJOR_ISSUE_TEXT" in issue_texts, \
+        f"apply_fixes must get full issue text, not just IDs: {call['issues']!r}"
+    fix_texts = {i["suggested_fix"] for i in call["issues"]}
+    assert "MAJOR_FIX_TEXT" in fix_texts, \
+        f"apply_fixes must get suggested_fix text: {call['issues']!r}"
+    assert call["diff"] == "modified src/feature.py", \
+        f"apply_fixes must receive current diff: {call['diff']!r}"
+    results["invariant_accepted_major_full_context"] = (
+        r.outcome, r.rounds_used)
+
     # 16. INVARIANT: rejected `major` issues reach the deadlock/tiebreak path
     # instead of being silently discarded. Pre-fix, `unresolved_blocking` was
     # computed from `blocking_ids` only, so a rejected major left it empty and
@@ -508,6 +541,7 @@ async def main():
         "invariant_transcript": (Outcome.PASSED, 2),
         "invariant_truncation": (Outcome.PASSED, 0),
         "invariant_silent_green_gate": (Outcome.PASSED, 0),
+        "invariant_accepted_major_full_context": (Outcome.PASSED, 1),
         "invariant_major_deadlocks": (Outcome.ESCALATED_DISAGREEMENT, 2),
     }
     ok = True

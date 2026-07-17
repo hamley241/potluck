@@ -16,15 +16,23 @@ run() {
 
 # Discover suites from disk so a new harness/test_*.py file is picked up
 # automatically -- a hard-coded list is the "new test suite silently skipped"
-# failure mode. Sorted for stable ordering across machines.
-suites=$(find harness -name 'test_*.py' -type f | sort | sed 's|/|.|g; s|\.py$||')
-if [[ -z "$suites" ]]; then
+# failure mode. NUL-delimited + array iteration so paths with spaces or
+# other whitespace don't get shell-word-split.
+suites=()
+while IFS= read -r -d '' f; do
+  # harness/foo/test_bar.py -> harness.foo.test_bar
+  name="${f%.py}"
+  name="${name//\//.}"
+  suites+=("$name")
+done < <(find harness -name 'test_*.py' -type f -print0 | sort -z)
+
+if [[ ${#suites[@]} -eq 0 ]]; then
   echo "no test suites found under harness/ -- refusing to report ALL SUITES PASS" >&2
   exit 1
 fi
 
 fail=0
-for suite in $suites; do
+for suite in "${suites[@]}"; do
   echo "=== $suite ==="
   run "$suite" || fail=1
   echo
