@@ -27,6 +27,18 @@ The four control guarantees, all visible here:
 
 The doer steps are abstracted behind a DoerClient so this file stays testable
 without invoking Claude Code, and so the same loop drives any convergent profile.
+
+Debate log contract (FeatureResult.debate_log):
+  Each event is a dict with at minimum:
+    - event: str            -- event name (e.g. "review", "doer_response")
+    - event_version: int    -- shape version for this event name
+    - ts: str               -- ISO 8601 UTC timestamp
+  Text fields above 16 KB are truncated to the cap; the event gets a sibling
+  `truncations: {"field.path": original_len}` so consumers can see what got cut.
+  Consumer rules (normative):
+    - unknown event name    -> pass through, do not fail
+    - unknown event_version -> drop with a warning, do not fail
+    - log parsing never hard-fails; events are additive over time
 """
 
 from __future__ import annotations
@@ -36,6 +48,7 @@ import json
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from .config import HarnessConfig
 from .runner import StepRunner, TimeoutEscalation, ModelUnavailable, run_subprocess
@@ -46,6 +59,67 @@ from .schemas import (
     Severity,
     TiebreakVerdict,
 )
+
+# Per-string truncation cap. Sized to preserve typical reviewer/doer reasoning
+# in full (a code snippet + a paragraph of prose) while bounding worst-case
+# FeatureResult size. Truncation is deterministic; the truncated slice is the
+# leading chars, and the original length is recorded in the event's
+# `truncations` sibling so consumers can render "... (12345 chars total)".
+_MAX_STR = 16 * 1024
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _truncate_walk(node, path: str = ""):
+    """Return (possibly-rewritten node, {field_path: original_len} for any
+    strings that exceeded _MAX_STR). Walks lists and dicts; leaves anything
+    that isn't str/list/dict untouched. Field paths are dotted for dict keys
+    and bracketed for list indices, e.g. `issues[2].suggested_fix`."""
+    if isinstance(node, str):
+        if len(node) > _MAX_STR:
+            return node[:_MAX_STR], {path: len(node)}
+        return node, {}
+    if isinstance(node, list):
+        out_list = []
+        trunc: dict[str, int] = {}
+        for i, item in enumerate(node):
+            new_item, sub = _truncate_walk(item, f"{path}[{i}]")
+            out_list.append(new_item)
+            trunc.update(sub)
+        return out_list, trunc
+    if isinstance(node, dict):
+        out_dict: dict = {}
+        trunc = {}
+        for k, v in node.items():
+            child_path = f"{path}.{k}" if path else k
+            new_v, sub = _truncate_walk(v, child_path)
+            out_dict[k] = new_v
+            trunc.update(sub)
+        return out_dict, trunc
+    return node, {}
+
+
+def _pack_event(event: str, event_version: int, **fields) -> dict:
+    """Build a debate-log event dict. Applies per-string truncation, stamps ts
+    and event_version, and attaches a `truncations` sibling only when at least
+    one string was cut. Keys `event`, `event_version`, `ts`, `truncations` are
+    reserved and cannot appear in **fields."""
+    reserved = {"event", "event_version", "ts", "truncations"}
+    clash = reserved & fields.keys()
+    if clash:
+        raise ValueError(f"reserved event field names: {sorted(clash)}")
+    packed_fields, truncations = _truncate_walk(fields)
+    packed: dict = {
+        "event": event,
+        "event_version": event_version,
+        "ts": _now_iso(),
+        **packed_fields,
+    }
+    if truncations:
+        packed["truncations"] = truncations
+    return packed
 
 
 @dataclass
@@ -234,6 +308,8 @@ class Orchestrator:
 
         # 3..6 debate
         verdict = await self._review(spec, diff)
+        self._log("review", event_version=1, round=0,
+                  issues=[i.model_dump(mode="json") for i in verdict.issues])
         if not verdict.has_blocking_or_major:
             self._log("early_exit", reason="no_blocking_or_major")
             return FeatureResult(Outcome.PASSED, 0, self.log)
@@ -247,9 +323,12 @@ class Orchestrator:
             # 4. Doer responds per issue
             response = await self.doer.respond_to_review(spec, verdict)
             accepted_ids |= response.accepted_ids()
-            self._log("doer_response", round=rnd,
-                      accepted=sorted(response.accepted_ids()),
-                      rejected=sorted(response.rejected_ids()))
+            # v2 payload: `responses` is the source of truth; accepted/rejected
+            # id lists are derivable and were dropped to avoid two sources of
+            # truth (see event_version bump).
+            self._log("doer_response", event_version=2, round=rnd,
+                      responses=[r.model_dump(mode="json")
+                                 for r in response.responses])
 
             rejected = response.rejected_ids() & unresolved_blocking
             if not rejected:
@@ -259,15 +338,18 @@ class Orchestrator:
             # 5. Reviewer responds to rejections only
             verdict = await self._review_followup(spec, diff, response)
             unresolved_blocking = verdict.blocking_ids & rejected
-            self._log("reviewer_followup", round=rnd,
-                      still_blocking=sorted(unresolved_blocking))
+            # v2 payload: `held_issues` replaces `still_blocking` id list;
+            # id set derivable via {i["id"] for i in held_issues}.
+            self._log("reviewer_followup", event_version=2, round=rnd,
+                      held_issues=[i.model_dump(mode="json")
+                                   for i in verdict.issues])
             if not unresolved_blocking:
                 break
 
         # 6. Resolve any remaining deadlock
         if unresolved_blocking:
             unresolved_blocking = await self._tiebreak(
-                spec, diff, unresolved_blocking, verdict, response)
+                spec, diff, unresolved_blocking, verdict, response, rounds_used)
             if unresolved_blocking:
                 return self._escalated(
                     Outcome.ESCALATED_DISAGREEMENT, rounds_used,
@@ -341,7 +423,8 @@ class Orchestrator:
 
     async def _tiebreak(self, spec, diff, blocking: set[str],
                         verdict: ReviewVerdict,
-                        response: DoerResponse) -> set[str]:
+                        response: DoerResponse,
+                        round_num: int) -> set[str]:
         if not (self.cfg.debate.use_tiebreaker and self.tiebreaker):
             return blocking  # no tiebreaker -> any unresolved blocking escalates
         # Both lookups are invariants: by construction (line ~253) an id in
@@ -400,8 +483,16 @@ class Orchestrator:
                 winning_role = role_of_b
             else:
                 winning_role = "unclear"
-            self._log("tiebreak", id=issue_id,
-                      sides_with=tb.sides_with, winning_role=winning_role)
+            # v2 payload: adds doer_position / reviewer_position / tb_reasoning
+            # so post-mortems can see what each side argued and why the
+            # tiebreaker landed where it did. Slot labels (a/b) are prompt
+            # artifacts and never appear in the log.
+            self._log("tiebreak", event_version=2, round=round_num,
+                      id=issue_id,
+                      sides_with=tb.sides_with, winning_role=winning_role,
+                      doer_position=doer_arg,
+                      reviewer_position=reviewer_arg,
+                      tb_reasoning=tb.reasoning)
             # 2-of-3: reviewer + tiebreaker agree it blocks -> stays blocking;
             # doer + tiebreaker agree -> resolved; unclear -> escalate.
             if winning_role in ("reviewer", "unclear"):
@@ -418,8 +509,8 @@ class Orchestrator:
         self._log("escalated", outcome=outcome.value, reason=reason)
         return FeatureResult(outcome, rounds, self.log, escalation_reason=reason)
 
-    def _log(self, event: str, **kw) -> None:
-        self.log.append({"event": event, **kw})
+    def _log(self, event: str, event_version: int = 1, **kw) -> None:
+        self.log.append(_pack_event(event, event_version, **kw))
 
 
 # --- parsing (tolerant: models may wrap JSON in prose/fences) ---
