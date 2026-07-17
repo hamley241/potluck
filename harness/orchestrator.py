@@ -960,14 +960,19 @@ class Orchestrator:
                 winning_role = role_of_b
             else:
                 winning_role = "unclear"
-            # v2 payload: adds doer_position / reviewer_position / tb_reasoning
-            # so post-mortems can see what each side argued and why the
-            # tiebreaker landed where it did. Slot labels (a/b) are prompt
-            # artifacts -- winning_role is the semantic answer, so sides_with
-            # (which is still "a"/"b"/"unclear") is NOT logged.
-            self._log("tiebreak", event_version=2, round=round_num,
+            # v3 payload: `sides_with` (raw model answer) and `swap` (which
+            # side got slot A this round) return to the log alongside
+            # `winning_role`. Together they reconstruct the translation --
+            # dropped in v2 to avoid "slot label leaks without mapping,"
+            # restored here because the mapping is emitted too. `winning_role`
+            # is the semantic answer post-translation; `sides_with` + `swap`
+            # are the audit trail behind it, so a translation regression is
+            # detectable from the log alone.
+            self._log("tiebreak", event_version=3, round=round_num,
                       id=issue_id,
                       winning_role=winning_role,
+                      sides_with=tb.sides_with,
+                      swap=swap,
                       doer_position=doer_arg,
                       reviewer_position=reviewer_arg,
                       tb_reasoning=tb.reasoning)

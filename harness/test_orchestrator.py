@@ -400,18 +400,18 @@ async def main():
     assert any(i["issue"] == "REVIEWER_HELD_MARKER"
                for fu in followups for i in fu["held_issues"]), \
         "reviewer held-issue text missing from log"
-    # `tiebreak` v2 carries doer_position/reviewer_position/tb_reasoning;
-    # slot labels (arg_a/arg_b) never leak into the log.
+    # `tiebreak` v3 carries doer_position/reviewer_position/tb_reasoning
+    # plus the sides_with+swap audit trail behind winning_role. `arg_a`/`arg_b`
+    # are the OLD prompt-side slot labels that never returned; they must
+    # still not leak.
     tiebreaks = [e for e in log if e["event"] == "tiebreak"]
     assert tiebreaks, "expected at least one tiebreak event"
     for tbe in tiebreaks:
-        assert tbe["event_version"] == 2
-        # No slot artifacts of any name.
-        for banned in ("arg_a", "arg_b", "sides_with"):
+        assert tbe["event_version"] == 3
+        for banned in ("arg_a", "arg_b"):
             assert banned not in tbe, \
                 f"tiebreak must not leak slot key '{banned}': {tbe}"
-        # No slot VALUES either -- a future regression could rename the field
-        # but still store "a"/"b". Guard against that too.
+        # winning_role stays the semantic answer -- must never be a slot letter.
         assert tbe.get("winning_role") not in ("a", "b"), \
             f"tiebreak winning_role must be semantic role, not slot: {tbe}"
         assert "doer_position" in tbe
@@ -420,9 +420,32 @@ async def main():
         assert tbe["doer_position"] == "DOER_REASONING_MARKER"
         assert "REVIEWER_HELD_MARKER" in tbe["reviewer_position"]
         assert tbe["tb_reasoning"] == "TB_REASONING_MARKER"
-        # winning_role must be a semantic role (or "unclear").
         assert tbe["winning_role"] in ("doer", "reviewer", "unclear"), \
             f"winning_role must be semantic: {tbe['winning_role']}"
+        # Audit trail: sides_with + swap must be present and typed correctly.
+        # Together they let a reader reconstruct the translation without
+        # re-running -- the reason we can put slot labels back in the log
+        # is that the mapping now travels with them.
+        assert "sides_with" in tbe, f"v3 tiebreak must emit sides_with: {tbe}"
+        assert tbe["sides_with"] in ("a", "b", "unclear"), \
+            f"sides_with must be raw slot answer: {tbe['sides_with']}"
+        assert "swap" in tbe, f"v3 tiebreak must emit swap: {tbe}"
+        assert isinstance(tbe["swap"], bool), \
+            f"swap must be bool: {tbe['swap']!r}"
+        # Translation invariant: winning_role is a pure function of
+        # (sides_with, swap). Any regression in the a/b -> doer/reviewer
+        # mapping shows up here.
+        if tbe["sides_with"] == "unclear":
+            assert tbe["winning_role"] == "unclear"
+        else:
+            role_of_a = "reviewer" if tbe["swap"] else "doer"
+            role_of_b = "doer" if tbe["swap"] else "reviewer"
+            expected = role_of_a if tbe["sides_with"] == "a" else role_of_b
+            assert tbe["winning_role"] == expected, (
+                f"winning_role {tbe['winning_role']} disagrees with "
+                f"(sides_with={tbe['sides_with']}, swap={tbe['swap']}) "
+                f"-> {expected}: {tbe}"
+            )
     # held_issues must be filtered to actual holds. Reviewer stub above returns
     # only I1 (blocking) in followups, and doer rejects I1, so held_issues in
     # each followup event must contain exactly I1 and no stray issues.
