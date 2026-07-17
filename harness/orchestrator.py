@@ -150,9 +150,21 @@ class GateResult(NamedTuple):
     the gate contract was just `str`, with empty meaning failure, which
     broke silently-green gates (pytest -q, mypy clean) that legitimately
     emit no stdout.
+
+    Serialized to a JSON string at the callable boundary so StepResult.output
+    can stay typed as `str` -- widening it to Any weakened validation on the
+    reviewer/tiebreak paths that share the same StepResult contract.
     """
     ok: bool
     output: str
+
+    def to_json_str(self) -> str:
+        return json.dumps({"ok": self.ok, "output": self.output})
+
+    @classmethod
+    def from_json_str(cls, s: str) -> "GateResult":
+        d = json.loads(s)
+        return cls(ok=bool(d["ok"]), output=str(d.get("output", "")))
 
 
 @dataclass
@@ -308,7 +320,7 @@ class Orchestrator:
         doer: DoerClient,
         reviewer: ReviewerClient,
         tiebreaker: TiebreakerClient | None,
-        run_gate,             # async callable -> (ok: bool, output: str)
+        run_gate,             # async callable -> GateResult.to_json_str()
         get_diff,             # async callable -> str
         ab_swap: Callable[[str], bool] | None = None,
     ):
@@ -351,9 +363,12 @@ class Orchestrator:
         await self.doer.implement(spec, acceptance)
 
         # 2. Gate (correctness is settled by tools, not opinion)
-        if not await self._gate_or_escalate("initial"):
-            return self._escalated(Outcome.ESCALATED_GATE, 0,
-                                    "gate could not be made green before review")
+        passed, detail = await self._gate_or_escalate("initial")
+        if not passed:
+            reason = "gate could not be made green before review"
+            if detail:
+                reason = f"{reason}: {detail}"
+            return self._escalated(Outcome.ESCALATED_GATE, 0, reason)
 
         # If debate disabled (e.g. CI) or diff touches human-only paths,
         # stop at the deterministic gate.
@@ -441,9 +456,12 @@ class Orchestrator:
             diff)
 
         # 8. Gate again
-        if not await self._gate_or_escalate("post-fix"):
-            return self._escalated(Outcome.ESCALATED_GATE, rounds_used,
-                                   "gate failed after applying fixes")
+        passed, detail = await self._gate_or_escalate("post-fix")
+        if not passed:
+            reason = "gate failed after applying fixes"
+            if detail:
+                reason = f"{reason}: {detail}"
+            return self._escalated(Outcome.ESCALATED_GATE, rounds_used, reason)
 
         # 9. Done
         self._log("passed", rounds=rounds_used)
@@ -451,7 +469,11 @@ class Orchestrator:
 
     # --- bounded wrappers around external steps ---
 
-    async def _gate_or_escalate(self, label: str) -> bool:
+    async def _gate_or_escalate(self, label: str) -> tuple[bool, str]:
+        """Run the gate, return (passed, detail). `detail` is the gate's
+        stdout/stderr on failure (for the escalation reason) or empty on
+        pass. Raises TimeoutEscalation on hangs so the caller doesn't have
+        to distinguish "failed" from "no signal"."""
         res = await self.runner.run(
             f"gate:{label}",
             lambda: self.run_gate(),
@@ -469,16 +491,29 @@ class Orchestrator:
                 "gate_no_signal",
                 f"gate '{label}' hung; cannot judge correctness without it",
             )
-        # run_gate returns a GateResult; ok comes from exit status, not from
-        # stdout being non-empty (silently green gates like `pytest -q` emit
-        # nothing on success and were previously misclassified as failures).
+        # run_gate returns a JSON-serialized GateResult on stdout; ok comes
+        # from exit status, not from stdout being non-empty (silently green
+        # gates like `pytest -q` emit nothing on success and were previously
+        # misclassified as failures).
         if not res.ok:
             # Gate callable itself errored (not just failed) -- can't judge.
-            self._log("gate", label=label, passed=False)
-            return False
-        gate_res: GateResult = res.output
-        self._log("gate", label=label, passed=gate_res.ok)
-        return gate_res.ok
+            err = res.error or "gate callable errored"
+            self._log("gate", label=label, passed=False, error=err)
+            return False, err
+        try:
+            gate_res = GateResult.from_json_str(res.output)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            # Stale caller returning the old str contract (or malformed JSON)
+            # -- surface as no-signal, not silent pass. Do NOT crash on the
+            # AttributeError that would come from touching .ok on a bare str.
+            detail = f"malformed gate response: {e}"
+            self._log("gate", label=label, passed=False, error=detail)
+            return False, detail
+        # Log the actual gate output (stdout on pass, stderr on fail) so the
+        # post-mortem can see WHY a gate failed instead of a generic string.
+        self._log("gate", label=label, passed=gate_res.ok,
+                  output=gate_res.output)
+        return gate_res.ok, gate_res.output if not gate_res.ok else ""
 
     async def _review(self, spec: str, acceptance: str,
                       diff: str) -> ReviewVerdict:
@@ -755,10 +790,14 @@ DIFF:
 
 # --- real gate / diff implementations (Seam 3) ---
 
-async def real_run_gate(gate_path: str = "./.claude/verify.sh") -> GateResult:
-    """Run the project's verification gate. `ok` reflects exit code (0 = pass),
-    NOT whether stdout was non-empty -- silently-green gates like `pytest -q`
-    would otherwise be misclassified as failures.
+async def real_run_gate(gate_path: str = "./.claude/verify.sh") -> str:
+    """Run the project's verification gate. Returns a JSON-serialized
+    GateResult (`{"ok": bool, "output": str}`); `ok` reflects exit code
+    (0 = pass), NOT whether stdout was non-empty -- silently-green gates
+    like `pytest -q` would otherwise be misclassified as failures.
+
+    JSON serialization keeps StepResult.output typed as `str` throughout;
+    the orchestrator calls `GateResult.from_json_str()` on the other side.
 
     No timeout here -- the Orchestrator wraps this via StepRunner.
     """
@@ -769,8 +808,10 @@ async def real_run_gate(gate_path: str = "./.claude/verify.sh") -> GateResult:
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode == 0:
-        return GateResult(ok=True, output=stdout.decode())
-    return GateResult(ok=False, output=stderr.decode())
+        return GateResult(
+            ok=True, output=stdout.decode(errors="replace")).to_json_str()
+    return GateResult(
+        ok=False, output=stderr.decode(errors="replace")).to_json_str()
 
 
 async def real_get_diff() -> str:
@@ -786,9 +827,17 @@ async def real_get_diff() -> str:
     No timeout here -- the Orchestrator wraps this via StepRunner.
     """
     tracked = await run_subprocess(["git", "diff", "HEAD"])
-    listing = await run_subprocess(
-        ["git", "ls-files", "--others", "--exclude-standard"])
-    untracked = [line for line in listing.splitlines() if line]
+    # -z: NUL-delimited output. Git allows newlines in filenames, so
+    # splitting `ls-files` on '\n' can turn one path into multiple bogus
+    # paths -- fine 99% of the time, silently wrong at the edge.
+    listing_bytes_proc = await asyncio.create_subprocess_exec(
+        "git", "ls-files", "-z", "--others", "--exclude-standard",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    listing_bytes, _ = await listing_bytes_proc.communicate()
+    untracked = [name.decode(errors="replace")
+                 for name in listing_bytes.split(b"\0") if name]
     parts = [tracked] if tracked else []
     for f in untracked:
         # `git diff --no-index` exits 0 when files are identical and 1 when

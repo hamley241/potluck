@@ -9,9 +9,9 @@ unresolved blocking issues, and decide when to escalate.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 class Severity(str, Enum):
@@ -97,14 +97,14 @@ class StepResult(BaseModel):
     A timeout is just a failure with a recovery hint -- it flows through the
     same contract as any other failure, never a special path.
 
-    `output` is `Any` because different step kinds carry different payloads:
-    model calls return `str` (the model's message); the gate returns a
-    `GateResult` NamedTuple. Consumers know which shape to expect per step.
+    `output` is always a `str`. Callers that need structured payloads (the
+    gate returns ok+output) serialize to a string at the callable boundary
+    and deserialize at the consumer -- keeping StepResult.output typed means
+    a model backend that accidentally returns bytes/dict is rejected at the
+    boundary rather than crashing deep in _parse_verdict/_extract_json.
     """
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
     ok: bool
     timed_out: bool = False
-    output: Any = ""
+    output: str = ""
     error: str | None = None
     recovery_hint: str | None = None
