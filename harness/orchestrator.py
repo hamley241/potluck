@@ -74,6 +74,28 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class DoerProtocolViolation(Exception):
+    """Raised when a DoerResponse fails to take a stance on every issue in the
+    reviewer's verdict. Lives here (not in runner.py next to
+    TimeoutEscalation/ModelUnavailable) because it is enforced by the debate
+    loop below and has no meaning outside it.
+
+    Like a timeout or an unavailable model, this is *no signal*: the doer
+    produced structured output that failed the protocol contract, so the loop
+    must escalate rather than treat an empty/partial response as approval. The
+    check is one-directional -- `expected - responded` -- so a doer that
+    responds to an id NOT in the verdict (hallucinated id) is a different bug,
+    out of scope here."""
+
+    def __init__(self, missing_ids: set[str], round: int):
+        self.missing_ids = missing_ids
+        self.round = round
+        super().__init__(
+            f"doer omitted {len(missing_ids)} verdict issue id(s) "
+            f"{sorted(missing_ids)} in round {round}"
+        )
+
+
 # Depth cap for _truncate_walk. Log payloads are shallow by construction
 # (pydantic-dumped issues/responses, 2-3 levels deep), so the cap only bites
 # on adversarial input (cycles, deeply-nested dicts). Beyond the cap the
@@ -357,6 +379,21 @@ class Orchestrator:
                 debate_log=self.log,
                 escalation_reason=f"[{mu.role}] {mu.detail}",
             )
+        except DoerProtocolViolation as dpv:
+            # The doer responded, but non-conformantly: it failed to take a
+            # stance on every reviewer issue. Neither a hang (TimeoutEscalation)
+            # nor an unavailable model (ModelUnavailable) -- but semantically the
+            # same no-signal bucket, so ESCALATED_NO_SIGNAL rather than a new
+            # Outcome value. rounds_used is the round the violation fired in.
+            return FeatureResult(
+                outcome=Outcome.ESCALATED_NO_SIGNAL,
+                rounds_used=dpv.round,
+                debate_log=self.log,
+                escalation_reason=(
+                    f"doer protocol violation in round {dpv.round}: response "
+                    f"omitted verdict issue id(s) {sorted(dpv.missing_ids)}"
+                ),
+            )
 
     async def _run(self, spec: str, acceptance: str) -> FeatureResult:
         # 1. Implement
@@ -404,6 +441,23 @@ class Orchestrator:
             # 4. Doer responds per issue
             response = await self.doer.respond_to_review(
                 spec, acceptance, diff, verdict)
+            # Protocol invariant: the doer must take a stance (accept/reject)
+            # on every issue the reviewer raised. A DoerResponse that omits any
+            # verdict issue id is emitting no signal on those issues -- the same
+            # bucket as a timeout or an unavailable model -- so escalate rather
+            # than let an empty/partial response converge silently to PASSED.
+            # Checked one-directionally (expected - responded); hallucinated ids
+            # are out of scope. Logged BEFORE raising so the transcript captures
+            # the failure even if the exception path logs nothing further.
+            expected_ids = {i.id for i in verdict.issues}
+            responded_ids = {r.id for r in response.responses}
+            missing_ids = expected_ids - responded_ids
+            if missing_ids:
+                self._log("doer_protocol_violation", event_version=1, round=rnd,
+                          missing_ids=sorted(missing_ids),
+                          verdict_issue_count=len(expected_ids),
+                          responded_id_count=len(responded_ids))
+                raise DoerProtocolViolation(missing_ids, rnd)
             for iresp in response.responses:
                 if iresp.decision == "accept":
                     for i in verdict.issues:

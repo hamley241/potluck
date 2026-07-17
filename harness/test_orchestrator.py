@@ -16,7 +16,7 @@ import json
 from harness.config import HarnessConfig
 from harness.orchestrator import (
     Orchestrator, DoerClient, ReviewerClient, TiebreakerClient, GateResult,
-    _parse_verdict,
+    DoerProtocolViolation, _parse_verdict,
 )
 from harness.schemas import DoerResponse, IssueResponse, Outcome
 
@@ -38,6 +38,26 @@ class StubDoer(DoerClient):
         self.apply_fixes_calls.append(
             {"issues": [i.model_dump() for i in issues], "diff": diff})
         return "applied"
+
+
+class EmptyResponseDoer(StubDoer):
+    """Doer that returns an empty DoerResponse regardless of the verdict --
+    emitting no signal on any reviewer issue. The loop must escalate rather
+    than treat this as blanket acceptance (drift-11a)."""
+    async def respond_to_review(self, spec, acceptance, diff, verdict):
+        return DoerResponse(responses=[])
+
+
+class PartialResponseDoer(StubDoer):
+    """Doer that responds to only the FIRST verdict issue, omitting the rest --
+    a strict-subset (partial) protocol violation."""
+    async def respond_to_review(self, spec, acceptance, diff, verdict):
+        first = verdict.issues[:1]
+        return DoerResponse(responses=[
+            IssueResponse(id=i.id, decision=self.decisions.get(i.id, "reject"),
+                          reasoning="stub")
+            for i in first
+        ])
 
 
 class StubReviewer(ReviewerClient):
@@ -578,6 +598,91 @@ async def main():
     results["invariant_followup_bare_array_ends_debate_cleanly"] = (
         r.outcome, r.rounds_used)
 
+    # 18. INVARIANT (drift-11a): an empty DoerResponse to a non-empty verdict
+    # escalates as a protocol violation -- it never converges silently to
+    # PASSED. The doer took no stance on the reviewer's blocking issue, which is
+    # no signal, the same bucket as a timeout or an unavailable model.
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]})
+    orch = make(cfg, EmptyResponseDoer({}), reviewer, None, gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"empty doer response must escalate no-signal, got {r.outcome}"
+    assert r.escalation_reason and "protocol violation" in r.escalation_reason, \
+        f"escalation_reason must name the protocol violation: {r.escalation_reason!r}"
+    assert "I1" in r.escalation_reason, \
+        f"escalation_reason must name the missing id I1: {r.escalation_reason!r}"
+    # The violation event is logged BEFORE the escalation event, with the
+    # documented v1 shape.
+    events = [e["event"] for e in r.debate_log]
+    assert "doer_protocol_violation" in events, \
+        f"expected doer_protocol_violation event in log: {events}"
+    dpv = next(e for e in r.debate_log if e["event"] == "doer_protocol_violation")
+    assert dpv["event_version"] == 1
+    assert dpv["missing_ids"] == ["I1"], f"missing_ids: {dpv['missing_ids']}"
+    assert dpv["verdict_issue_count"] == 1
+    assert dpv["responded_id_count"] == 0
+    # The violation is logged in _run BEFORE the exception unwinds; the
+    # run_feature handler returns without logging anything further, so the
+    # violation event is the last thing in the transcript.
+    assert events[-1] == "doer_protocol_violation", \
+        f"doer_protocol_violation must be the last logged event: {events}"
+    results["invariant_empty_doer_response_escalates"] = (
+        r.outcome, r.rounds_used)
+
+    # 19. INVARIANT (drift-11a): a partial DoerResponse (strict subset of the
+    # verdict ids) escalates the same way; the escalation reason names the
+    # omitted subset, not the responded id.
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"},
+                          {"id": "I2", "severity": "blocking",
+                           "issue": "x2", "suggested_fix": "y2"}]})
+    orch = make(cfg, PartialResponseDoer({}), reviewer, None,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"partial doer response must escalate, got {r.outcome}"
+    assert r.escalation_reason and "I2" in r.escalation_reason, \
+        f"escalation_reason must name the missing id I2: {r.escalation_reason!r}"
+    assert "I1" not in r.escalation_reason, \
+        f"escalation_reason must not name the responded id I1: {r.escalation_reason!r}"
+    dpv = next(e for e in r.debate_log if e["event"] == "doer_protocol_violation")
+    assert dpv["missing_ids"] == ["I2"], f"missing_ids: {dpv['missing_ids']}"
+    assert dpv["verdict_issue_count"] == 2
+    assert dpv["responded_id_count"] == 1
+    results["invariant_partial_doer_response_escalates"] = (
+        r.outcome, r.rounds_used)
+
+    # 20. INVARIANT (drift-11a): a conformant DoerResponse (stance on every
+    # verdict issue) does NOT trigger the violation -- normal debate flow. This
+    # is the convergence path from case 2, with an explicit assertion that no
+    # doer_protocol_violation event is emitted.
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]},
+        followups=[{"issues": []}])  # reviewer concedes
+    orch = make(cfg, StubDoer({"I1": "reject"}), reviewer, None,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.PASSED, \
+        f"conformant response must pass, got {r.outcome}"
+    assert not any(e["event"] == "doer_protocol_violation"
+                   for e in r.debate_log), \
+        "conformant response must not emit a protocol violation event"
+    results["invariant_conformant_doer_response_still_passes"] = (
+        r.outcome, r.rounds_used)
+
+    # 21. UNIT: DoerProtocolViolation carries the missing ids and round for the
+    # run_feature handler to build the escalation reason from.
+    dpv_exc = DoerProtocolViolation({"I2", "I3"}, 2)
+    assert dpv_exc.missing_ids == {"I2", "I3"}
+    assert dpv_exc.round == 2
+
     # report
     expected = {
         "early_exit": (Outcome.PASSED, 0),
@@ -599,6 +704,11 @@ async def main():
         "invariant_bare_empty_array_verdict_parses": (Outcome.PASSED, 0),
         "invariant_bare_populated_array_verdict_parses": (Outcome.PASSED, 1),
         "invariant_followup_bare_array_ends_debate_cleanly": (Outcome.PASSED, 1),
+        "invariant_empty_doer_response_escalates": (
+            Outcome.ESCALATED_NO_SIGNAL, 1),
+        "invariant_partial_doer_response_escalates": (
+            Outcome.ESCALATED_NO_SIGNAL, 1),
+        "invariant_conformant_doer_response_still_passes": (Outcome.PASSED, 1),
     }
     ok = True
     for name, got in results.items():
