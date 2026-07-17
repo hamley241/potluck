@@ -17,6 +17,7 @@ a committed config line and only affects PII (secrets stay on).
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -77,6 +78,39 @@ async def _whitelisted_pii_does_not_block() -> bool:
             "example_ssn = 123-45-6789\n"
         )
         rc, _, _ = await _run_hook(payload, cwd=td)
+        return rc == 0
+
+
+async def _string_false_stays_scanning_on() -> bool:
+    """Type-safety of the off-switch. `pii_enabled = "false"` (string, not
+    bool) is a user footgun; previously it truthy-coerced and silently left
+    PII scanning ON while the user thought it was off. Now: strict bool
+    check, warn on stderr, default to ON (safe direction). The visible
+    warning is the actual behavior we want to lock in."""
+    with tempfile.TemporaryDirectory() as td:
+        cfg_dir = Path(td) / ".claude"
+        cfg_dir.mkdir()
+        (cfg_dir / "secret-scan.toml").write_text('pii_enabled = "false"\n')
+        rc, _, stderr = await _run_hook("SSN 111-22-3333\n", cwd=td)
+        # Blocks (PII stayed on because "false" wasn't a real bool).
+        blocked = rc != 0 and "PII" in stderr
+        # And the warning was surfaced.
+        warned = "expected a boolean" in stderr or "pii_enabled=" in stderr
+        return blocked and warned
+
+
+async def _rfc2606_reserved_tlds_are_whitelisted() -> bool:
+    """RFC 2606 / RFC 6761 reserve `.test`, `.example`, `.invalid`, and
+    `.localhost` for testing/documentation. Emails at these TLDs must not
+    fire PII, since they're the canonical fixture domains."""
+    with tempfile.TemporaryDirectory() as td:
+        payload = (
+            "email = admin@my.test\n"
+            "other = user@subdomain.example\n"
+            "invalid_ex = fake@stuff.invalid\n"
+            "localhost_ex = ops@my.localhost\n"
+        )
+        rc, _, stderr = await _run_hook(payload, cwd=td)
         return rc == 0
 
 
@@ -202,6 +236,42 @@ def _register_refuses_wrong_shape_pretool_key() -> bool:
             return False
 
 
+def _register_preserves_mode() -> bool:
+    """Atomic write must preserve the original mode/permissions -- otherwise
+    a settings.json set to 0o644 (readable by another tool or team member)
+    silently becomes 0o600 after the rewrite. `shutil.copystat` handles this
+    when the destination already exists."""
+    import stat as _stat
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        original = home / "settings.json"
+        original.write_text(json.dumps({"hooks": {"PreToolUse": []}}))
+        os.chmod(original, 0o644)
+        script = home / "hooks" / "pre-tool-secret-scan.py"
+        register(home, script)
+        mode = _stat.S_IMODE(original.stat().st_mode)
+        return mode == 0o644
+
+
+def _register_refuses_symlink() -> bool:
+    """settings.json as a symlink is often intentional (dotfiles repo); a
+    naive replace would silently convert it to a regular file, breaking
+    the link. Refuse rather than silently do the wrong thing."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        target = home / "real-settings.json"
+        target.write_text("{}")
+        link = home / "settings.json"
+        link.symlink_to(target)
+        script = home / "hooks" / "pre-tool-secret-scan.py"
+        try:
+            register(home, script)
+            return False  # should have raised
+        except RuntimeError:
+            # Link must still be a symlink; content untouched.
+            return link.is_symlink() and target.read_text() == "{}"
+
+
 def _register_write_is_atomic() -> bool:
     """After registration, no temp-file leftovers should sit next to
     settings.json -- atomic write via tempfile + os.replace, with cleanup on
@@ -226,6 +296,10 @@ def main() -> bool:
         _whitelisted_pii_does_not_block())
     results["hook_pii_off_switch_via_config"] = asyncio.run(
         _pii_off_switch_via_config())
+    results["hook_string_false_stays_scanning_on"] = asyncio.run(
+        _string_false_stays_scanning_on())
+    results["hook_rfc2606_reserved_tlds_are_whitelisted"] = asyncio.run(
+        _rfc2606_reserved_tlds_are_whitelisted())
     results["register_adds_hook_when_settings_absent"] = (
         _register_adds_hook_when_settings_absent())
     results["register_is_idempotent"] = _register_is_idempotent()
@@ -238,6 +312,8 @@ def main() -> bool:
     results["register_refuses_wrong_shape_pretool_key"] = (
         _register_refuses_wrong_shape_pretool_key())
     results["register_write_is_atomic"] = _register_write_is_atomic()
+    results["register_preserves_mode"] = _register_preserves_mode()
+    results["register_refuses_symlink"] = _register_refuses_symlink()
 
     ok = True
     for name, passed in results.items():

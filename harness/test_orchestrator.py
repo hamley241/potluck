@@ -572,6 +572,24 @@ async def main():
     assert "OK_MARKER" in diff, \
         f"non-oversized non-binary untracked must be included: {diff!r}"
 
+    # 15e-inject. INVARIANT: `# skipped:` markers encode filenames git-quotePath
+    # style so a filename containing `\n`, `"`, or non-ASCII bytes CAN'T
+    # inject fake diff content. Filter-based approaches (e.g. reject-if-newline)
+    # are brittle; encoding is correct-by-construction.
+    from harness.orchestrator import _git_quote_path  # noqa: E402
+    # Newline: must be encoded as \n and the whole path quoted.
+    encoded = _git_quote_path("evil\nname.py")
+    assert "\n" not in encoded, \
+        f"encoded path must not contain literal newline: {encoded!r}"
+    assert encoded == r'"evil\nname.py"', \
+        f"encoded path must be git-quoted: {encoded!r}"
+    # Plain ASCII no-special-chars: pass-through.
+    assert _git_quote_path("normal/path.py") == "normal/path.py"
+    # Non-ASCII UTF-8: octal-encoded per git convention.
+    encoded_utf8 = _git_quote_path("café.py")
+    assert encoded_utf8 == r'"caf\303\251.py"', \
+        f"non-ASCII path must be octal-encoded: {encoded_utf8!r}"
+
     # 15e. INVARIANT: `_untracked_skip_reason` short-circuits on non-regular
     # paths (FIFO, socket, device, symlink) instead of calling open() on
     # them. Regression guard for the hang scenario: pre-fix, `open(fifo,
@@ -626,6 +644,37 @@ async def main():
     assert "fé\\.py" in paths, \
         f"octal-encoded non-ASCII path must decode: {paths!r}"
 
+    # 15f-cc. INVARIANT: merge/combined diff headers (`diff --cc`,
+    # `diff --combined`) trigger human_only_paths routing. Pre-fix, only
+    # `diff --git` headers were parsed; a merge conflict touching a
+    # sensitive file would silently be sent to the external reviewer.
+    cc_paths = _extract_changed_paths(
+        'diff --cc src/security/merged.py\n@@@ @@@\n-a\n+b\n')
+    assert cc_paths == ["src/security/merged.py"], \
+        f"diff --cc header must extract path: {cc_paths!r}"
+    combined_paths = _extract_changed_paths(
+        'diff --combined src/security/x.py\n@@@ @@@\n')
+    assert combined_paths == ["src/security/x.py"], \
+        f"diff --combined header must extract path: {combined_paths!r}"
+    # Quoted merged path.
+    quoted_cc_paths = _extract_changed_paths(
+        'diff --cc "src/security/a b.py"\n@@@ @@@\n')
+    assert quoted_cc_paths == ["src/security/a b.py"], \
+        f"quoted diff --cc must decode: {quoted_cc_paths!r}"
+
+    # 15f-prefix. INVARIANT: human_only_paths prefix match respects path
+    # boundaries. `["src/security"]` must NOT match `src/security_bypass.py`.
+    async def diff_bypass_lookalike():
+        return ('diff --git a/src/security_bypass.py b/src/security_bypass.py\n'
+                '@@ -1 +1 @@\n-a\n+b\n')
+    cfg = HarnessConfig()
+    cfg.human_only_paths = ["src/security"]  # NO trailing slash
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                None, gate_pass, diff_bypass_lookalike)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.PASSED, \
+        f"src/security_bypass.py must not match human_only_paths=['src/security']: {r.outcome}"
+
     # 15g. INVARIANT: end-to-end path-aware routing still triggers on
     # quoted paths. A rename involving a sensitive-tree filename with a
     # space must route to human-only.
@@ -641,6 +690,55 @@ async def main():
     r = await orch.run_feature("spec", "acc")
     assert r.outcome == Outcome.ESCALATED_DISAGREEMENT, \
         f"quoted sensitive path must trigger human-only: {r.outcome}"
+
+    # 15h. INVARIANT: malformed doer JSON escalates cleanly as
+    # ESCALATED_NO_SIGNAL, not an uncaught Pydantic ValidationError. The
+    # doer's `respond_to_review` return is validated OUTSIDE StepRunner's
+    # error boundary, so ValidationError previously propagated to run_feature
+    # which doesn't know about pydantic -> uncaught traceback.
+    class MalformedDoer(StubDoer):
+        async def respond_to_review(self, spec, acceptance, diff, verdict):
+            class FakeResp:
+                def model_dump_json(self):
+                    return "this is not valid json"
+            return FakeResp()
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]},
+        followups=[{"issues": []}])
+    orch = make(cfg, MalformedDoer({"I1": "reject"}), reviewer, None,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["invariant_doer_malformed_response"] = (r.outcome, r.rounds_used)
+
+    # 15i. INVARIANT: HarnessConfig.validate() rejects feature_seconds smaller
+    # than the largest step timeout. The "finer signal never overwritten"
+    # guarantee only holds when steps can raise TimeoutEscalation before the
+    # outer wall-clock cancels the task; making the violating config
+    # unrepresentable at load time is stronger than handling the runtime race.
+    from harness.config import HarnessConfig as _HC  # noqa: E402
+    bad = _HC()
+    bad.timeouts.feature_seconds = 30
+    bad.timeouts.model_call_seconds = 120
+    try:
+        bad.validate()
+        assert False, "validate() must reject feature_seconds < max step timeout"
+    except ValueError:
+        pass  # expected
+    # Zero feature_seconds is the deliberate "fire immediately" test case;
+    # validate() must NOT reject it (used by invariant_feature_budget above).
+    ok = _HC()
+    ok.timeouts.feature_seconds = 0
+    ok.validate()  # must not raise
+    # Negative timeouts rejected.
+    neg = _HC()
+    neg.timeouts.model_call_seconds = -1
+    try:
+        neg.validate()
+        assert False, "validate() must reject negative timeouts"
+    except ValueError:
+        pass
 
     # 16. INVARIANT: rejected `major` issues reach the deadlock/tiebreak path
     # instead of being silently discarded. Pre-fix, `unresolved_blocking` was
@@ -735,6 +833,9 @@ async def main():
         "invariant_feature_budget": (Outcome.ABORTED_BUDGET, 0),
         "invariant_accepted_major_full_context": (Outcome.PASSED, 1),
         "invariant_major_deadlocks": (Outcome.ESCALATED_DISAGREEMENT, 2),
+        # rounds_used=0 because the failure fires mid-round-1; per
+        # completed-round semantics, the round didn't finish.
+        "invariant_doer_malformed_response": (Outcome.ESCALATED_NO_SIGNAL, 0),
     }
     ok = True
     for name, got in results.items():

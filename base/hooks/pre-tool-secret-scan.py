@@ -68,8 +68,13 @@ PII_PATTERNS = [
 # testing-workflow pain points. Each entry is a full-match regex against the
 # specific PII-pattern hit (not the whole payload).
 PII_WHITELIST = [
-    # RFC 2606 reserved test/example domains.
+    # RFC 2606 / RFC 6761 reserved test/example TLDs and second-level
+    # domains. Covers example.com/.org/.net/.edu plus the fully-reserved
+    # `.test`, `.example`, `.invalid`, `.localhost` TLDs (which apply to
+    # any subdomain), so `user@fixtures.test` and `admin@my.localhost`
+    # don't false-positive on their own.
     r".+@(?:example\.(?:com|org|net|edu)|(?:.+\.)?example\.(?:com|org|net|edu))",
+    r".+@(?:.+\.)?(?:test|example|invalid|localhost)",
     # Well-known payment test PANs.
     r"4111\s?1111\s?1111\s?1111",
     r"4111-1111-1111-1111",
@@ -91,9 +96,16 @@ _CONFIG_PATH = Path(".claude/secret-scan.toml")
 
 
 def _pii_enabled() -> bool:
-    """Read `.claude/secret-scan.toml` from CWD. Absent or malformed -> True
-    (fail safe: scanning ON). Committed off-switch means opting out leaves an
-    audit trail; env var was rejected precisely because it doesn't."""
+    """Read `.claude/secret-scan.toml` from CWD. Absent, empty, malformed,
+    OR wrong-type -> True (fail-safe: scanning ON). Committed off-switch
+    means opting out leaves an audit trail; env var was rejected precisely
+    because it doesn't.
+
+    Strict type check: `pii_enabled` must be a TOML boolean. A string
+    `"false"` in the toml would previously coerce to truthy and leave
+    scanning silently enabled -- worse than the "committed opt-out" claim
+    suggests. On non-bool we warn to stderr and default to ON so the user
+    sees the config issue on the next tool call rather than a stealth pass."""
     if not _CONFIG_PATH.exists():
         return True
     try:
@@ -107,7 +119,18 @@ def _pii_enabled() -> bool:
         cfg = tomllib.loads(_CONFIG_PATH.read_text())
     except Exception:
         return True
-    return bool(cfg.get("pii_enabled", True))
+    if "pii_enabled" not in cfg:
+        return True
+    val = cfg["pii_enabled"]
+    if not isinstance(val, bool):
+        sys.stderr.write(
+            f"WARNING: {_CONFIG_PATH} has pii_enabled={val!r} "
+            f"({type(val).__name__}); expected a boolean. Defaulting to "
+            f"scanning ON. Change to `pii_enabled = false` (TOML bool, "
+            f"unquoted) to disable PII scanning.\n"
+        )
+        return True
+    return val
 
 
 # --- Scan --------------------------------------------------------------------

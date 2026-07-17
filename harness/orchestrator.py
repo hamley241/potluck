@@ -84,6 +84,36 @@ _GIT_QUOTE_ESCAPES = {
     "v": "\v", "f": "\f", "r": "\r",
     '"': '"', "\\": "\\",
 }
+# Reverse map for encoding.
+_GIT_ENCODE_ESCAPES = {
+    ord("\a"): r"\a", ord("\b"): r"\b", ord("\t"): r"\t", ord("\n"): r"\n",
+    ord("\v"): r"\v", ord("\f"): r"\f", ord("\r"): r"\r",
+    ord('"'): r"\"", ord("\\"): r"\\",
+}
+
+
+def _git_quote_path(path: str) -> str:
+    """Encode `path` in git's `core.quotePath` style so newlines, quotes,
+    and non-ASCII bytes CAN'T inject content into the surrounding stream.
+    Returns the path unquoted if it's plain ASCII with no special chars,
+    or a double-quoted C-style-escaped form otherwise. Uses git's own
+    convention so downstream parsers that already handle git-quoted paths
+    handle these markers correctly too."""
+    needs_quote = False
+    encoded_bytes = bytearray()
+    for b in path.encode("utf-8"):
+        if b in _GIT_ENCODE_ESCAPES:
+            needs_quote = True
+            encoded_bytes.extend(_GIT_ENCODE_ESCAPES[b].encode("ascii"))
+        elif b < 0x20 or b >= 0x80:
+            needs_quote = True
+            # Octal \NNN, three digits.
+            encoded_bytes.extend(f"\\{b:03o}".encode("ascii"))
+        else:
+            encoded_bytes.append(b)
+    if not needs_quote:
+        return path
+    return '"' + encoded_bytes.decode("ascii") + '"'
 
 
 def _parse_git_quoted(s: str, start: int) -> tuple[str, int] | None:
@@ -175,18 +205,46 @@ def _parse_diff_git_header(line: str) -> tuple[str, str] | None:
     return a_spec, b_spec
 
 
+# Merge/combined diff header prefixes. Distinct from `diff --git` because
+# merge-conflict diffs identify a SINGLE path (the merged file) rather than
+# an a/OLD b/NEW pair. Ignoring these leaked sensitive-path changes past
+# human_only_paths routing whenever a merge touched a protected file.
+_DIFF_CC_PREFIX = "diff --cc "
+_DIFF_COMBINED_PREFIX = "diff --combined "
+
+
+def _parse_diff_cc_header(line: str) -> str | None:
+    """`diff --cc <path>` and `diff --combined <path>` -- merge/conflict
+    combined diffs. Return the merged path (unquoted if needed), or None.
+    The trailing path may be git-quoted just like `diff --git`."""
+    for prefix in (_DIFF_CC_PREFIX, _DIFF_COMBINED_PREFIX):
+        if line.startswith(prefix):
+            rest = line[len(prefix):]
+            if rest.startswith('"'):
+                parsed = _parse_git_quoted(rest, 0)
+                return parsed[0] if parsed is not None else None
+            return rest or None
+    return None
+
+
 def _extract_changed_paths(diff: str) -> list[str]:
     """Return every file path (both `a/` old and `b/` new sides) mentioned by
-    a `diff --git` header. Preserves order + duplicates; deduping is cheap
-    for callers that don't care. Handles git-quoted paths correctly."""
+    a `diff --git`, `diff --cc`, or `diff --combined` header. Preserves order
+    + duplicates; deduping is cheap for callers that don't care. Handles
+    git-quoted paths correctly. Ignoring merge/combined headers previously
+    let sensitive-path changes slip past human_only_paths routing whenever
+    a conflict resolution touched a protected file."""
     paths: list[str] = []
     for line in diff.splitlines():
         parsed = _parse_diff_git_header(line)
-        if parsed is None:
+        if parsed is not None:
+            old, new = parsed
+            paths.append(old)
+            paths.append(new)
             continue
-        old, new = parsed
-        paths.append(old)
-        paths.append(new)
+        merged = _parse_diff_cc_header(line)
+        if merged is not None:
+            paths.append(merged)
     return paths
 
 
@@ -728,7 +786,16 @@ class Orchestrator:
         if not res.ok:
             raise ModelUnavailable(
                 "doer", res.error or "doer respond errored")
-        return DoerResponse.model_validate_json(res.output)
+        # Pydantic ValidationError from a malformed doer JSON must NOT
+        # propagate as an uncaught traceback -- run_feature's escalation
+        # handlers don't know about pydantic. Convert to ModelUnavailable
+        # so the outcome is a clean ESCALATED_NO_SIGNAL, same as any other
+        # unusable doer response.
+        try:
+            return DoerResponse.model_validate_json(res.output)
+        except Exception as e:  # pydantic ValidationError, JSONDecodeError, ...
+            raise ModelUnavailable(
+                "doer", f"doer returned malformed response: {e}") from e
 
     async def _doer_apply_fixes(self, issues: list[ReviewIssue],
                                 diff: str) -> str:
@@ -859,12 +926,16 @@ class Orchestrator:
 
     def _is_human_only(self, diff: str) -> bool:
         """True if any file touched by the diff is under a human-only path.
-        Path-aware: parses `diff --git a/OLD b/NEW` headers rather than
-        substring-matching the diff text (which false-positived on comments
-        and false-negatived on renames). For renames/copies, EITHER side
-        matching triggers routing -- a file moving OUT of a sensitive tree
-        still touched the sensitive tree."""
-        configured = [p for p in self.cfg.human_only_paths if p]
+        Path-aware: parses `diff --git`, `diff --cc`, and `diff --combined`
+        headers rather than substring-matching the diff text. For
+        renames/copies, EITHER side matching triggers routing -- a file
+        moving OUT of a sensitive tree still touched it. Configured paths
+        are normalized to end with `/` so `human_only_paths=["src/security"]`
+        does NOT match `src/security_bypass.py` (previously did)."""
+        configured = [
+            p if p.endswith("/") else p + "/"
+            for p in self.cfg.human_only_paths if p
+        ]
         if not configured:
             return False
         for path in _extract_changed_paths(diff):
@@ -1097,7 +1168,12 @@ async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
         skip_reason = _untracked_skip_reason(
             f, max_untracked_bytes, binary_probe_bytes)
         if skip_reason:
-            parts.append(f"\n# skipped: {f} ({skip_reason})\n")
+            # Encode the path git-quotePath style so a filename containing
+            # `\n`, `"`, or non-ASCII bytes CAN'T inject fake diff content
+            # into the marker line. Filtering would be brittle; encoding is
+            # correct-by-construction and matches git's own convention.
+            parts.append(
+                f"\n# skipped: {_git_quote_path(f)} ({skip_reason})\n")
             continue
         # `git diff --no-index` exits 0 when files are identical and 1 when
         # they differ. We're diffing /dev/null against a non-empty new file,
@@ -1118,30 +1194,48 @@ def _untracked_skip_reason(path: str, max_bytes: int,
                            probe_bytes: int) -> str | None:
     """Reason to omit this untracked file from the review diff, or None to
     include it. Reasons come out as human-readable strings that go into the
-    `# skipped: <path> (<reason>)` marker."""
-    # lstat first so we don't follow symlinks and never open a non-regular
-    # file. A FIFO or socket left in the working tree (e.g. `mkfifo trap`)
-    # would otherwise block `open()` indefinitely, and because this is
-    # synchronous code inside the async coroutine, wait_for(feature_seconds)
-    # cannot preempt it. Explicit skip with a visible marker instead.
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return "unreadable"
+    `# skipped: <path> (<reason>)` marker.
+
+    TOCTOU-safe: we NEVER stat the path and then open it -- an attacker with
+    local access could swap a FIFO between the two calls, and `open()`
+    blocking on a FIFO would hang the async coroutine past every timeout
+    (synchronous code can't be preempted by `wait_for`). Instead: open with
+    `O_NOFOLLOW | O_NONBLOCK`, then `fstat` the FD to check type on the
+    actual opened file. `O_NONBLOCK` also guarantees a FIFO opens or errors
+    immediately (never blocks) even if it wins the race."""
     import stat as _stat
-    mode = st.st_mode
-    if _stat.S_ISLNK(mode):
-        return "symlink"
-    if not _stat.S_ISREG(mode):
-        # FIFOs, sockets, char/block devices -- anything we shouldn't open.
-        return "non-regular"
-    if st.st_size > max_bytes:
-        return f"size {st.st_size} bytes"
     try:
-        with open(path, "rb") as fp:
-            probe = fp.read(probe_bytes)
-    except OSError:
+        # O_NOFOLLOW: fail on symlink (attacker can't redirect us).
+        # O_NONBLOCK: a FIFO on the write side opens instantly with ENXIO
+        #             instead of hanging; a FIFO on read waits for a writer
+        #             normally, but with O_NONBLOCK the open returns an fd
+        #             backed by an empty pipe that we then reject via fstat.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as e:
+        # ELOOP (symlink caught by O_NOFOLLOW), ENOENT (vanished), EACCES,
+        # ENXIO (FIFO write-side with no reader). Bucket everything as
+        # "unreadable" or "symlink" for the specific ELOOP case that
+        # confirms redirection.
+        import errno
+        if e.errno == errno.ELOOP:
+            return "symlink"
         return "unreadable"
-    if b"\x00" in probe:
-        return "binary"
-    return None
+    try:
+        st = os.fstat(fd)
+        mode = st.st_mode
+        if not _stat.S_ISREG(mode):
+            return "non-regular"
+        if st.st_size > max_bytes:
+            return f"size {st.st_size} bytes"
+        try:
+            probe = os.read(fd, probe_bytes)
+        except OSError:
+            return "unreadable"
+        if b"\x00" in probe:
+            return "binary"
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass

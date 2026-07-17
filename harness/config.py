@@ -141,7 +141,50 @@ class HarnessConfig:
             with open(resolved_path, "rb") as f:
                 cfg._apply(tomllib.load(f))
         cfg._apply_env()
+        cfg.validate()
         return cfg
+
+    def validate(self) -> None:
+        """Fail-fast invariants. Called at end of `load()` so a broken config
+        REFUSES TO START rather than producing subtle runtime races. Two
+        properties made unrepresentable here that were previously hopes:
+
+        1. `feature_seconds >= max(step timeouts)`. The debate log guarantees
+           "a finer-grained signal is never overwritten by a coarser one":
+           step-level TimeoutEscalation names WHICH step hung; ABORTED_BUDGET
+           only says "too long overall." That precedence only holds when
+           the step timeout can actually fire before the outer wall-clock --
+           otherwise `asyncio.wait_for(feature_seconds)` cancels the inner
+           task before TimeoutEscalation raises, and the finer signal is lost.
+           Enforcing the inequality at load time makes the guarantee real.
+
+        2. Non-negative timeout values. A zero or negative step timeout is a
+           config mistake, not a valid "no bound"; explicit rejection at
+           load beats mysterious immediate-fire escalations later.
+        """
+        t = self.timeouts
+        for name in ("model_call_seconds", "gate_seconds", "round_seconds",
+                     "feature_seconds"):
+            v = getattr(t, name)
+            if not isinstance(v, int) or v < 0:
+                raise ValueError(
+                    f"timeouts.{name} must be a non-negative int, got {v!r}"
+                )
+        step_bounds = (t.model_call_seconds, t.gate_seconds, t.round_seconds)
+        max_step = max(step_bounds)
+        # feature_seconds == 0 is a special case: it fires immediately, but
+        # so does the step timeout, so the invariant is vacuously satisfied
+        # (used in tests to exercise the ABORTED_BUDGET path). For any
+        # positive value, the strict inequality is required.
+        if t.feature_seconds > 0 and t.feature_seconds < max_step:
+            raise ValueError(
+                f"timeouts.feature_seconds ({t.feature_seconds}s) must be >= "
+                f"max step timeout ({max_step}s) so a step-level "
+                f"TimeoutEscalation can fire before the outer feature "
+                f"budget cancels the task -- otherwise the 'finer-grained "
+                f"signal never overwritten by a coarser one' guarantee "
+                f"cannot hold. Adjust one or the other."
+            )
 
     def _apply(self, data: dict) -> None:
         for k in ("profile", "interactive", "debate_enabled", "human_only_paths"):

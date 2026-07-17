@@ -107,8 +107,28 @@ def _atomic_write_text(path: Path, content: str) -> None:
     """Write via a same-directory temp file and `os.replace` so an interrupt
     mid-write can't leave a truncated settings.json. Same directory matters:
     `os.replace` is only guaranteed atomic within a single filesystem, and
-    tempfile.NamedTemporaryFile in TMPDIR may land on a different one."""
+    tempfile.NamedTemporaryFile in TMPDIR may land on a different one.
+
+    Metadata preservation: mkstemp creates the temp at 0o600, and `os.replace`
+    does NOT inherit the destination's mode/owner/timestamps. If the caller's
+    settings.json was 0o644 (e.g. so their editor or a team-installed policy
+    tool can read it), a naive replace silently downgrades permissions.
+    We `shutil.copystat` from the existing file into the temp before replace,
+    so the on-disk mode/mtime survives the rewrite. ACLs and extended
+    attributes are best-effort (copystat handles what the platform supports).
+
+    Symlinks: refuse rather than replace. A symlinked settings.json is often
+    intentional (dotfiles repo); silently converting it to a regular file
+    would break that. The caller can resolve the link themselves if they
+    want in-place editing on the target."""
+    import shutil
     import tempfile
+    if path.is_symlink():
+        raise RuntimeError(
+            f"{path} is a symlink; refusing to replace it (would break "
+            f"the link target). Resolve the symlink and edit its target, "
+            f"or remove the symlink first."
+        )
     parent = path.parent
     parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -116,6 +136,15 @@ def _atomic_write_text(path: Path, content: str) -> None:
     try:
         with os.fdopen(fd, "w") as fp:
             fp.write(content)
+        # Copy mode/owner/times from the existing file if one exists so a
+        # 0o644 settings.json doesn't silently become 0o600 after rewrite.
+        if path.exists():
+            try:
+                shutil.copystat(str(path), tmp_name)
+            except OSError:
+                # copystat can fail on ACL/xattr copy; the mode part is what
+                # matters most, and it's already been attempted. Continue.
+                pass
         os.replace(tmp_name, path)
     except Exception:
         try:
