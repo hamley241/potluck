@@ -9,9 +9,9 @@ unresolved blocking issues, and decide when to escalate.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Severity(str, Enum):
@@ -39,6 +39,15 @@ class ReviewVerdict(BaseModel):
     @property
     def blocking_ids(self) -> set[str]:
         return {i.id for i in self.issues if i.severity == Severity.BLOCKING}
+
+    @property
+    def deadlock_ids(self) -> set[str]:
+        """Issue ids eligible for the deadlock/tiebreak path -- blocking OR
+        major. A reviewer flagged a `major` issue as materially wrong; if the
+        doer rejects it, that disagreement deserves the same tiebreak as
+        rejected `blocking`. `minor` never enters deadlock."""
+        return {i.id for i in self.issues
+                if i.severity in (Severity.BLOCKING, Severity.MAJOR)}
 
 
 class IssueResponse(BaseModel):
@@ -87,9 +96,15 @@ class StepResult(BaseModel):
 
     A timeout is just a failure with a recovery hint -- it flows through the
     same contract as any other failure, never a special path.
+
+    `output` is `Any` because different step kinds carry different payloads:
+    model calls return `str` (the model's message); the gate returns a
+    `GateResult` NamedTuple. Consumers know which shape to expect per step.
     """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     ok: bool
     timed_out: bool = False
-    output: str = ""
+    output: Any = ""
     error: str | None = None
     recovery_hint: str | None = None
