@@ -69,6 +69,18 @@ def write_log(result: dict, args):
         print(f"\nFull log written to {args.log_file}")
 
 
+def build_orchestrator(cfg: HarnessConfig) -> Orchestrator:
+    """Wire a cfg into a production Orchestrator (real doer/reviewer/tiebreaker,
+    real gate, config-bound get_diff). Pure: cfg -> Orchestrator, no argparse
+    and no I/O, so a test can build the exact object cmd_fix runs and assert on
+    the wiring (e.g. `orch.get_diff.diff_cfg is cfg.diff`)."""
+    doer = RealDoerClient()
+    reviewer = ReviewerClient(cfg)
+    tiebreaker = TiebreakerClient(cfg) if cfg.debate.use_tiebreaker else None
+    return Orchestrator(cfg, doer, reviewer, tiebreaker, real_run_gate,
+                        bound_get_diff(cfg.diff))
+
+
 # ---------------------------------------------------------------------------
 # fix — the code-writing loop
 # ---------------------------------------------------------------------------
@@ -119,11 +131,7 @@ def cmd_fix(args):
     print(f"spec: {spec[:80]}{'...' if len(spec) > 80 else ''}\n")
 
     async def _run():
-        doer = RealDoerClient()
-        reviewer = ReviewerClient(cfg)
-        tiebreaker = TiebreakerClient(cfg) if cfg.debate.use_tiebreaker else None
-        orch = Orchestrator(cfg, doer, reviewer, tiebreaker, real_run_gate,
-                            bound_get_diff(cfg.diff))
+        orch = build_orchestrator(cfg)
         return await orch.run_feature(spec, acceptance)
 
     result = asyncio.run(_run())

@@ -1321,6 +1321,19 @@ async def main():
     trailing = "[]\n\nNote: see [the docs] for details."
     assert _extract_verdict_json(trailing) == {"issues": []}, \
         f"array + prose containing ] must parse, got {_extract_verdict_json(trailing)!r}"
+    # (b') POPULATED one-issue array followed by prose whose text contains `]`.
+    # The `[]`-only case above can't catch a regression that mishandles a
+    # non-empty array's rightmost real `]`: here the widest slice spans the
+    # trailing "[link]" and is unparseable, so the leftward `]` walk must land
+    # on the array's own closing bracket and recover the single issue.
+    populated_trailing = (
+        '[{"id": "I1", "severity": "blocking", "issue": "x", '
+        '"suggested_fix": "y"}]\n\nNote: see [the link] above.')
+    got_pt = _extract_verdict_json(populated_trailing)
+    assert [i["id"] for i in got_pt["issues"]] == ["I1"], \
+        f"populated array + prose containing ] must parse to the issue, got {got_pt!r}"
+    assert got_pt["issues"][0]["issue"] == "x", \
+        f"populated array + prose must preserve issue fields, got {got_pt!r}"
     # (c) fenced ```json array.
     fenced = ('```json\n'
               '[{"id": "I1", "severity": "blocking", '
@@ -1330,6 +1343,183 @@ async def main():
     assert [i["id"] for i in got["issues"]] == ["I1"], \
         f"fenced array must parse to one issue, got {got!r}"
     results["invariant_verdict_array_shapes_parse"] = (Outcome.PASSED, 0)
+
+    # 29. INVARIANT (Member A): the parse-boundary catches are narrowed to
+    # ValueError, so a NON-ValueError from a parse path (a harness bug -- e.g.
+    # a TypeError from a refactored _extract_json) PROPAGATES and crashes the
+    # run rather than being mislabelled "malformed response" and buried as
+    # no-signal. We monkeypatch _extract_json to raise TypeError; the reviewer
+    # returns valid JSON so the parse actually reaches the extractor. The
+    # TypeError must escape run_feature entirely (its handlers cover
+    # Timeout/ModelUnavailable/DoerProtocolViolation only, never TypeError).
+    import harness.orchestrator as _orch_mod  # noqa: E402
+    _real_extract = _orch_mod._extract_json
+
+    def _boom_extract(text):
+        raise TypeError("simulated harness refactor bug")
+
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain)
+    _orch_mod._extract_json = _boom_extract
+    try:
+        crashed = None
+        try:
+            await orch.run_feature("spec", "acc")
+        except BaseException as e:  # capture exactly what escapes
+            crashed = e
+        assert isinstance(crashed, TypeError), (
+            "a TypeError from a parse path must propagate (narrow ValueError "
+            f"catch), got {type(crashed).__name__ if crashed else None}: "
+            f"{crashed!r}")
+    finally:
+        _orch_mod._extract_json = _real_extract
+
+    # 30. INVARIANT (Member B): get_diff runs under StepRunner, so a get_diff
+    # callable that ERRORS is no-signal -> ESCALATED_NO_SIGNAL tagged
+    # "[get_diff]", the same contract as an errored gate/reviewer. Bare
+    # `await self.get_diff()` would have let the RuntimeError crash the run.
+    cfg = HarnessConfig()
+    async def diff_raises():
+        raise RuntimeError("git index.lock held")
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_raises)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"erroring get_diff must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[get_diff]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [get_diff]: {r.escalation_reason!r}"
+
+    # 31. INVARIANT (Member B): a HANGING get_diff fires the step-level timeout
+    # under the gate_seconds bound and escalates ESCALATED_TIMEOUT -- BEFORE the
+    # coarse feature budget -- proving the finer step signal wins. The gate
+    # passes instantly; only get_diff hangs. gate_seconds=1 bounds get_diff;
+    # feature_seconds stays large so ABORTED_BUDGET can't fire first.
+    cfg = HarnessConfig()
+    cfg.timeouts.gate_seconds = 1        # bounds get_diff (local tooling)
+    cfg.timeouts.model_call_seconds = 1  # keep max_step small for validate()
+    cfg.timeouts.feature_seconds = 120   # >> the ~1s get_diff hang
+    cfg.escalation.retries_before_counting = 0  # single attempt -> fast
+    async def diff_hang():
+        await asyncio.sleep(30)
+        return "never"
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_hang)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_TIMEOUT, \
+        f"hanging get_diff must escalate TIMEOUT (not budget), got {r.outcome}"
+    assert r.escalation_reason and "get_diff_no_signal" in r.escalation_reason, \
+        f"escalation_reason must name the get_diff step: {r.escalation_reason!r}"
+
+    # 32. INVARIANT (Member D2a): RealDoerClient.respond_to_review fed valid
+    # JSON that FAILS schema validation (missing required IssueResponse fields)
+    # must raise RuntimeError("malformed"), NOT leak a pydantic ValidationError.
+    # Prior malformed tests only fed prose; this pins the valid-JSON-wrong-schema
+    # branch through the real subprocess path via the fake-CLI helper.
+    verdict_wrongschema = ReviewVerdict(issues=[
+        ReviewIssue(id="I1", severity="blocking",
+                    issue="something is wrong", suggested_fix="fix it")])
+    with tempfile.TemporaryDirectory() as tmp:
+        # Valid JSON, but each response is missing `decision` and `reasoning`.
+        helper = _write_helper(tmp, json.dumps({"responses": [{"id": "I1"}]}))
+        doer = RealDoerClient(claude_cmd=helper)
+        raised = None
+        try:
+            await doer.respond_to_review("spec", "acc", "diff",
+                                         verdict_wrongschema)
+        except BaseException as e:
+            raised = e
+        assert isinstance(raised, RuntimeError), \
+            f"wrong-schema JSON must raise RuntimeError, got {type(raised).__name__}: {raised!r}"
+        assert not isinstance(raised, (ValueError, ValidationError)), \
+            f"must not leak ValueError/ValidationError: {type(raised).__name__}"
+        assert "malformed" in str(raised), \
+            f"RuntimeError message must mention 'malformed': {raised!r}"
+
+    # 33. INVARIANT (Member D2b): a stub reviewer returning valid JSON that
+    # fails ReviewVerdict validation escalates ESCALATED_NO_SIGNAL, same bucket
+    # as prose. (A bare wrong key like {"wrong_key": []} is ACCEPTED -- `issues`
+    # defaults to [] -- so it can't exercise the failure path; we feed valid
+    # JSON whose issues entry violates the schema to actually trip validation.)
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg, {"issues": [{"id": "I1"}]})  # missing fields
+    orch = make(cfg, StubDoer({}), reviewer, None, gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"wrong-schema reviewer JSON must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[reviewer]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [reviewer]: {r.escalation_reason!r}"
+
+    # 34. INVARIANT (Member D4): cmd_fix's Orchestrator construction is factored
+    # into build_orchestrator(cfg), and the production get_diff callable carries
+    # its bound DiffConfig introspectably. Reverting cli to pass bare
+    # real_get_diff (defaults shadowing the config) would fail this: the wired
+    # callable's diff_cfg must be the very cfg.diff object.
+    from harness.cli import build_orchestrator  # noqa: E402
+    cfg = HarnessConfig()
+    built = build_orchestrator(cfg)
+    assert built.get_diff.diff_cfg is cfg.diff, \
+        "build_orchestrator must wire the config-bound get_diff (diff_cfg is cfg.diff)"
+
+    # 35. INVARIANT (Member A): deeply nested MODEL output escalates
+    # ESCALATED_NO_SIGNAL instead of crashing. `json.loads` on pathologically
+    # nested input raises RecursionError -- which is NOT a ValueError -- so the
+    # ValueError-only narrowing would have let it crash the harness. The
+    # boundary now catches (ValueError, RecursionError); a model emitting
+    # nested-to-death JSON is bad model output (the no-signal bucket), not a
+    # harness bug. We drive the REAL deep-input path (not a monkeypatch) so this
+    # proves the actual failure mode: the reviewer returns `'['*N + ']'*N`,
+    # which blows json.loads's recursion limit inside _parse_verdict.
+    class DeepNestedReviewer(ReviewerClient):
+        async def review(self, spec, acceptance, diff):
+            return "[" * 200000 + "]" * 200000
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), DeepNestedReviewer(cfg), None,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"deeply nested reviewer output must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[reviewer]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [reviewer]: {r.escalation_reason!r}"
+
+    # 36. INVARIANT (Member A, class closure): a gate callable returning
+    # nested-to-death JSON escalates ESCALATED_NO_SIGNAL "[gate]" instead of
+    # crashing. GateResult.from_json_str calls json.loads, which raises
+    # RecursionError on pathologically nested input -- NOT a ValueError -- so
+    # before the tuple was widened this escaped run_feature and crashed the
+    # harness. We drive the REAL deep-input path (a gate callable actually
+    # returning `'['*N + ']'*N`), not a monkeypatch, so this pins the actual
+    # failure mode at the GateResult parse boundary.
+    cfg = HarnessConfig()
+    async def gate_deep_nested():
+        return "[" * 200000 + "]" * 200000
+    orch = Orchestrator(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                        None, gate_deep_nested, diff_plain,
+                        ab_swap=lambda _id: False)
+    crashed = None
+    try:
+        r = await orch.run_feature("spec", "acc")
+    except BaseException as e:  # must NOT raise
+        crashed = e
+    assert crashed is None, \
+        f"nested-to-death gate output must not crash the harness, got {crashed!r}"
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"nested-to-death gate output must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[gate]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [gate]: {r.escalation_reason!r}"
+
+    # 37. INVARIANT (Member B, class closure): _extract_codex_message skips a
+    # nested-to-death JSONL line instead of crashing. A pathologically nested
+    # line raises RecursionError inside json.loads; the per-line except now
+    # includes RecursionError so the line is skipped like any other unparseable
+    # line (continue semantics unchanged) and a LATER valid item.completed line
+    # still wins (last-wins). Called directly to pin the extractor boundary.
+    nested_line = "[" * 200000 + "]" * 200000
+    valid_line = json.dumps(
+        {"type": "item.completed", "item": {"text": "the real answer"}})
+    extracted = _orch_mod._extract_codex_message(nested_line + "\n" + valid_line)
+    assert extracted == "the real answer", \
+        f"nested-to-death line must be skipped and later valid line win, got {extracted!r}"
 
     # report
     expected = {

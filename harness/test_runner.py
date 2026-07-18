@@ -13,7 +13,7 @@ import os
 import sys
 import tempfile
 
-from harness.runner import run_subprocess
+from harness.runner import run_subprocess, _drain
 
 
 async def _process_killed_on_timeout() -> bool:
@@ -107,13 +107,15 @@ async def _chatty_child_survives_grace_window() -> bool:
     sentinel = tempfile.NamedTemporaryFile(delete=False)
     sentinel.close()
     # 256 KB is larger than any default pipe buffer, so a handler that flushes
-    # it wedges on write() unless someone is draining the read end.
+    # it wedges on write() unless someone is draining the read end. The handler
+    # records its PID alongside 'clean' so the test can also assert the process
+    # actually exited (drained-and-exited, not drained-but-lingering).
     script = (
-        "import sys, signal, time\n"
+        "import os, sys, signal, time\n"
         "def handler(signum, frame):\n"
         "    sys.stdout.write('x' * (256 * 1024))\n"
         "    sys.stdout.flush()\n"
-        "    open(sys.argv[1], 'w').write('clean')\n"
+        "    open(sys.argv[1], 'w').write('clean ' + str(os.getpid()))\n"
         "    sys.exit(0)\n"
         "signal.signal(signal.SIGTERM, handler)\n"
         "time.sleep(30)\n"
@@ -121,42 +123,102 @@ async def _chatty_child_survives_grace_window() -> bool:
     cmd = [sys.executable, "-c", script, sentinel.name]
 
     try:
-        await asyncio.wait_for(run_subprocess(cmd), timeout=1.0)
-        return False  # it should NOT have completed
-    except asyncio.TimeoutError:
-        pass  # expected -- triggers the SIGTERM+grace teardown
+        try:
+            await asyncio.wait_for(run_subprocess(cmd), timeout=1.0)
+            return False  # it should NOT have completed
+        except asyncio.TimeoutError:
+            pass  # expected -- triggers the SIGTERM+grace teardown
 
-    # Let the handler flush + exit within the grace window and the reap settle.
-    await asyncio.sleep(1.0)
-    return open(sentinel.name).read().strip() == "clean"
+        # Let the handler flush + exit within the grace window and the reap
+        # settle.
+        await asyncio.sleep(1.0)
+        parts = open(sentinel.name).read().strip().split()
+        if len(parts) != 2 or parts[0] != "clean":
+            return False
+        # The child flushed cleanly AND the process is gone -- it exited via the
+        # handler within the grace window rather than being SIGKILLed.
+        return _pid_dead(int(parts[1]))
+    finally:
+        # The sentinel is delete=False (the child, a separate process, writes
+        # it) so we remove it here rather than leaking one tempfile per run.
+        try:
+            os.unlink(sentinel.name)
+        except OSError:
+            pass
 
 
 async def _invalid_utf8_stdout_replaced() -> bool:
     """A backend emitting invalid UTF-8 on stdout must not raise
     UnicodeDecodeError (a ValueError that slips through StepRunner's
-    (RuntimeError, OSError) catch). Strict decode -> errors='replace'."""
+    (RuntimeError, OSError) catch). Strict decode -> errors='replace'.
+
+    Asserts the U+FFFD replacement character actually lands in the returned
+    string: errors='ignore' would silently drop the bad bytes and also not
+    raise, so a bare "isinstance str" check passes under either policy. Pinning
+    U+FFFD is what fails the test if the decode ever regresses to 'ignore'."""
     cmd = [sys.executable, "-c",
            "import sys; sys.stdout.buffer.write(b'\\xff\\xfe'); sys.exit(0)"]
     try:
         out = await run_subprocess(cmd)
     except UnicodeDecodeError:
         return False  # the bug: strict decode crashed the success path
-    return isinstance(out, str)
+    return isinstance(out, str) and "�" in out
 
 
 async def _invalid_utf8_stderr_message_builds() -> bool:
     """Non-zero exit with invalid UTF-8 on stderr: the RuntimeError message
     interpolates stderr, so a strict decode there raises UnicodeDecodeError
-    while building the exception. Must surface as RuntimeError, not decode."""
+    while building the exception. Must surface as RuntimeError, not decode.
+
+    Asserts the U+FFFD replacement character is in the RuntimeError message:
+    errors='ignore' would build the message without raising too, so only
+    pinning U+FFFD distinguishes 'replace' from 'ignore'."""
     cmd = [sys.executable, "-c",
            "import sys; sys.stderr.buffer.write(b'\\xff\\xfe'); sys.exit(1)"]
     try:
         await run_subprocess(cmd)
-    except RuntimeError:
-        return True   # error path reported cleanly
+    except RuntimeError as e:
+        return "�" in str(e)  # error path reported cleanly, bytes replaced
     except UnicodeDecodeError:
         return False  # the bug: message interpolation crashed
     return False      # a non-zero exit must raise SOMETHING
+
+
+async def _drain_survives_transient_concurrent_reader() -> bool:
+    """_drain must survive a transient concurrent-reader RuntimeError and still
+    drain to EOF. communicate()'s cancelled reader can still hold the stream on
+    the first read (StreamReader rejects a concurrent reader with RuntimeError);
+    the sleep(0) at the call site narrows but does not close that window under a
+    loaded loop, so _drain retries rather than abandoning the pipe -- else the
+    original wedge-on-full-pipe failure re-opens.
+
+    Fake stream: read() raises RuntimeError once, then returns data, then b""
+    (EOF). Pins that _drain retried past the RuntimeError AND consumed to EOF."""
+    class FakeStream:
+        def __init__(self):
+            self.calls = 0
+            self.consumed = []
+            # First call: transient concurrent-reader error. Then a data chunk,
+            # then EOF.
+            self._script = [RuntimeError("read() called while another"
+                                        " coroutine is already waiting"),
+                            b"buffered output",
+                            b""]
+
+        async def read(self, n):
+            self.calls += 1
+            item = self._script[self.calls - 1] if self.calls <= len(
+                self._script) else b""
+            if isinstance(item, RuntimeError):
+                raise item
+            self.consumed.append(item)
+            return item
+
+    fake = FakeStream()
+    await _drain(fake)
+    # Retried past the RuntimeError (>=3 calls: error, data, EOF) and consumed
+    # the real data before hitting EOF.
+    return fake.calls >= 3 and fake.consumed == [b"buffered output", b""]
 
 
 def main():
@@ -172,6 +234,10 @@ def main():
         _invalid_utf8_stdout_replaced())
     results["invalid_utf8_stderr_message_builds"] = asyncio.run(
         _invalid_utf8_stderr_message_builds())
+    # _drain retries past a transient concurrent-reader RuntimeError (bounded)
+    # and still drains to EOF -- pins Member B1.
+    results["drain_survives_transient_concurrent_reader"] = asyncio.run(
+        _drain_survives_transient_concurrent_reader())
     # Both teardown paths: (a) grandchild respects SIGTERM (dies in grace
     # window); (b) grandchild ignores SIGTERM (SIGKILL fallback kicks in).
     # In both, the whole process group must be gone.

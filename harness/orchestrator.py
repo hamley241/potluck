@@ -453,15 +453,22 @@ class RealDoerClient(DoerClient):
         raw = await run_subprocess(
             [self._cmd] + self._JUDGE_FLAGS, stdin_text=prompt
         )
-        # This parse runs inside the coroutine StepRunner drives; a prose
-        # reply (ValueError from _extract_json) or schema mismatch (pydantic
-        # ValidationError) would otherwise escape StepRunner's narrow
-        # (RuntimeError, OSError) catch and crash the orchestrator. Raise the
-        # same RuntimeError contract run_subprocess uses for CLI failures so
-        # it flows through StepRunner -> ModelUnavailable -> ESCALATED_NO_SIGNAL.
+        # This parse runs inside the coroutine StepRunner drives; a malformed
+        # reply would otherwise escape StepRunner's narrow (RuntimeError,
+        # OSError) catch and crash the orchestrator. Raise the same RuntimeError
+        # contract run_subprocess uses for CLI failures so it flows through
+        # StepRunner -> ModelUnavailable -> ESCALATED_NO_SIGNAL.
+        # The caught set is exactly what a malformed MODEL RESPONSE can raise
+        # out of json.loads + pydantic: ValueError (covering json.JSONDecodeError
+        # and pydantic ValidationError, both subclasses) plus RecursionError
+        # (json.loads on pathologically nested input exceeds the recursion
+        # limit, and RecursionError is NOT a ValueError). Any OTHER exception
+        # type is a harness bug -- not a bad model reply -- and MUST crash
+        # loudly rather than be mislabelled "malformed response" and buried as
+        # no-signal.
         try:
             return DoerResponse.model_validate(_extract_json(raw))
-        except Exception as e:
+        except (ValueError, RecursionError) as e:
             raise RuntimeError(
                 f"doer returned malformed response: {e}") from e
 
@@ -643,7 +650,24 @@ class Orchestrator:
 
         # If debate disabled (e.g. CI) or diff touches human-only paths,
         # stop at the deterministic gate.
-        diff = await self.get_diff()
+        # get_diff runs under StepRunner like every other external step -- a
+        # hung git (lock contention, huge repo) otherwise stalls the feature
+        # until the coarse feature_seconds budget fires, losing the step-level
+        # signal the design is built on. gate_seconds is the right bound:
+        # get_diff, like the gate, is local deterministic tooling, so it reuses
+        # that knob rather than adding a dead new one. StepRunner returns the
+        # coroutine's value unchanged, so res.output is already the diff str.
+        diff_res = await self.runner.run(
+            "get_diff", lambda: self.get_diff(),
+            self.cfg.timeouts.gate_seconds)
+        if diff_res.timed_out:
+            raise TimeoutEscalation(
+                "get_diff_no_signal",
+                "get_diff hung; cannot assemble the review diff")
+        if not diff_res.ok:
+            raise ModelUnavailable(
+                "get_diff", diff_res.error or "get_diff errored")
+        diff = diff_res.output
         if not self.cfg.debate_enabled:
             self._log("debate_skipped", reason="disabled_by_profile")
             return FeatureResult(Outcome.PASSED, 0, self.log)
@@ -825,11 +849,17 @@ class Orchestrator:
             raise ModelUnavailable("gate", err)
         try:
             gate_res = GateResult.from_json_str(res.output)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError,
+                RecursionError) as e:
             # Stale caller returning the old str contract (or malformed JSON):
             # the gate produced no parseable verdict, so surface as no-signal,
             # not a gate failure and not a silent pass. Do NOT crash on the
             # AttributeError that would come from touching .ok on a bare str.
+            # RecursionError covers a gate callable returning nested-to-death
+            # JSON (json.loads blows the stack): that is an unusable gate
+            # response, not a harness bug, so it becomes no-signal too. Keep
+            # KeyError/TypeError explicit -- they cover a structurally-wrong
+            # but valid-JSON payload that ValueError does not.
             detail = f"malformed gate response: {e}"
             self._log("gate", label=label, passed=False, error=detail)
             raise ModelUnavailable("gate", detail)
@@ -880,14 +910,20 @@ class Orchestrator:
         if not res.ok:
             raise ModelUnavailable(
                 "doer", res.error or "doer respond errored")
-        # Pydantic ValidationError from a malformed doer JSON must NOT
-        # propagate as an uncaught traceback -- run_feature's escalation
-        # handlers don't know about pydantic. Convert to ModelUnavailable
-        # so the outcome is a clean ESCALATED_NO_SIGNAL, same as any other
-        # unusable doer response.
+        # A malformed doer JSON must NOT propagate as an uncaught traceback --
+        # run_feature's escalation handlers don't know about pydantic. Convert
+        # to ModelUnavailable so the outcome is a clean ESCALATED_NO_SIGNAL,
+        # same as any other unusable doer response. The caught set is exactly
+        # what a malformed MODEL RESPONSE can raise out of json.loads +
+        # pydantic: ValueError (covering json.JSONDecodeError and pydantic
+        # ValidationError, both subclasses) plus RecursionError (json.loads on
+        # pathologically nested input exceeds the recursion limit, and
+        # RecursionError is NOT a ValueError). Anything else is a harness bug --
+        # not a bad doer reply -- and MUST crash loudly rather than hide behind
+        # the model-quality bucket.
         try:
             return DoerResponse.model_validate_json(res.output)
-        except Exception as e:  # pydantic ValidationError, JSONDecodeError, ...
+        except (ValueError, RecursionError) as e:
             raise ModelUnavailable(
                 "doer", f"doer returned malformed response: {e}") from e
 
@@ -921,12 +957,18 @@ class Orchestrator:
         if not res.ok:
             raise ModelUnavailable("reviewer", res.error or "reviewer call errored")
         # A reviewer answering with prose (no JSON) or a schema mismatch raises
-        # ValueError / pydantic ValidationError, which run_feature does not
-        # catch. Convert to ModelUnavailable so it escalates cleanly, same as
-        # the doer path in _doer_respond_to_review.
+        # out of the parse, which run_feature does not catch. Convert to
+        # ModelUnavailable so it escalates cleanly, same as the doer path in
+        # _doer_respond_to_review. The caught set is exactly what a malformed
+        # MODEL RESPONSE can raise out of json.loads + pydantic: ValueError
+        # (covering json.JSONDecodeError and pydantic ValidationError, both
+        # subclasses) plus RecursionError (json.loads on pathologically nested
+        # input exceeds the recursion limit, and RecursionError is NOT a
+        # ValueError). Any other exception type is a harness bug and MUST crash
+        # loudly, not be mislabelled as a bad reviewer reply.
         try:
             return _parse_verdict(res.output)
-        except Exception as e:
+        except (ValueError, RecursionError) as e:
             raise ModelUnavailable(
                 "reviewer", f"reviewer returned malformed response: {e}") from e
 
@@ -942,10 +984,16 @@ class Orchestrator:
                                     "reviewer follow-up timed out")
         if not res.ok:
             raise ModelUnavailable("reviewer", res.error or "reviewer follow-up errored")
-        # See _review: malformed reviewer output must escalate, not crash.
+        # See _review: malformed reviewer output must escalate, not crash. The
+        # caught set is exactly what a malformed MODEL RESPONSE can raise out of
+        # json.loads + pydantic: ValueError (covering json.JSONDecodeError and
+        # pydantic ValidationError, both subclasses) plus RecursionError
+        # (json.loads on pathologically nested input exceeds the recursion
+        # limit, and RecursionError is NOT a ValueError). Any other exception
+        # type is a harness bug that MUST crash loudly.
         try:
             return _parse_verdict(res.output)
-        except Exception as e:
+        except (ValueError, RecursionError) as e:
             raise ModelUnavailable(
                 "reviewer", f"reviewer returned malformed response: {e}") from e
 
@@ -1006,10 +1054,16 @@ class Orchestrator:
                 raise ModelUnavailable("tiebreaker", res.error or "tiebreaker call errored")
             # A malformed tiebreaker response (prose / schema mismatch) escalates
             # the whole run, matching the ERRORED branch above -- NOT the timeout
-            # branch, which merely leaves this issue contested.
+            # branch, which merely leaves this issue contested. The caught set is
+            # exactly what a malformed MODEL RESPONSE can raise out of json.loads
+            # + pydantic: ValueError (covering json.JSONDecodeError and pydantic
+            # ValidationError, both subclasses) plus RecursionError (json.loads on
+            # pathologically nested input exceeds the recursion limit, and
+            # RecursionError is NOT a ValueError). Any other exception type is a
+            # harness bug and MUST crash loudly instead of being buried here.
             try:
                 tb = _parse_tiebreak(res.output)
-            except Exception as e:
+            except (ValueError, RecursionError) as e:
                 raise ModelUnavailable(
                     "tiebreaker",
                     f"tiebreaker returned malformed response: {e}") from e
@@ -1101,7 +1155,10 @@ def _extract_codex_message(jsonl_output: str) -> str:
             event = json.loads(line)
             if event.get("type") == "item.completed":
                 last_text = event.get("item", {}).get("text", "")
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, RecursionError):
+            # A nested-to-death line (json.loads blows the stack) is skipped
+            # like any other unparseable line, not fatal: one bad line must
+            # not discard the rest of the stream.
             continue
     return last_text if last_text is not None else jsonl_output
 
@@ -1299,7 +1356,9 @@ async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
     by dropping a large file. A visible marker means the reviewer can see
     something was omitted and ask for it.
 
-    No timeout here -- the Orchestrator wraps this via StepRunner.
+    No timeout here -- the Orchestrator runs this under StepRunner with the
+    gate_seconds bound (get_diff is local deterministic tooling, same class as
+    the gate), so a hung git surfaces as a step-level timeout escalation.
     """
     tracked = await run_subprocess(["git", "diff", "HEAD"])
     # -z: NUL-delimited output. Git allows newlines in filenames, so
@@ -1347,6 +1406,12 @@ def bound_get_diff(diff_cfg: DiffConfig):
     async def _get_diff() -> str:
         return await real_get_diff(
             diff_cfg.max_untracked_bytes, diff_cfg.binary_probe_bytes)
+    # Expose the bound config on the returned callable so a test can verify
+    # production wiring introspectably -- reverting cli to pass bare
+    # real_get_diff (whose defaults shadow the config) would otherwise leave
+    # the suite green. Asserting `orch.get_diff.diff_cfg is cfg.diff` pins that
+    # the config-bearing callable is the one that reached the Orchestrator.
+    _get_diff.diff_cfg = diff_cfg
     return _get_diff
 
 
