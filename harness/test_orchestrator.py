@@ -884,6 +884,54 @@ async def main():
     assert not hasattr(stale.timeouts, "round_seconds"), \
         "stale round_seconds key must NOT create the attribute"
 
+    # 15n. INVARIANT: the dead `interactive` knob stays deleted (config-drift 2b).
+    # Nothing in harness/ ever read it; guards against reintroduction without a
+    # reader, same rationale as round_seconds above.
+    assert not hasattr(_HC(), "interactive"), \
+        "interactive must not be reintroduced without a reader"
+
+    # 15o. INVARIANT: old profile TOML setting `interactive` still loads. The
+    # `_apply` top-level tuple no longer lists it, so the key is silently ignored
+    # (same contract as any unknown key) -- neither raises nor creates the
+    # attribute -- while a sibling live key like `profile` still applies.
+    stale_i = _HC()
+    stale_i._apply({"interactive": False, "profile": "ci"})  # must not raise
+    assert not hasattr(stale_i, "interactive"), \
+        "stale interactive key must NOT create the attribute"
+    assert stale_i.profile == "ci", \
+        "live sibling key `profile` must still apply alongside a dead one"
+
+    # 15p. INVARIANT: HARNESS_NONINTERACTIVE is a no-op. Setting it must not
+    # raise and must not create an `interactive` attribute (the env hook was
+    # deleted with the field, not kept as a dead compatibility shim).
+    _prev_ni = os.environ.get("HARNESS_NONINTERACTIVE")
+    os.environ["HARNESS_NONINTERACTIVE"] = "1"
+    try:
+        env_i = _HC()
+        env_i._apply_env()  # must not raise
+        assert not hasattr(env_i, "interactive"), \
+            "HARNESS_NONINTERACTIVE must not create an interactive attribute"
+    finally:
+        if _prev_ni is None:
+            os.environ.pop("HARNESS_NONINTERACTIVE", None)
+        else:
+            os.environ["HARNESS_NONINTERACTIVE"] = _prev_ni
+
+    # 15q. INVARIANT: the live env sibling HARNESS_NO_DEBATE still flips
+    # debate_enabled (guards against over-deleting in `_apply_env`).
+    _prev_nd = os.environ.get("HARNESS_NO_DEBATE")
+    os.environ["HARNESS_NO_DEBATE"] = "1"
+    try:
+        env_d = _HC()
+        env_d._apply_env()
+        assert env_d.debate_enabled is False, \
+            "HARNESS_NO_DEBATE=1 must still flip debate_enabled to False"
+    finally:
+        if _prev_nd is None:
+            os.environ.pop("HARNESS_NO_DEBATE", None)
+        else:
+            os.environ["HARNESS_NO_DEBATE"] = _prev_nd
+
     # 16. INVARIANT: rejected `major` issues reach the deadlock/tiebreak path
     # instead of being silently discarded. Pre-fix, `unresolved_blocking` was
     # computed from `blocking_ids` only, so a rejected major left it empty and

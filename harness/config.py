@@ -112,7 +112,6 @@ class DiffConfig:
 @dataclass
 class HarnessConfig:
     profile: str = "personal"
-    interactive: bool = True          # CI sets this False -> no human escalation target
     debate_enabled: bool = True       # CI disables -> deterministic gate only
     # Path-based routing: diffs touching these paths skip external review and
     # go human-only. Empty by default; flip on after checking with security.
@@ -184,7 +183,7 @@ class HarnessConfig:
             )
 
     def _apply(self, data: dict) -> None:
-        for k in ("profile", "interactive", "debate_enabled", "human_only_paths"):
+        for k in ("profile", "debate_enabled", "human_only_paths"):
             if k in data:
                 setattr(self, k, data[k])
         for section, obj in (
@@ -218,8 +217,6 @@ class HarnessConfig:
 
     def _apply_env(self) -> None:
         # A couple of high-value env overrides for CI.
-        if os.environ.get("HARNESS_NONINTERACTIVE") == "1":
-            self.interactive = False
         if os.environ.get("HARNESS_NO_DEBATE") == "1":
             self.debate_enabled = False
 

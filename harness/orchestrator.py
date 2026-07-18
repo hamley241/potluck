@@ -1,7 +1,7 @@
 """The orchestration loop.
 
 This is the invariant core -- it does not change across profiles. Profiles only
-flip config (debate on/off, interactive, thresholds, which paths are human-only).
+flip config (debate on/off, thresholds, which paths are human-only).
 
 Flow (convergent / bug-fix & feature profiles):
 
