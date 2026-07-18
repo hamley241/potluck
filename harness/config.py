@@ -110,6 +110,38 @@ class DiffConfig:
 
 
 @dataclass
+class PromptConfig:
+    """Knobs for prompt packing and prompt-size instrumentation.
+
+    Two DIFFERENT problems live under "large prompts" and get opposite
+    treatments (see README's argv seam and docs/observations.md 001):
+
+      * The HARD limit -- argv-delivered backends (Backend.stdin=False, e.g.
+        Kimi `-p <prompt>`) pass the whole prompt as a command argument, so a
+        large diff can exceed the OS ARG_MAX. `argv_safety_margin_bytes` is the
+        headroom subtracted from the derived ARG_MAX budget so we pack BELOW the
+        real limit, not right at it. Read in orchestrator._derive_argv_budget.
+
+      * The SOFT drift -- codex loses repo grounding as stdin grows. That gets
+        MEASURED, never truncated. `large_prompt_warn_bytes` is the threshold
+        above which a `prompt_large` event is logged. Read in
+        orchestrator._assemble_prompt. This is instrumentation, not mitigation:
+        crossing it changes no behavior, it just records the drift zone.
+
+    Both knobs MUST actually be read (this project has a history of knobs that
+    govern nothing); the tests assert the derivation and the threshold use them.
+    """
+    # Headroom under the derived ARG_MAX budget. ARG_MAX bounds argv+envp
+    # together and the exact overhead (alignment, pointer array) is
+    # platform-specific, so we keep a margin rather than pack to the byte.
+    argv_safety_margin_bytes: int = 8 * 1024
+    # Prompt byte size above which `prompt_large` fires. Sized at the low end of
+    # observation 001's drift zone (codex drifted at ~19 KB, stayed accurate at
+    # ~4 KB) so the warning brackets where grounding starts to slip.
+    large_prompt_warn_bytes: int = 16 * 1024
+
+
+@dataclass
 class HarnessConfig:
     profile: str = "personal"
     debate_enabled: bool = True       # CI disables -> deterministic gate only
@@ -129,6 +161,7 @@ class HarnessConfig:
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
     models: Models = field(default_factory=Models)
     diff: DiffConfig = field(default_factory=DiffConfig)
+    prompt: PromptConfig = field(default_factory=PromptConfig)
 
     @classmethod
     def load(cls, profile_path: Path | None = None,
@@ -199,6 +232,7 @@ class HarnessConfig:
             ("debate", self.debate),
             ("escalation", self.escalation),
             ("diff", self.diff),
+            ("prompt", self.prompt),
         ):
             if section in data:
                 for k, v in data[section].items():
