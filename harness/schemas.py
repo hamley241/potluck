@@ -97,6 +97,12 @@ class ClosurePattern(BaseModel):
     The model NEVER reports a site. It names the bug class and emits patterns;
     the harness runs them itself. `regex` is POSIX ERE, run by the harness via
     `git grep -E`. `rationale` explains why a match here would be the same bug.
+
+    `rationale` is bounded (single line, capped with an elision marker) before
+    it reaches a ClosureReport: this pattern rides FeatureResult straight into
+    --json-output, so the debate-log size contract applies here too. `regex` is
+    NOT bounded that way -- a truncated regex would search for something
+    different; the harness rejects an over-long regex before running it instead.
     """
     regex: str
     rationale: str
@@ -111,6 +117,12 @@ class ClosureCandidate(BaseModel):
     hallucinated path the model invents cannot become a ClosureCandidate,
     because nothing the model says about locations is ever trusted or echoed --
     only lines the grep actually found reach the operator.
+
+    `text` is bounded at construction (capped with an elision marker) even
+    though it is real grep output, not model-supplied: a single long repo line
+    -- a minified bundle, a generated file, a long data literal -- would
+    otherwise carry hundreds of KB into --json-output unchecked. This report
+    rides FeatureResult, so the debate-log size contract applies to it too.
     """
     file: str
     line: int
@@ -127,6 +139,14 @@ class ClosureReport(BaseModel):
     model-claimed locations are NEVER trusted or copied into it. The report is
     advisory only -- it is produced on an already-passed run and can never
     change the outcome.
+
+    Every free-text field carried here -- `bug_class`, each pattern's
+    `rationale`, and each candidate's `text` -- is length-bounded with a visible
+    elision marker before it lands. This whole report rides FeatureResult into
+    --json-output, so the debate-log size contract that bounds worst-case
+    FeatureResult size applies to it too; a single unbounded field would defeat
+    it. (`regex` is the exception: it is rejected-not-truncated when over-long,
+    since a shortened regex would silently search for something else.)
     """
     bug_class: str                     # one line: the class this fix closed
     patterns: list[ClosurePattern] = Field(default_factory=list)

@@ -73,6 +73,29 @@ from .schemas import (
 # `truncations` sibling so consumers can render "... (12345 chars total)".
 _MAX_STR = 16 * 1024
 
+# Closure free-text cap. ClosureReport (bug_class, each pattern's rationale, and
+# every candidate's `text`) rides on FeatureResult straight into --json-output,
+# so the debate-log size contract above applies to it too: an unbounded field
+# there would blow the worst-case FeatureResult size the way a 200 KB grep line
+# from one minified repo file does. Every free-text field is capped here at the
+# same 500 this file uses for git stderr excerpts, with a visible elision marker
+# so a truncated value is never mistaken for the whole one. This is ALSO the max
+# regex length accepted -- but a regex is never truncated (a shortened regex is a
+# DIFFERENT regex that would silently change what was searched); an over-long one
+# is rejected before it runs instead. Lives at module scope because _parse_closure
+# (a module function) bounds the model strings; the count caps stay class-level.
+_CLOSURE_MAX_TEXT = 500
+
+
+def _bound_closure_text(s: str) -> str:
+    """Cap a closure free-text field at _CLOSURE_MAX_TEXT, appending an explicit
+    `... (N chars total)` marker when it bites so a truncated value is never
+    mistaken for the whole line. NEVER use this on a regex -- truncating a regex
+    changes what it matches; reject an over-long regex instead."""
+    if len(s) <= _CLOSURE_MAX_TEXT:
+        return s
+    return s[:_CLOSURE_MAX_TEXT] + f"... ({len(s)} chars total)"
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1298,6 +1321,26 @@ class Orchestrator:
                       dropped=len(patterns) - self._CLOSURE_MAX_PATTERNS)
             patterns = patterns[:self._CLOSURE_MAX_PATTERNS]
 
+        # (d2) Reject (never truncate) any over-long regex BEFORE it can run or
+        #     reach the report. A shortened regex is a DIFFERENT regex that would
+        #     silently change what was searched, so it is dropped from the
+        #     accepted set entirely -- it never rides closure_report.patterns into
+        #     --json-output, even when a valid sibling pattern yields candidates.
+        #     Log only the offending LENGTH, never the raw regex: _pack_event
+        #     would truncate an over-long field, leaving a shortened form of the
+        #     rejected regex in the log -- exactly the truncated artifact this
+        #     rejection exists to prevent.
+        accepted: list[ClosurePattern] = []
+        for pat in patterns:
+            if len(pat.regex) > _CLOSURE_MAX_TEXT:
+                self._log("closure_skipped", scope="pattern",
+                          regex_length=len(pat.regex),
+                          reason=f"regex length {len(pat.regex)} exceeds "
+                                 f"{_CLOSURE_MAX_TEXT}")
+                continue
+            accepted.append(pat)
+        patterns = accepted
+
         # (f) Files this diff touched are the sites just fixed -- exclude them.
         #     _extract_changed_paths parses the `diff --git` headers via the
         #     existing _parse_diff_git_header helper (and merge headers too);
@@ -1316,15 +1359,19 @@ class Orchestrator:
         #     to JSON at the step boundary and we deserialize on the far side.
         async def _grep_all() -> str:
             found: list[dict] = []
-            for pat in patterns:
+            for pat in patterns:  # all over-long regexes already rejected in (d2)
                 grep = await self._git_grep(pat.regex)
                 if grep is None:
                     continue  # >1 exit -- _git_grep logged closure_skipped
                 for path, lineno, text in grep:
                     if path in touched:
                         continue
+                    # A grep line exists to be eyeballed and printed one-per-line;
+                    # bound it here, at construction, so no full-length repo line
+                    # (a minified bundle, a long data literal) reaches the report.
                     found.append({"file": path, "line": lineno,
-                                  "text": text, "pattern": pat.regex})
+                                  "text": _bound_closure_text(text),
+                                  "pattern": pat.regex})
             return json.dumps(found)
 
         grep_res = await self.runner.run(
@@ -1525,17 +1572,27 @@ def _parse_closure(text: str) -> tuple[str, list[ClosurePattern]]:
       * _extract_json raises ValueError when no JSON object is present;
       * a missing/non-string `bug_class` or non-list `patterns` -> ValueError;
       * ClosurePattern.model_validate raises pydantic ValidationError (a
-        ValueError subclass) on a malformed pattern entry."""
+        ValueError subclass) on a malformed pattern entry.
+
+    The model-supplied free-text -- `bug_class` and each pattern's `rationale`
+    -- is bounded here (single-line explanations, capped at _CLOSURE_MAX_TEXT
+    with an elision marker) so nothing unbounded can reach a ClosureReport and
+    ride FeatureResult into --json-output. `regex` is left untouched on purpose:
+    a truncated regex would search for something different; the over-long case
+    is rejected in the sweep before any grep runs, never shortened."""
     data = _extract_json(text)
     if not isinstance(data, dict):
         raise ValueError("closure reply is not a JSON object")
     bug_class = data.get("bug_class")
     if not isinstance(bug_class, str):
         raise ValueError("closure reply missing a string 'bug_class'")
+    bug_class = _bound_closure_text(bug_class)
     raw_patterns = data.get("patterns", [])
     if not isinstance(raw_patterns, list):
         raise ValueError("closure reply 'patterns' must be a list")
     patterns = [ClosurePattern.model_validate(p) for p in raw_patterns]
+    for p in patterns:
+        p.rationale = _bound_closure_text(p.rationale)
     return bug_class, patterns
 
 

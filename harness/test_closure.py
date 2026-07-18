@@ -12,6 +12,16 @@ real file:line matches it found. These tests pin the whole contract:
   8. the FINAL (step-9) PASSED path -- reached through a real debate round,
      apply_fixes, and the post-fix gate -- attaches the report and logs
      closure_report / closure_clean too, not just the early-exit path
+  9. every free-text field on the report is bounded so it can't blow the
+     worst-case FeatureResult size on its way into --json-output:
+       9.  a real 50k-char grep line is capped with an elision marker
+       10. model-supplied bug_class + rationale are likewise bounded
+       11. an over-long regex is REJECTED (never truncated): it never runs, is
+           filtered OUT of closure_report.patterns even when a valid sibling
+           pattern makes a report attach, a closure_skipped(scope=pattern) that
+           carries only its LENGTH (not the raw regex) is logged, and no
+           truncated form of the regex appears anywhere in the report or log --
+           even when the regex is longer than the _pack_event field cap
 
 Tests 1-7 all converge through the early-exit PASSED branch (review finds
 nothing blocking), so on their own they leave the second wiring point unpinned.
@@ -32,6 +42,7 @@ import tempfile
 from harness.config import HarnessConfig
 from harness.orchestrator import (
     Orchestrator, DoerClient, ReviewerClient, GateResult,
+    _CLOSURE_MAX_TEXT, _bound_closure_text, _MAX_STR,
 )
 from harness.schemas import DoerResponse, IssueResponse, Outcome
 
@@ -394,6 +405,104 @@ async def main():
     check("step9_clean_report_none", r.closure_report is None)
     check("step9_clean_no_report_event",
           not any(e["event"] == "closure_report" for e in r.debate_log))
+
+    # 9. LONG GREP LINE IS BOUNDED. A single real repo line 50k chars long that
+    # a pattern matches must not ride into the report at full length -- the
+    # candidate's `text` is capped at construction with a visible elision marker.
+    # Pre-fix the line came through whole (grep output was attached verbatim).
+    with tempfile.TemporaryDirectory() as tmp:
+        long_line = "LONGLINE_MARKER " + "z" * 50000
+        _init_repo(tmp, {"big.py": long_line + "\n"})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, {
+            "bug_class": "c",
+            "patterns": [{"regex": "LONGLINE_MARKER", "rationale": "r"}]})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["other.py"]))
+        r = await _run_in_repo(tmp, orch)
+    cands = r.closure_report.candidates if r.closure_report else []
+    ctext = cands[0].text if cands else ""
+    marker = f"... ({len(long_line)} chars total)"
+    check("longline_passed", r.outcome == Outcome.PASSED)
+    check("longline_one_candidate", len(cands) == 1)
+    check("longline_bounded", len(ctext) <= _CLOSURE_MAX_TEXT + len(marker))
+    check("longline_marked",
+          ctext.startswith("LONGLINE_MARKER") and ctext.endswith(marker))
+
+    # 10. LONG MODEL STRINGS BOUNDED. bug_class and each rationale are
+    # single-line model explanations; both are capped in _parse_closure so
+    # nothing unbounded reaches a ClosureReport. (A planted sibling gives the
+    # report a candidate so it actually attaches.)
+    big = "B" * 50000
+    rat = "R" * 50000
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"sib.py": "MODELSTR_MARKER\n"})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, {
+            "bug_class": big,
+            "patterns": [{"regex": "MODELSTR_MARKER", "rationale": rat}]})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["other.py"]))
+        r = await _run_in_repo(tmp, orch)
+    rep = r.closure_report
+    bc = rep.bug_class if rep else ""
+    rr = rep.patterns[0].rationale if rep and rep.patterns else ""
+    bc_marker = f"... ({len(big)} chars total)"
+    rr_marker = f"... ({len(rat)} chars total)"
+    check("modelstr_report_attached", rep is not None)
+    check("modelstr_bugclass_bounded",
+          len(bc) <= _CLOSURE_MAX_TEXT + len(bc_marker)
+          and bc.endswith(bc_marker))
+    check("modelstr_rationale_bounded",
+          len(rr) <= _CLOSURE_MAX_TEXT + len(rr_marker)
+          and rr.endswith(rr_marker))
+
+    # 11. OVER-LONG REGEX IS REJECTED, NOT TRUNCATED. A regex past the length
+    # limit must never run and must never appear in a truncated form -- a
+    # shortened regex is a DIFFERENT regex that would silently change what was
+    # searched. The distinctive start/end markers let us prove no truncated
+    # fragment leaked: every occurrence of the start marker must be part of a
+    # full-length regex occurrence. Crucially the regex is longer than _MAX_STR
+    # (the _pack_event field cap), so if the raw regex were ever logged, its
+    # start marker would survive in a _pack_event-truncated fragment while the
+    # full regex would not -- the count assertion below would then fail. The
+    # only way both counts stay equal is if the rejected regex is never logged
+    # at all, which is exactly the contract.
+    # A VALID sibling pattern matches too, so a ClosureReport is genuinely
+    # emitted -- this is the case where the rejected regex could otherwise ride
+    # into closure_report.patterns. It must be filtered out of the report, not
+    # merely skipped in the grep loop.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"x.py": "TRUNCMARK_ lives here\nSIBLING_MARKER\n"})
+        cfg = HarnessConfig()
+        long_regex = "TRUNCMARK_" + "a" * (_MAX_STR + 1000) + "_ENDMARK"
+        reviewer = ClosureReviewer(cfg, {
+            "bug_class": "c",
+            "patterns": [
+                {"regex": long_regex, "rationale": "r"},
+                {"regex": "SIBLING_MARKER", "rationale": "sib"}]})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["other.py"]))
+        r = await _run_in_repo(tmp, orch)
+    blob = json.dumps(r.debate_log, default=str)
+    if r.closure_report is not None:
+        blob += r.closure_report.model_dump_json()
+    pat_skips = [e for e in r.debate_log if e["event"] == "closure_skipped"
+                 and e.get("scope") == "pattern"]
+    report_regexes = ([p.regex for p in r.closure_report.patterns]
+                      if r.closure_report else [])
+    check("longregex_passed", r.outcome == Outcome.PASSED)
+    # The valid sibling yields a candidate, so a report IS attached...
+    check("longregex_report_attached", r.closure_report is not None)
+    # ...but the over-long regex is filtered OUT of report.patterns entirely.
+    check("longregex_absent_from_report", long_regex not in report_regexes)
+    check("longregex_only_sibling_kept", report_regexes == ["SIBLING_MARKER"])
+    check("longregex_skipped_logged",
+          any(str(_CLOSURE_MAX_TEXT) in str(e.get("reason", ""))
+              for e in pat_skips))
+    # No truncated form of the regex appears: the elided form our helper would
+    # produce is absent, and every start-marker occurrence is a full regex.
+    check("longregex_no_elided_form",
+          _bound_closure_text(long_regex) not in blob)
+    check("longregex_never_truncated",
+          blob.count("TRUNCMARK_") == blob.count(long_regex))
 
     print("\nALL PASS" if ok else "\nSOME FAILED")
     return ok
