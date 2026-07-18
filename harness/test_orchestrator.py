@@ -16,7 +16,7 @@ import json
 from harness.config import HarnessConfig
 from harness.orchestrator import (
     Orchestrator, DoerClient, ReviewerClient, TiebreakerClient, GateResult,
-    DoerProtocolViolation, _parse_verdict,
+    DoerProtocolViolation, _parse_verdict, _extract_verdict_json,
 )
 from harness.schemas import DoerResponse, IssueResponse, Outcome
 
@@ -78,10 +78,6 @@ class RawFollowupReviewer(StubReviewer):
     (verbatim strings, not json.dumps'd) so tests can feed a literal top-level
     array like "[]" straight through respond() -> _parse_verdict."""
     async def respond(self, spec, acceptance, diff, rejections):
-        # Signature was 3-arg (spec, diff, rejections) when drift-12 landed; upstream
-        # 5805f48 threaded `acceptance` through every reviewer / tiebreaker method.
-        # Rebase-aligned: RawFollowupReviewer accepts it and ignores it (the raw
-        # output is what the whole class exists to inject).
         out = self.followups[self._n] if self._n < len(self.followups) else "[]"
         self._n += 1
         return out
@@ -125,6 +121,25 @@ class ErrorTiebreaker(TiebreakerClient):
     from a genuine disagreement (F1)."""
     async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
         raise RuntimeError("kimi exited 1: not authenticated")
+
+
+class ProseReviewer(ReviewerClient):
+    """Reviewer that answers with prose containing no JSON at all. The parse
+    raises ValueError, which run_feature does not catch -- must convert to a
+    clean no-signal escalation, not an uncaught traceback."""
+    async def review(self, spec, acceptance, diff):
+        return "The diff looks fine, nothing to report."
+    async def respond(self, spec, acceptance, diff, rejections):
+        return "Still fine."
+
+
+class MalformedTiebreaker(TiebreakerClient):
+    """Tiebreaker that answers with prose (no JSON). Distinct from
+    ErrorTiebreaker (whose CLI raises): here the call succeeds but the OUTPUT
+    is unparseable, so the parse -- not the runner -- would crash. Must escalate
+    the whole run, like the errored case, not leave the issue contested."""
+    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
+        return "I think the doer is probably right here."
 
 
 async def gate_pass(): return (True, "all green")
@@ -770,6 +785,69 @@ async def main():
     r = await orch.run_feature("spec", "acc")
     results["invariant_doer_malformed_response"] = (r.outcome, r.rounds_used)
 
+    # 15h-real. INVARIANT: the REAL RealDoerClient.respond_to_review parses
+    # live model output INSIDE StepRunner's coroutine. A prose reply (no JSON)
+    # or a schema mismatch must surface as RuntimeError -- the same "this call
+    # failed" contract run_subprocess uses for CLI failures -- so StepRunner's
+    # narrow (RuntimeError, OSError) catch turns it into a non-ok StepResult
+    # -> ModelUnavailable -> ESCALATED_NO_SIGNAL, NOT an uncaught ValueError /
+    # pydantic ValidationError that crashes the orchestrator mid-debate. We
+    # drive the real subprocess path (not a stub) via a tiny executable helper
+    # pointed at by claude_cmd; the appended `-p` flag is ignored by the helper.
+    import os  # noqa: E402
+    import stat  # noqa: E402
+    import sys  # noqa: E402
+    import tempfile  # noqa: E402
+    from pydantic import ValidationError  # noqa: E402
+    from harness.orchestrator import RealDoerClient  # noqa: E402
+    from harness.schemas import ReviewVerdict, ReviewIssue  # noqa: E402
+
+    verdict = ReviewVerdict(issues=[
+        ReviewIssue(id="I1", severity="blocking",
+                    issue="something is wrong", suggested_fix="fix it")])
+
+    def _write_helper(tmpdir, body):
+        # Executable python helper: ignores its args, prints `body` to stdout.
+        path = f"{tmpdir}/fake_claude.py"
+        with open(path, "w") as fp:
+            fp.write(f"#!{sys.executable}\n")
+            fp.write("import sys\n")
+            fp.write(f"sys.stdout.write({body!r})\n")
+        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP
+                 | stat.S_IXOTH)
+        return path
+
+    # (a) Prose reply -> RuntimeError mentioning "malformed", never ValueError
+    # or pydantic ValidationError.
+    with tempfile.TemporaryDirectory() as tmp:
+        helper = _write_helper(tmp, "I think these issues all look valid to me.")
+        doer = RealDoerClient(claude_cmd=helper)
+        raised = None
+        try:
+            await doer.respond_to_review("spec", "acc", "diff", verdict)
+        except BaseException as e:  # capture the exact type that escapes
+            raised = e
+        assert isinstance(raised, RuntimeError), \
+            f"prose reply must raise RuntimeError, got {type(raised).__name__}: {raised!r}"
+        assert not isinstance(raised, (ValueError, ValidationError)), \
+            f"must not leak ValueError/ValidationError: {type(raised).__name__}"
+        assert "malformed" in str(raised), \
+            f"RuntimeError message must mention 'malformed': {raised!r}"
+
+    # (b) Happy path: valid response JSON still parses to a DoerResponse with
+    # the expected decision -- the wrapper does not break normal parsing.
+    with tempfile.TemporaryDirectory() as tmp:
+        valid = json.dumps({"responses": [
+            {"id": "I1", "decision": "reject",
+             "reasoning": "the reviewer misread the diff"}]})
+        helper = _write_helper(tmp, valid)
+        doer = RealDoerClient(claude_cmd=helper)
+        resp = await doer.respond_to_review("spec", "acc", "diff", verdict)
+        assert isinstance(resp, DoerResponse), \
+            f"valid JSON must parse to DoerResponse, got {type(resp).__name__}"
+        assert resp.rejected_ids() == {"I1"}, \
+            f"expected I1 rejected, got responses={resp.responses!r}"
+
     # 15i. INVARIANT: HarnessConfig.validate() rejects feature_seconds smaller
     # than the largest step timeout. The "finer signal never overwritten"
     # guarantee only holds when steps can raise TimeoutEscalation before the
@@ -994,6 +1072,52 @@ async def main():
     assert dpv_exc.missing_ids == {"I2", "I3"}
     assert dpv_exc.round == 2
 
+    # 22. INVARIANT: a reviewer that answers with prose (no JSON) on the initial
+    # review escalates cleanly as ESCALATED_NO_SIGNAL. The parse raises
+    # ValueError OUTSIDE StepRunner's error boundary, so it previously crashed
+    # run_feature with an uncaught traceback -- same class as the doer path.
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), ProseReviewer(cfg), None,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["invariant_reviewer_prose_escalates"] = (r.outcome, r.rounds_used)
+
+    # 23. INVARIANT: a tiebreaker that answers with malformed output on a
+    # deadlocked issue escalates the WHOLE run as ESCALATED_NO_SIGNAL -- matching
+    # the errored-tiebreaker branch, NOT the timeout branch (which merely leaves
+    # the issue contested). The parse would otherwise raise ValueError inside the
+    # per-issue loop and crash run_feature.
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]},
+        followups=[{"issues": [{"id": "I1", "severity": "blocking",
+                                "issue": "x", "suggested_fix": "y"}]}] * 3)
+    orch = make(cfg, StubDoer({"I1": "reject"}), reviewer,
+                MalformedTiebreaker(cfg), gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["invariant_tiebreaker_malformed_escalates"] = (
+        r.outcome, r.rounds_used)
+
+    # 24. INVARIANT: _extract_verdict_json tolerates the three array shapes.
+    # (a) bare empty array.
+    assert _extract_verdict_json("[]") == {"issues": []}, "bare [] must parse"
+    # (b) array followed by prose whose text contains `]` -- rfind lands on the
+    # `]` in "[the docs]", the widest slice is unparseable, and the array path
+    # must walk `]` candidates leftward until the real array parses.
+    trailing = "[]\n\nNote: see [the docs] for details."
+    assert _extract_verdict_json(trailing) == {"issues": []}, \
+        f"array + prose containing ] must parse, got {_extract_verdict_json(trailing)!r}"
+    # (c) fenced ```json array.
+    fenced = ('```json\n'
+              '[{"id": "I1", "severity": "blocking", '
+              '"issue": "x", "suggested_fix": "y"}]\n'
+              '```')
+    got = _extract_verdict_json(fenced)
+    assert [i["id"] for i in got["issues"]] == ["I1"], \
+        f"fenced array must parse to one issue, got {got!r}"
+    results["invariant_verdict_array_shapes_parse"] = (Outcome.PASSED, 0)
+
     # report
     expected = {
         "early_exit": (Outcome.PASSED, 0),
@@ -1025,6 +1149,14 @@ async def main():
         "invariant_partial_doer_response_escalates": (
             Outcome.ESCALATED_NO_SIGNAL, 1),
         "invariant_conformant_doer_response_still_passes": (Outcome.PASSED, 1),
+        # Reviewer prose fails mid-round-1 (like reviewer_no_signal); the
+        # round didn't complete, so rounds_used=0.
+        "invariant_reviewer_prose_escalates": (Outcome.ESCALATED_NO_SIGNAL, 0),
+        # Malformed tiebreaker escalates after two held followups, mirroring
+        # tiebreaker_no_signal's rounds_used=2.
+        "invariant_tiebreaker_malformed_escalates": (
+            Outcome.ESCALATED_NO_SIGNAL, 2),
+        "invariant_verdict_array_shapes_parse": (Outcome.PASSED, 0),
     }
     ok = True
     for name, got in results.items():
