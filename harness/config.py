@@ -29,8 +29,6 @@ class Timeouts:
     # Per verification-gate run. Build/test can legitimately take a while;
     # tune per project -- this default is deliberately generous.
     gate_seconds: int = 300
-    # Per debate round (a round may involve several calls).
-    round_seconds: int = 400
     # Outer bound on a single feature across all rounds/retries.
     feature_seconds: int = 1800  # 30 min
 
@@ -114,7 +112,6 @@ class DiffConfig:
 @dataclass
 class HarnessConfig:
     profile: str = "personal"
-    interactive: bool = True          # CI sets this False -> no human escalation target
     debate_enabled: bool = True       # CI disables -> deterministic gate only
     # Path-based routing: diffs touching these paths skip external review and
     # go human-only. Empty by default; flip on after checking with security.
@@ -163,14 +160,13 @@ class HarnessConfig:
            load beats mysterious immediate-fire escalations later.
         """
         t = self.timeouts
-        for name in ("model_call_seconds", "gate_seconds", "round_seconds",
-                     "feature_seconds"):
+        for name in ("model_call_seconds", "gate_seconds", "feature_seconds"):
             v = getattr(t, name)
             if not isinstance(v, int) or v < 0:
                 raise ValueError(
                     f"timeouts.{name} must be a non-negative int, got {v!r}"
                 )
-        step_bounds = (t.model_call_seconds, t.gate_seconds, t.round_seconds)
+        step_bounds = (t.model_call_seconds, t.gate_seconds)
         max_step = max(step_bounds)
         # feature_seconds == 0 is a special case: it fires immediately, but
         # so does the step timeout, so the invariant is vacuously satisfied
@@ -187,7 +183,7 @@ class HarnessConfig:
             )
 
     def _apply(self, data: dict) -> None:
-        for k in ("profile", "interactive", "debate_enabled", "human_only_paths"):
+        for k in ("profile", "debate_enabled", "human_only_paths"):
             if k in data:
                 setattr(self, k, data[k])
         for section, obj in (
@@ -221,8 +217,6 @@ class HarnessConfig:
 
     def _apply_env(self) -> None:
         # A couple of high-value env overrides for CI.
-        if os.environ.get("HARNESS_NONINTERACTIVE") == "1":
-            self.interactive = False
         if os.environ.get("HARNESS_NO_DEBATE") == "1":
             self.debate_enabled = False
 

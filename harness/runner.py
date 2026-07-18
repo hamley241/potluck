@@ -237,8 +237,12 @@ async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
                 # kill); fall through to plain wait.
                 await proc.wait()
         raise
+    # Strict decode of arbitrary backend bytes raises UnicodeDecodeError (a
+    # ValueError), which slips through StepRunner's (RuntimeError, OSError)
+    # catch and crashes the run. errors="replace" keeps the boundary total.
     if proc.returncode != 0:
         raise RuntimeError(
-            f"command {cmd[0]} exited {proc.returncode}: {stderr.decode()[:500]}"
+            f"command {cmd[0]} exited {proc.returncode}: "
+            f"{stderr.decode(errors='replace')[:500]}"
         )
-    return stdout.decode()
+    return stdout.decode(errors="replace")
