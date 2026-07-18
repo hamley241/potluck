@@ -453,22 +453,22 @@ class RealDoerClient(DoerClient):
         raw = await run_subprocess(
             [self._cmd] + self._JUDGE_FLAGS, stdin_text=prompt
         )
-        # This parse runs inside the coroutine StepRunner drives; a prose
-        # reply (ValueError from _extract_json) or schema mismatch (pydantic
-        # ValidationError) would otherwise escape StepRunner's narrow
-        # (RuntimeError, OSError) catch and crash the orchestrator. Raise the
-        # same RuntimeError contract run_subprocess uses for CLI failures so
-        # it flows through StepRunner -> ModelUnavailable -> ESCALATED_NO_SIGNAL.
-        # ValueError is the exact declared bug class and nothing more: no-JSON
-        # (ValueError from _extract_json), malformed JSON (json.JSONDecodeError)
-        # and schema mismatch (pydantic ValidationError) are ALL ValueError
-        # subclasses. The catch is deliberately narrow: any other exception
-        # type here (TypeError/AttributeError from a refactor of the extractor)
-        # is a harness bug, not a bad model reply, and MUST crash loudly rather
-        # than be mislabelled "malformed response" and buried as no-signal.
+        # This parse runs inside the coroutine StepRunner drives; a malformed
+        # reply would otherwise escape StepRunner's narrow (RuntimeError,
+        # OSError) catch and crash the orchestrator. Raise the same RuntimeError
+        # contract run_subprocess uses for CLI failures so it flows through
+        # StepRunner -> ModelUnavailable -> ESCALATED_NO_SIGNAL.
+        # The caught set is exactly what a malformed MODEL RESPONSE can raise
+        # out of json.loads + pydantic: ValueError (covering json.JSONDecodeError
+        # and pydantic ValidationError, both subclasses) plus RecursionError
+        # (json.loads on pathologically nested input exceeds the recursion
+        # limit, and RecursionError is NOT a ValueError). Any OTHER exception
+        # type is a harness bug -- not a bad model reply -- and MUST crash
+        # loudly rather than be mislabelled "malformed response" and buried as
+        # no-signal.
         try:
             return DoerResponse.model_validate(_extract_json(raw))
-        except ValueError as e:
+        except (ValueError, RecursionError) as e:
             raise RuntimeError(
                 f"doer returned malformed response: {e}") from e
 
@@ -939,18 +939,20 @@ class Orchestrator:
         if not res.ok:
             raise ModelUnavailable(
                 "doer", res.error or "doer respond errored")
-        # Pydantic ValidationError from a malformed doer JSON must NOT
-        # propagate as an uncaught traceback -- run_feature's escalation
-        # handlers don't know about pydantic. Convert to ModelUnavailable
-        # so the outcome is a clean ESCALATED_NO_SIGNAL, same as any other
-        # unusable doer response. ValueError covers the whole declared class
-        # and only it: pydantic ValidationError and json.JSONDecodeError both
-        # subclass ValueError. Anything else (a TypeError/AttributeError from a
-        # harness refactor) is a bug, not a bad doer reply, and MUST crash
-        # loudly rather than hide behind the model-quality bucket.
+        # A malformed doer JSON must NOT propagate as an uncaught traceback --
+        # run_feature's escalation handlers don't know about pydantic. Convert
+        # to ModelUnavailable so the outcome is a clean ESCALATED_NO_SIGNAL,
+        # same as any other unusable doer response. The caught set is exactly
+        # what a malformed MODEL RESPONSE can raise out of json.loads +
+        # pydantic: ValueError (covering json.JSONDecodeError and pydantic
+        # ValidationError, both subclasses) plus RecursionError (json.loads on
+        # pathologically nested input exceeds the recursion limit, and
+        # RecursionError is NOT a ValueError). Anything else is a harness bug --
+        # not a bad doer reply -- and MUST crash loudly rather than hide behind
+        # the model-quality bucket.
         try:
             return DoerResponse.model_validate_json(res.output)
-        except ValueError as e:  # pydantic ValidationError, JSONDecodeError
+        except (ValueError, RecursionError) as e:
             raise ModelUnavailable(
                 "doer", f"doer returned malformed response: {e}") from e
 
@@ -984,16 +986,18 @@ class Orchestrator:
         if not res.ok:
             raise ModelUnavailable("reviewer", res.error or "reviewer call errored")
         # A reviewer answering with prose (no JSON) or a schema mismatch raises
-        # ValueError / pydantic ValidationError (a ValueError subclass), which
-        # run_feature does not catch. Convert to ModelUnavailable so it escalates
-        # cleanly, same as the doer path in _doer_respond_to_review. Narrow to
-        # ValueError on purpose: it is exactly the declared bug class (no-JSON,
-        # JSONDecodeError, pydantic ValidationError all subclass it); any other
-        # exception type is a harness bug and MUST crash loudly, not be
-        # mislabelled as a bad reviewer reply.
+        # out of the parse, which run_feature does not catch. Convert to
+        # ModelUnavailable so it escalates cleanly, same as the doer path in
+        # _doer_respond_to_review. The caught set is exactly what a malformed
+        # MODEL RESPONSE can raise out of json.loads + pydantic: ValueError
+        # (covering json.JSONDecodeError and pydantic ValidationError, both
+        # subclasses) plus RecursionError (json.loads on pathologically nested
+        # input exceeds the recursion limit, and RecursionError is NOT a
+        # ValueError). Any other exception type is a harness bug and MUST crash
+        # loudly, not be mislabelled as a bad reviewer reply.
         try:
             return _parse_verdict(res.output)
-        except ValueError as e:
+        except (ValueError, RecursionError) as e:
             raise ModelUnavailable(
                 "reviewer", f"reviewer returned malformed response: {e}") from e
 
@@ -1009,13 +1013,16 @@ class Orchestrator:
                                     "reviewer follow-up timed out")
         if not res.ok:
             raise ModelUnavailable("reviewer", res.error or "reviewer follow-up errored")
-        # See _review: malformed reviewer output must escalate, not crash.
-        # ValueError is the entire declared class (JSONDecodeError and pydantic
-        # ValidationError both subclass it) and nothing else -- an unexpected
-        # exception type is a harness bug that MUST crash loudly.
+        # See _review: malformed reviewer output must escalate, not crash. The
+        # caught set is exactly what a malformed MODEL RESPONSE can raise out of
+        # json.loads + pydantic: ValueError (covering json.JSONDecodeError and
+        # pydantic ValidationError, both subclasses) plus RecursionError
+        # (json.loads on pathologically nested input exceeds the recursion
+        # limit, and RecursionError is NOT a ValueError). Any other exception
+        # type is a harness bug that MUST crash loudly.
         try:
             return _parse_verdict(res.output)
-        except ValueError as e:
+        except (ValueError, RecursionError) as e:
             raise ModelUnavailable(
                 "reviewer", f"reviewer returned malformed response: {e}") from e
 
@@ -1076,13 +1083,16 @@ class Orchestrator:
                 raise ModelUnavailable("tiebreaker", res.error or "tiebreaker call errored")
             # A malformed tiebreaker response (prose / schema mismatch) escalates
             # the whole run, matching the ERRORED branch above -- NOT the timeout
-            # branch, which merely leaves this issue contested. ValueError is
-            # exactly the declared bug class (no-JSON, JSONDecodeError, pydantic
-            # ValidationError all subclass it); any other exception type is a
+            # branch, which merely leaves this issue contested. The caught set is
+            # exactly what a malformed MODEL RESPONSE can raise out of json.loads
+            # + pydantic: ValueError (covering json.JSONDecodeError and pydantic
+            # ValidationError, both subclasses) plus RecursionError (json.loads on
+            # pathologically nested input exceeds the recursion limit, and
+            # RecursionError is NOT a ValueError). Any other exception type is a
             # harness bug and MUST crash loudly instead of being buried here.
             try:
                 tb = _parse_tiebreak(res.output)
-            except ValueError as e:
+            except (ValueError, RecursionError) as e:
                 raise ModelUnavailable(
                     "tiebreaker",
                     f"tiebreaker returned malformed response: {e}") from e
