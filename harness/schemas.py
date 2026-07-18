@@ -91,6 +91,79 @@ class Outcome(str, Enum):
     ABORTED_BUDGET = "aborted_budget"                  # whole-feature wall-clock blown
 
 
+class ClosurePattern(BaseModel):
+    """One grep pattern the reviewer model proposes for the class-closure sweep.
+
+    The model supplies patterns and explanation ONLY: no location it claims
+    ever becomes a reported candidate. It names the bug class and emits
+    patterns; the harness runs them itself and draws candidates exclusively
+    from real `git grep` output. `regex` is POSIX ERE, run by the harness via
+    `git grep -E`, and `rationale` explains why a match here would be the same
+    bug -- both are UNVERIFIED model text that may contain `file:line`-shaped
+    strings, and neither is ever read as a location.
+
+    `rationale` is bounded (single line, capped with an elision marker) before
+    it reaches a ClosureReport: this pattern rides FeatureResult straight into
+    --json-output, so the debate-log size contract applies here too. `regex` is
+    NOT bounded that way -- a truncated regex would search for something
+    different; the harness rejects an over-long regex before running it instead.
+    """
+    regex: str
+    rationale: str
+
+
+class ClosureCandidate(BaseModel):
+    """A single harness-verified sibling site: a real `file:line` that a
+    reviewer-proposed pattern actually matched in the repo.
+
+    HARNESS-VERIFIED, never model-supplied: `file`, `line`, and `text` all come
+    from real `git grep` output the harness ran -- never from anything the model
+    claimed. A `file:line`-shaped string the model invents (in its bug_class or
+    a rationale) cannot become a ClosureCandidate: candidates are drawn
+    exclusively from grep matches, so a claimed location is never promoted to a
+    reported candidate. `pattern` is the model's regex, kept only to explain WHY
+    this line matched -- it is the one model-supplied field here and is not a
+    location.
+
+    `text` is bounded at construction (capped with an elision marker) even
+    though it is real grep output, not model-supplied: a single long repo line
+    -- a minified bundle, a generated file, a long data literal -- would
+    otherwise carry hundreds of KB into --json-output unchecked. This report
+    rides FeatureResult, so the debate-log size contract applies to it too.
+    """
+    file: str
+    line: int
+    text: str
+    pattern: str   # which regex matched, so the operator can judge relevance
+
+
+class ClosureReport(BaseModel):
+    """Result of a class-closure sweep after a run PASSED: the bug class the
+    fix closed, the patterns the reviewer proposed, and the sibling sites the
+    HARNESS found by running those patterns.
+
+    The honest guarantee: `candidates` is populated exclusively from real
+    `git grep` output the harness ran -- every one is harness-verified. The
+    model-supplied fields -- `bug_class` and each pattern's `regex`/`rationale`
+    -- are EXPLANATION, not evidence: bounded (below) but NOT verified, and NOT
+    locations. A model may write a `src/ghost.py:12`-shaped string into any of
+    them; that never makes it a candidate, because candidates come only from
+    grep matches, never from anything the model claimed. The report is advisory
+    only -- produced on an already-passed run, it can never change the outcome.
+
+    Every free-text field carried here -- `bug_class`, each pattern's
+    `rationale`, and each candidate's `text` -- is length-bounded with a visible
+    elision marker before it lands. This whole report rides FeatureResult into
+    --json-output, so the debate-log size contract that bounds worst-case
+    FeatureResult size applies to it too; a single unbounded field would defeat
+    it. (`regex` is the exception: it is rejected-not-truncated when over-long,
+    since a shortened regex would silently search for something else.)
+    """
+    bug_class: str                     # one line: the class this fix closed
+    patterns: list[ClosurePattern] = Field(default_factory=list)
+    candidates: list[ClosureCandidate] = Field(default_factory=list)
+
+
 class StepResult(BaseModel):
     """Uniform result for any bounded step (model call, gate run).
 

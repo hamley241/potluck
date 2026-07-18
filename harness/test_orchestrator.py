@@ -71,6 +71,11 @@ class StubReviewer(ReviewerClient):
         out = self.followups[self._n] if self._n < len(self.followups) else {"issues": []}
         self._n += 1
         return json.dumps(out)
+    async def closure_scan(self, spec, diff):
+        # Default: report no closable class, so PASSED runs in this suite do not
+        # invoke the real `claude` backend the base ReviewerClient would shell
+        # out to. Tests that exercise the sweep live in test_closure.py.
+        return json.dumps({"bug_class": "none", "patterns": []})
 
 
 class RawFollowupReviewer(StubReviewer):

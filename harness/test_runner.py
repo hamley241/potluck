@@ -13,7 +13,7 @@ import os
 import sys
 import tempfile
 
-from harness.runner import run_subprocess, _drain
+from harness.runner import run_subprocess, run_subprocess_result, _drain
 
 
 async def _process_killed_on_timeout() -> bool:
@@ -49,10 +49,17 @@ def _pid_dead(pid: int) -> bool:
         return False         # alive but not ours -> treat as fail
 
 
-async def _grandchild_dies_on_timeout(ignore_sigterm: bool) -> bool:
+async def _grandchild_dies_on_timeout(ignore_sigterm: bool,
+                                      runner=run_subprocess) -> bool:
     """Child forks a grandchild (double-fork so it escapes the parent's
     direct-child slot). Both must be gone after cancellation. Optional
-    SIGTERM ignore exercises the SIGKILL fallback path."""
+    SIGTERM ignore exercises the SIGKILL fallback path.
+
+    `runner` is the spawn function under test -- run_subprocess by default, or
+    run_subprocess_result to prove the result-returning sibling shares the exact
+    same process-group teardown (a cancelled call leaks neither child nor
+    grandchild). Both are driven the same way: wrapped in wait_for and cancelled
+    mid-flight, so the return value never matters here."""
     child_pidfile = tempfile.NamedTemporaryFile(delete=False)
     child_pidfile.close()
     grand_pidfile = tempfile.NamedTemporaryFile(delete=False)
@@ -80,7 +87,7 @@ time.sleep(30)
     cmd = [sys.executable, "-c", script, child_pidfile.name, grand_pidfile.name]
 
     try:
-        await asyncio.wait_for(run_subprocess(cmd), timeout=1.0)
+        await asyncio.wait_for(runner(cmd), timeout=1.0)
         return False
     except asyncio.TimeoutError:
         pass
@@ -145,6 +152,74 @@ async def _chatty_child_survives_grace_window() -> bool:
             os.unlink(sentinel.name)
         except OSError:
             pass
+
+
+async def _teardown_survives_second_cancellation() -> tuple[bool, bool]:
+    """A SECOND cancellation arriving WHILE teardown is running (the outer
+    feature_seconds budget firing during a step-level teardown, or a Ctrl-C)
+    must not abort cleanup before the SIGKILL fallback and the final reap.
+
+    Drives the exact double-cancel path: spawn a child+grandchild that BOTH
+    ignore SIGTERM (so teardown must reach its SIGKILL fallback -- the grace
+    window is fully used), cancel the call once to enter teardown, then cancel
+    again while it is in that grace window.
+
+    Returns (both_dead, cancelled_propagated):
+      * both_dead           -- child AND grandchild gone afterwards. Pre-fix the
+        unshielded `await _teardown_process_group` is cancelled mid-grace, SIGKILL
+        never fires, and both SIGTERM-ignoring processes survive.
+      * cancelled_propagated -- the double-cancel still raises CancelledError out
+        to the caller. Shielding changes only whether cleanup FINISHES, never
+        what the caller sees."""
+    child_pf = tempfile.NamedTemporaryFile(delete=False); child_pf.close()
+    grand_pf = tempfile.NamedTemporaryFile(delete=False); grand_pf.close()
+    # Both processes ignore SIGTERM: teardown's grace window expires and the
+    # SIGKILL fallback is the ONLY thing that can reap them -- so a second cancel
+    # that aborts teardown before SIGKILL leaves both alive.
+    script = """
+import os, sys, time, signal
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+open(sys.argv[1], 'w').write(str(os.getpid()))
+pid = os.fork()
+if pid == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    open(sys.argv[2], 'w').write(str(os.getpid()))
+    time.sleep(30)
+    sys.exit(0)
+time.sleep(30)
+"""
+    cmd = [sys.executable, "-c", script, child_pf.name, grand_pf.name]
+    try:
+        task = asyncio.ensure_future(run_subprocess(cmd))
+        # Let the child fork the grandchild and communicate() start.
+        await asyncio.sleep(0.6)
+        # First cancel -> enters teardown: SIGTERM the group, then the grace
+        # window (_GRACE_SECONDS = 0.5).
+        task.cancel()
+        # Land the SECOND cancel INSIDE that grace window -- after SIGTERM was
+        # sent but before the SIGKILL fallback fires.
+        await asyncio.sleep(0.1)
+        task.cancel()
+        cancelled_propagated = False
+        try:
+            await task
+        except asyncio.CancelledError:
+            cancelled_propagated = True
+        # The shielded teardown runs to completion in the background: let its
+        # SIGKILL + reap settle.
+        await asyncio.sleep(1.5)
+        child_pid = int((open(child_pf.name).read().strip() or "0"))
+        grand_pid = int((open(grand_pf.name).read().strip() or "0"))
+        if child_pid <= 0 or grand_pid <= 0:
+            return (False, cancelled_propagated)
+        both_dead = _pid_dead(child_pid) and _pid_dead(grand_pid)
+        return (both_dead, cancelled_propagated)
+    finally:
+        for pf in (child_pf, grand_pf):
+            try:
+                os.unlink(pf.name)
+            except OSError:
+                pass
 
 
 async def _invalid_utf8_stdout_replaced() -> bool:
@@ -245,6 +320,23 @@ def main():
         _grandchild_dies_on_timeout(ignore_sigterm=False))
     results["grandchild_dies_via_sigkill"] = asyncio.run(
         _grandchild_dies_on_timeout(ignore_sigterm=True))
+    # run_subprocess_result shares run_subprocess's spawn+teardown: a cancelled
+    # call must leak neither child nor grandchild. Member B: the direct-spawn
+    # shape these call sites used to hand-roll left survivors here.
+    results["result_helper_grandchild_dies_via_sigterm"] = asyncio.run(
+        _grandchild_dies_on_timeout(ignore_sigterm=False,
+                                    runner=run_subprocess_result))
+    results["result_helper_grandchild_dies_via_sigkill"] = asyncio.run(
+        _grandchild_dies_on_timeout(ignore_sigterm=True,
+                                    runner=run_subprocess_result))
+    # Member A: a SECOND cancellation during teardown's grace window must not
+    # abort cleanup before the SIGKILL fallback (both processes gone), and the
+    # double-cancel must still propagate CancelledError to the caller. Pre-fix
+    # the unshielded teardown left both SIGTERM-ignoring survivors behind.
+    _both_dead, _cancelled_propagated = asyncio.run(
+        _teardown_survives_second_cancellation())
+    results["teardown_survives_second_cancellation"] = _both_dead
+    results["double_cancel_still_propagates"] = _cancelled_propagated
 
     ok = True
     for name, passed in results.items():

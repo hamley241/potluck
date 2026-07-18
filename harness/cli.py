@@ -209,6 +209,11 @@ def cmd_fix(args):
         "outcome": result.outcome.value,
         "rounds_used": result.rounds_used,
         "escalation_reason": result.escalation_reason,
+        # Harness-verified class-closure sweep (None unless the run PASSED and
+        # the sweep found sibling candidates). JSON mode carries it here; the
+        # human-readable section below is printed only in non-JSON mode.
+        "closure_report": (result.closure_report.model_dump(mode="json")
+                           if result.closure_report else None),
         "debate_log": result.debate_log,
     }
 
@@ -220,6 +225,27 @@ def cmd_fix(args):
         if out["escalation_reason"]:
             print(f"  Reason: {out['escalation_reason']}")
         print(f"{'='*60}")
+        # Class-closure sweep: only on a PASSED run that found siblings. The
+        # presentation keeps the two kinds of text unmissably distinct so a
+        # path-shaped string the model wrote can't be mistaken for a finding:
+        #   * bug_class is the MODEL'S words -- unverified explanation, labelled
+        #     `model-supplied` and never rendered as a location;
+        #   * candidates are HARNESS-VERIFIED grep matches -- real file:line hits
+        #     the harness found, shown under a heading that says so. They are
+        #     still candidates to JUDGE, not confirmed bugs.
+        # `rationale` is deliberately NOT printed here (it adds no operator value
+        # next to the pattern and is one more unverified string on screen); it
+        # stays in --json-output for structured consumers that can tell the keys
+        # apart.
+        cr = out["closure_report"]
+        if out["outcome"] == "passed" and cr and cr["candidates"]:
+            print("\nCLASS-CLOSURE SWEEP")
+            print(f"  Bug class (model-supplied, unverified): {cr['bug_class']}")
+            print("  Harness-verified grep matches -- candidates for you to "
+                  "judge, NOT confirmed bugs:")
+            for c in cr["candidates"]:
+                print(f"    {c['file']}:{c['line']}: {c['text'].strip()}")
+                print(f"        (matched pattern: {c['pattern']})")
         if out["debate_log"]:
             print("\nDebate log:")
             for entry in out["debate_log"]:

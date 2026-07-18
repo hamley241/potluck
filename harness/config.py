@@ -113,6 +113,13 @@ class DiffConfig:
 class HarnessConfig:
     profile: str = "personal"
     debate_enabled: bool = True       # CI disables -> deterministic gate only
+    # After a PASSED run whose change a reviewer actually judged, ask the
+    # reviewer backend to name the bug CLASS this fix closed and emit grep
+    # patterns for siblings of it elsewhere; the harness runs them and surfaces
+    # only real matches. Advisory: it never changes the outcome. Read in
+    # Orchestrator._closure_sweep (step a) -- a profile may set it False to keep
+    # a run model-free, and the debate-disabled path never invokes it.
+    closure_enabled: bool = True
     # Path-based routing: diffs touching these paths skip external review and
     # go human-only. Empty by default; flip on after checking with security.
     human_only_paths: list[str] = field(default_factory=list)
@@ -183,7 +190,8 @@ class HarnessConfig:
             )
 
     def _apply(self, data: dict) -> None:
-        for k in ("profile", "debate_enabled", "human_only_paths"):
+        for k in ("profile", "debate_enabled", "closure_enabled",
+                  "human_only_paths"):
             if k in data:
                 setattr(self, k, data[k])
         for section, obj in (
