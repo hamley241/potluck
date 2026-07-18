@@ -258,9 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
-    # Native-Windows fails ungracefully deep in run_subprocess because
-    # `preexec_fn=os.setsid` is POSIX-only. That's an obscure traceback for
-    # someone who just tried potluck on the wrong OS. Fail honestly at
+    # Native-Windows fails ungracefully deep in run_subprocess because its
+    # cancellation teardown uses POSIX process-group signalling (`os.killpg`),
+    # which is POSIX-only. That's an obscure traceback for someone who just
+    # tried potluck on the wrong OS. Fail honestly at
     # startup instead: potluck's docs say Windows via WSL, so tell the user
     # exactly that. Under WSL, sys.platform is `linux`, so this check
     # doesn't fire.
