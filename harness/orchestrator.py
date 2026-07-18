@@ -735,10 +735,21 @@ class Orchestrator:
                     f"{sorted(unresolved)}",
                 )
 
-        # 7. Apply agreed fixes
-        await self._doer_apply_fixes(
-            [accepted_issues_by_id[k] for k in sorted(accepted_issues_by_id)],
-            diff)
+        # 7. Apply agreed fixes -- but only if there ARE any. When the doer
+        #    rejected every issue and the reviewer/tiebreaker conceded,
+        #    accepted_issues_by_id is empty; calling apply_fixes then spawns a
+        #    full doer model call with an empty issue list -- pointless cost
+        #    and a real failure mode (that no-op call can itself error and
+        #    escalate a run that had actually converged). Skip the model call;
+        #    step 8 still runs (it is local + deterministic and guards against
+        #    any unexpected tree mutation during debate).
+        if accepted_issues_by_id:
+            await self._doer_apply_fixes(
+                [accepted_issues_by_id[k]
+                 for k in sorted(accepted_issues_by_id)],
+                diff)
+        else:
+            self._log("apply_fixes_skipped", reason="no_accepted_issues")
 
         # 8. Gate again
         passed, detail = await self._gate_or_escalate("post-fix")
@@ -758,8 +769,18 @@ class Orchestrator:
     async def _gate_or_escalate(self, label: str) -> tuple[bool, str]:
         """Run the gate, return (passed, detail). `detail` is the gate's
         stdout/stderr on failure (for the escalation reason) or empty on
-        pass. Raises TimeoutEscalation on hangs so the caller doesn't have
-        to distinguish "failed" from "no signal"."""
+        pass.
+
+        Contract: this returns ONLY when the gate actually RAN and produced a
+        verdict about the code. Every can't-judge path raises instead, so the
+        caller never has to distinguish "the code failed the gate" from "the
+        gate produced no signal":
+          - the gate hung            -> TimeoutEscalation (tracked as a hang)
+          - the gate callable errored (verify.sh missing, OSError, non-zero
+            run_gate) or returned a malformed GateResult -> ModelUnavailable
+            ("gate", ...), which run_feature maps to ESCALATED_NO_SIGNAL.
+        A returned (False, detail) therefore means a gate that RAN and said
+        fail -- the caller reports that as ESCALATED_GATE."""
         res = await self.runner.run(
             f"gate:{label}",
             lambda: self.run_gate(),
@@ -782,19 +803,26 @@ class Orchestrator:
         # gates like `pytest -q` emit nothing on success and were previously
         # misclassified as failures).
         if not res.ok:
-            # Gate callable itself errored (not just failed) -- can't judge.
+            # Gate CALLABLE itself errored (not just failed): verify.sh
+            # missing, OSError, a RuntimeError out of run_gate. It produced NO
+            # verdict about the code, so this is the no-signal bucket, NOT a
+            # gate failure -- raise ModelUnavailable so run_feature reports
+            # ESCALATED_NO_SIGNAL rather than mislabelling it ESCALATED_GATE
+            # ("the code failed the gate"). Logged first so the transcript
+            # still records the event before the exception unwinds.
             err = res.error or "gate callable errored"
             self._log("gate", label=label, passed=False, error=err)
-            return False, err
+            raise ModelUnavailable("gate", err)
         try:
             gate_res = GateResult.from_json_str(res.output)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-            # Stale caller returning the old str contract (or malformed JSON)
-            # -- surface as no-signal, not silent pass. Do NOT crash on the
+            # Stale caller returning the old str contract (or malformed JSON):
+            # the gate produced no parseable verdict, so surface as no-signal,
+            # not a gate failure and not a silent pass. Do NOT crash on the
             # AttributeError that would come from touching .ok on a bare str.
             detail = f"malformed gate response: {e}"
             self._log("gate", label=label, passed=False, error=detail)
-            return False, detail
+            raise ModelUnavailable("gate", detail)
         # Log the actual gate output (stdout on pass, stderr on fail) so the
         # post-mortem can see WHY a gate failed instead of a generic string.
         self._log("gate", label=label, passed=gate_res.ok,

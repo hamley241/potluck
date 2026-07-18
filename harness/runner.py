@@ -39,10 +39,14 @@ class TimeoutEscalation(Exception):
 
 
 class ModelUnavailable(Exception):
-    """Raised when a required model call ERRORS (not times out) -- e.g. the CLI
-    is missing, unauthenticated, or exits non-zero. Like a timeout, this is
-    *no signal*, never a verdict: we escalate rather than treat an errored
-    reviewer as approval."""
+    """Raised when a required external signal source ERRORS (not times out).
+    The archetype is a model call -- the CLI is missing, unauthenticated, or
+    exits non-zero -- but the same applies to the deterministic gate callable
+    (verify.sh missing, an OSError/RuntimeError out of run_gate, or a
+    malformed GateResult): an errored gate produced NO verdict about the code.
+    Like a timeout, all of these are *no signal*, never a verdict: we escalate
+    rather than treat an errored reviewer as approval or an errored gate as a
+    gate failure."""
 
     def __init__(self, role: str, detail: str):
         self.role = role
@@ -129,24 +133,54 @@ class StepRunner:
             )
 
 
+async def _drain(stream: asyncio.StreamReader) -> None:
+    """Read a stream to EOF, discarding everything. Used during the SIGTERM
+    grace window so a child flushing buffered output doesn't wedge on a full
+    pipe. Any error (the transport tearing down under us as the process dies)
+    is swallowed -- this is best-effort cleanup on an already-cancelled call."""
+    try:
+        while await stream.read(65536):
+            pass
+    except Exception:
+        pass
+
+
+async def _cancel_drainers(drainers: list) -> None:
+    """Cancel and await the background pipe-reader tasks so none leaks past
+    run_subprocess. Awaited on both the graceful-exit and SIGKILL paths."""
+    for d in drainers:
+        d.cancel()
+    for d in drainers:
+        try:
+            await d
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
     """Run an external CLI, return stdout. Raises on non-zero exit.
 
     No timeout here on purpose -- the StepRunner wraps the call and owns the
     wall-clock bound, so timeout policy lives in exactly one place.
 
-    Spawns each child in its own POSIX process group (via `os.setsid`) so
-    cancellation can kill the WHOLE group. Model CLIs often fork helper
-    processes -- killing only the direct child would leak grandchildren
-    that continue running (burning tokens, holding locks), and a retry
-    would spawn a second copy of the work.
+    Spawns each child in its own POSIX process group (via
+    `start_new_session=True`, i.e. setsid() in the child) so cancellation
+    can kill the WHOLE group. Model CLIs often fork helper processes --
+    killing only the direct child would leak grandchildren that continue
+    running (burning tokens, holding locks), and a retry would spawn a
+    second copy of the work.
     """
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE if stdin_text is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        preexec_fn=os.setsid,  # new session -> distinct process group
+        # New session -> distinct process group (so the killpg teardown
+        # below reaches the whole tree). start_new_session is the documented,
+        # thread-safe spelling of "run setsid() in the child" -- the older
+        # fork-hook form is unsafe in the presence of threads and deprecated
+        # for exactly this use.
+        start_new_session=True,
     )
     try:
         stdout, stderr = await proc.communicate(
@@ -171,6 +205,21 @@ async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
                     os.killpg(pgid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
+                # communicate() was cancelled, so nobody is reading the
+                # child's pipes anymore. A well-behaved child that flushes
+                # buffered output from its SIGTERM handler -- the exact case
+                # this grace window exists for -- blocks in write() the moment
+                # the ~64 KB pipe buffer fills, never reaches exit, and eats
+                # SIGKILL. Drain both pipes concurrently with the wait so the
+                # child can finish flushing and exit cleanly. The bytes are
+                # discarded: the call is already cancelled, there is no
+                # consumer. The readers are cleaned up on BOTH paths below so
+                # no task leaks past this function.
+                drainers = [
+                    asyncio.ensure_future(_drain(stream))
+                    for stream in (proc.stdout, proc.stderr)
+                    if stream is not None
+                ]
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=_GRACE_SECONDS)
                 except asyncio.TimeoutError:
@@ -181,6 +230,8 @@ async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
                     except ProcessLookupError:
                         pass
                     await proc.wait()
+                finally:
+                    await _cancel_drainers(drainers)
             else:
                 # Couldn't get pgid (child already exited between check and
                 # kill); fall through to plain wait.

@@ -94,10 +94,51 @@ time.sleep(30)
     return _pid_dead(child_pid) and _pid_dead(grand_pid)
 
 
+async def _chatty_child_survives_grace_window() -> bool:
+    """A SIGTERM-trapping child that flushes >= 256 KB from its handler must
+    exit CLEANLY within the grace window, not eat SIGKILL. This is the exact
+    "flush logs and exit" case the grace window exists for.
+
+    Pre-fix this fails: communicate() is cancelled, so nobody reads the child's
+    stdout; the handler blocks in write() once the ~64 KB pipe buffer fills,
+    never reaches exit, the grace expires, and it gets SIGKILLed -- leaving the
+    sentinel empty. Post-fix the teardown drains the pipe concurrently, so the
+    handler finishes flushing and writes 'clean' before exiting."""
+    sentinel = tempfile.NamedTemporaryFile(delete=False)
+    sentinel.close()
+    # 256 KB is larger than any default pipe buffer, so a handler that flushes
+    # it wedges on write() unless someone is draining the read end.
+    script = (
+        "import sys, signal, time\n"
+        "def handler(signum, frame):\n"
+        "    sys.stdout.write('x' * (256 * 1024))\n"
+        "    sys.stdout.flush()\n"
+        "    open(sys.argv[1], 'w').write('clean')\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, handler)\n"
+        "time.sleep(30)\n"
+    )
+    cmd = [sys.executable, "-c", script, sentinel.name]
+
+    try:
+        await asyncio.wait_for(run_subprocess(cmd), timeout=1.0)
+        return False  # it should NOT have completed
+    except asyncio.TimeoutError:
+        pass  # expected -- triggers the SIGTERM+grace teardown
+
+    # Let the handler flush + exit within the grace window and the reap settle.
+    await asyncio.sleep(1.0)
+    return open(sentinel.name).read().strip() == "clean"
+
+
 def main():
     results = {}
     results["child_process_killed_on_timeout"] = asyncio.run(
         _process_killed_on_timeout())
+    # A well-behaved chatty child (flushes >=256 KB from its SIGTERM handler)
+    # must survive the grace window instead of being SIGKILLed mid-flush.
+    results["chatty_child_survives_grace_window"] = asyncio.run(
+        _chatty_child_survives_grace_window())
     # Both teardown paths: (a) grandchild respects SIGTERM (dies in grace
     # window); (b) grandchild ignores SIGTERM (SIGKILL fallback kicks in).
     # In both, the whole process group must be gone.

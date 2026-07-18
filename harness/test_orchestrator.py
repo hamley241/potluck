@@ -994,6 +994,85 @@ async def main():
     assert dpv_exc.missing_ids == {"I2", "I3"}
     assert dpv_exc.round == 2
 
+    # 22. INVARIANT: an errored gate CALLABLE is no-signal, NOT a gate failure.
+    # run_gate raising (verify.sh missing, OSError, non-zero run_gate) produced
+    # NO verdict about the code, so the outcome must be ESCALATED_NO_SIGNAL with
+    # "[gate]" in the reason -- never ESCALATED_GATE ("the code failed the
+    # gate"). Covers the initial-gate site.
+    cfg = HarnessConfig()
+    async def gate_raises():
+        raise RuntimeError("verify.sh: not found")
+    orch = Orchestrator(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                        None, gate_raises, diff_plain,
+                        ab_swap=lambda _id: False)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"errored gate must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[gate]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [gate]: {r.escalation_reason!r}"
+    results["gate_error_no_signal"] = (r.outcome, r.rounds_used)
+
+    # 23. INVARIANT: a malformed GateResult (gate returns a non-JSON string,
+    # e.g. a stale caller on the old str contract) is the SAME no-signal
+    # bucket, not a gate failure.
+    cfg = HarnessConfig()
+    async def gate_malformed():
+        return "this is not json"
+    orch = Orchestrator(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                        None, gate_malformed, diff_plain,
+                        ab_swap=lambda _id: False)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"malformed gate must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[gate]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [gate]: {r.escalation_reason!r}"
+    results["gate_malformed_no_signal"] = (r.outcome, r.rounds_used)
+
+    # 24. INVARIANT (guards against over-rotating #22/#23): a gate that RAN and
+    # reported ok=False is still a real gate failure -> ESCALATED_GATE. This is
+    # case 6 above, re-asserted here alongside the no-signal cases to keep the
+    # ran-and-failed vs never-ran distinction pinned.
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_fail, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_GATE, \
+        f"a gate that ran and failed must stay ESCALATED_GATE, got {r.outcome}"
+    results["gate_ran_and_failed"] = (r.outcome, r.rounds_used)
+
+    # 25. INVARIANT: zero accepted issues after debate skips the apply_fixes
+    # model call. Reviewer raises one blocking issue, doer rejects with
+    # reasoning, reviewer follow-up concedes (nothing held) -> accepted set is
+    # empty. Step 7's doer call must be SKIPPED (the pointless no-op that could
+    # itself error and escalate a converged run), an apply_fixes_skipped event
+    # logged, and step 8 (post-fix gate) STILL run -> PASSED.
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]},
+        followups=[{"issues": []}])  # reviewer concedes, nothing held
+    doer = StubDoer({"I1": "reject"})
+    gate_calls = []
+    async def gate_pass_recording():
+        gate_calls.append(True)
+        return (True, "green")
+    orch = make(cfg, doer, reviewer, None, gate_pass_recording, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.PASSED, \
+        f"converged empty-accept must PASS, got {r.outcome}"
+    assert doer.apply_fixes_calls == [], \
+        f"apply_fixes must not run with zero accepted issues: {doer.apply_fixes_calls}"
+    events = [e["event"] for e in r.debate_log]
+    assert "apply_fixes_skipped" in events, \
+        f"expected apply_fixes_skipped event in log: {events}"
+    skipped = next(e for e in r.debate_log if e["event"] == "apply_fixes_skipped")
+    assert skipped["reason"] == "no_accepted_issues", \
+        f"apply_fixes_skipped must record its reason: {skipped}"
+    # Post-fix gate STILL ran: initial gate + post-fix gate == 2 invocations.
+    assert len(gate_calls) == 2, \
+        f"post-fix gate must still run when apply is skipped, saw {len(gate_calls)} gate calls"
+    results["empty_accept_skips_apply"] = (r.outcome, r.rounds_used)
+
     # report
     expected = {
         "early_exit": (Outcome.PASSED, 0),
@@ -1025,6 +1104,10 @@ async def main():
         "invariant_partial_doer_response_escalates": (
             Outcome.ESCALATED_NO_SIGNAL, 1),
         "invariant_conformant_doer_response_still_passes": (Outcome.PASSED, 1),
+        "gate_error_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
+        "gate_malformed_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
+        "gate_ran_and_failed": (Outcome.ESCALATED_GATE, 0),
+        "empty_accept_skips_apply": (Outcome.PASSED, 1),
     }
     ok = True
     for name, got in results.items():
