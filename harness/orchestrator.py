@@ -453,7 +453,17 @@ class RealDoerClient(DoerClient):
         raw = await run_subprocess(
             [self._cmd] + self._JUDGE_FLAGS, stdin_text=prompt
         )
-        return DoerResponse.model_validate(_extract_json(raw))
+        # This parse runs inside the coroutine StepRunner drives; a prose
+        # reply (ValueError from _extract_json) or schema mismatch (pydantic
+        # ValidationError) would otherwise escape StepRunner's narrow
+        # (RuntimeError, OSError) catch and crash the orchestrator. Raise the
+        # same RuntimeError contract run_subprocess uses for CLI failures so
+        # it flows through StepRunner -> ModelUnavailable -> ESCALATED_NO_SIGNAL.
+        try:
+            return DoerResponse.model_validate(_extract_json(raw))
+        except Exception as e:
+            raise RuntimeError(
+                f"doer returned malformed response: {e}") from e
 
     async def apply_fixes(self, accepted_issues: list[ReviewIssue],
                           diff: str) -> str:

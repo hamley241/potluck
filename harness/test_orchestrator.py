@@ -785,6 +785,69 @@ async def main():
     r = await orch.run_feature("spec", "acc")
     results["invariant_doer_malformed_response"] = (r.outcome, r.rounds_used)
 
+    # 15h-real. INVARIANT: the REAL RealDoerClient.respond_to_review parses
+    # live model output INSIDE StepRunner's coroutine. A prose reply (no JSON)
+    # or a schema mismatch must surface as RuntimeError -- the same "this call
+    # failed" contract run_subprocess uses for CLI failures -- so StepRunner's
+    # narrow (RuntimeError, OSError) catch turns it into a non-ok StepResult
+    # -> ModelUnavailable -> ESCALATED_NO_SIGNAL, NOT an uncaught ValueError /
+    # pydantic ValidationError that crashes the orchestrator mid-debate. We
+    # drive the real subprocess path (not a stub) via a tiny executable helper
+    # pointed at by claude_cmd; the appended `-p` flag is ignored by the helper.
+    import os  # noqa: E402
+    import stat  # noqa: E402
+    import sys  # noqa: E402
+    import tempfile  # noqa: E402
+    from pydantic import ValidationError  # noqa: E402
+    from harness.orchestrator import RealDoerClient  # noqa: E402
+    from harness.schemas import ReviewVerdict, ReviewIssue  # noqa: E402
+
+    verdict = ReviewVerdict(issues=[
+        ReviewIssue(id="I1", severity="blocking",
+                    issue="something is wrong", suggested_fix="fix it")])
+
+    def _write_helper(tmpdir, body):
+        # Executable python helper: ignores its args, prints `body` to stdout.
+        path = f"{tmpdir}/fake_claude.py"
+        with open(path, "w") as fp:
+            fp.write(f"#!{sys.executable}\n")
+            fp.write("import sys\n")
+            fp.write(f"sys.stdout.write({body!r})\n")
+        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP
+                 | stat.S_IXOTH)
+        return path
+
+    # (a) Prose reply -> RuntimeError mentioning "malformed", never ValueError
+    # or pydantic ValidationError.
+    with tempfile.TemporaryDirectory() as tmp:
+        helper = _write_helper(tmp, "I think these issues all look valid to me.")
+        doer = RealDoerClient(claude_cmd=helper)
+        raised = None
+        try:
+            await doer.respond_to_review("spec", "acc", "diff", verdict)
+        except BaseException as e:  # capture the exact type that escapes
+            raised = e
+        assert isinstance(raised, RuntimeError), \
+            f"prose reply must raise RuntimeError, got {type(raised).__name__}: {raised!r}"
+        assert not isinstance(raised, (ValueError, ValidationError)), \
+            f"must not leak ValueError/ValidationError: {type(raised).__name__}"
+        assert "malformed" in str(raised), \
+            f"RuntimeError message must mention 'malformed': {raised!r}"
+
+    # (b) Happy path: valid response JSON still parses to a DoerResponse with
+    # the expected decision -- the wrapper does not break normal parsing.
+    with tempfile.TemporaryDirectory() as tmp:
+        valid = json.dumps({"responses": [
+            {"id": "I1", "decision": "reject",
+             "reasoning": "the reviewer misread the diff"}]})
+        helper = _write_helper(tmp, valid)
+        doer = RealDoerClient(claude_cmd=helper)
+        resp = await doer.respond_to_review("spec", "acc", "diff", verdict)
+        assert isinstance(resp, DoerResponse), \
+            f"valid JSON must parse to DoerResponse, got {type(resp).__name__}"
+        assert resp.rejected_ids() == {"I1"}, \
+            f"expected I1 rejected, got responses={resp.responses!r}"
+
     # 15i. INVARIANT: HarnessConfig.validate() rejects feature_seconds smaller
     # than the largest step timeout. The "finer signal never overwritten"
     # guarantee only holds when steps can raise TimeoutEscalation before the
