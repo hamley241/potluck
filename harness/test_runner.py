@@ -13,7 +13,7 @@ import os
 import sys
 import tempfile
 
-from harness.runner import run_subprocess, _drain
+from harness.runner import run_subprocess, run_subprocess_result, _drain
 
 
 async def _process_killed_on_timeout() -> bool:
@@ -49,10 +49,17 @@ def _pid_dead(pid: int) -> bool:
         return False         # alive but not ours -> treat as fail
 
 
-async def _grandchild_dies_on_timeout(ignore_sigterm: bool) -> bool:
+async def _grandchild_dies_on_timeout(ignore_sigterm: bool,
+                                      runner=run_subprocess) -> bool:
     """Child forks a grandchild (double-fork so it escapes the parent's
     direct-child slot). Both must be gone after cancellation. Optional
-    SIGTERM ignore exercises the SIGKILL fallback path."""
+    SIGTERM ignore exercises the SIGKILL fallback path.
+
+    `runner` is the spawn function under test -- run_subprocess by default, or
+    run_subprocess_result to prove the result-returning sibling shares the exact
+    same process-group teardown (a cancelled call leaks neither child nor
+    grandchild). Both are driven the same way: wrapped in wait_for and cancelled
+    mid-flight, so the return value never matters here."""
     child_pidfile = tempfile.NamedTemporaryFile(delete=False)
     child_pidfile.close()
     grand_pidfile = tempfile.NamedTemporaryFile(delete=False)
@@ -80,7 +87,7 @@ time.sleep(30)
     cmd = [sys.executable, "-c", script, child_pidfile.name, grand_pidfile.name]
 
     try:
-        await asyncio.wait_for(run_subprocess(cmd), timeout=1.0)
+        await asyncio.wait_for(runner(cmd), timeout=1.0)
         return False
     except asyncio.TimeoutError:
         pass
@@ -245,6 +252,15 @@ def main():
         _grandchild_dies_on_timeout(ignore_sigterm=False))
     results["grandchild_dies_via_sigkill"] = asyncio.run(
         _grandchild_dies_on_timeout(ignore_sigterm=True))
+    # run_subprocess_result shares run_subprocess's spawn+teardown: a cancelled
+    # call must leak neither child nor grandchild. Member B: the direct-spawn
+    # shape these call sites used to hand-roll left survivors here.
+    results["result_helper_grandchild_dies_via_sigterm"] = asyncio.run(
+        _grandchild_dies_on_timeout(ignore_sigterm=False,
+                                    runner=run_subprocess_result))
+    results["result_helper_grandchild_dies_via_sigkill"] = asyncio.run(
+        _grandchild_dies_on_timeout(ignore_sigterm=True,
+                                    runner=run_subprocess_result))
 
     ok = True
     for name, passed in results.items():

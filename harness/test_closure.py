@@ -3,7 +3,8 @@ CLASS it closed and emits grep patterns; the HARNESS runs them and reports only
 real file:line matches it found. These tests pin the whole contract:
 
   1. happy path end-to-end (a planted sibling is found and reported)
-  2. framework disposes -- model-claimed locations are ignored
+  2. Contract A, honestly -- a report attaches with real grep candidates while
+     a model-claimed path (in bug_class/rationale) never becomes a candidate
   3. files touched by the diff are excluded (those are the fixed sites)
   4. advisory -- a failing sweep can never break a PASSED run
   5. disabled by config -- no model call, no closure events
@@ -22,6 +23,11 @@ real file:line matches it found. These tests pin the whole contract:
            carries only its LENGTH (not the raw regex) is logged, and no
            truncated form of the regex appears anywhere in the report or log --
            even when the regex is longer than the _pack_event field cap
+ 12. signal death is not success -- a grep killed by a signal (negative
+     returncode) skips the pattern and yields no candidate from partial stdout
+ 13. caps bound the WORK -- the pattern cap applies before per-pattern
+     validation (a malformed entry past the cap is never validated), and the
+     capped-count log still reports the true `returned` count
 
 Tests 1-7 all converge through the early-exit PASSED branch (review finds
 nothing blocking), so on their own they leave the second wiring point unpinned.
@@ -39,6 +45,7 @@ import os
 import subprocess
 import tempfile
 
+from harness import orchestrator as orch_mod
 from harness.config import HarnessConfig
 from harness.orchestrator import (
     Orchestrator, DoerClient, ReviewerClient, GateResult,
@@ -194,27 +201,52 @@ async def main():
                   and c["pattern"] == "SIBLING_MARKER"
                   for c in rep_ev[0]["candidates"]))
 
-    # 2. FRAMEWORK DISPOSES: a model that claims a plausible but NONEXISTENT
-    # location (in its rationale) with a regex matching nothing yields zero
-    # candidates, and the invented path appears NOWHERE in the report or log.
+    # 2. CONTRACT A, honestly. Candidates are HARNESS-VERIFIED grep output; the
+    # model's bug_class and rationale are unverified EXPLANATION that MAY carry a
+    # path -- but a model-claimed path must NEVER become a candidate. The old
+    # version of this test used a regex matching nothing, so no report attached
+    # at all; it would have passed even if an invented path leaked into an
+    # attached report. This version makes the reviewer return a pattern that DOES
+    # match a planted line (so a report genuinely attaches with candidates) and
+    # stuffs an invented path `src/ghost.py:12` into BOTH bug_class and
+    # rationale. We assert: (a) a report attaches with >= 1 candidate; (b) every
+    # candidate's file is a real path in the repo under test; (c) the invented
+    # path appears in NO candidate's file/text -- it MAY appear in
+    # bug_class/rationale (that is the honest contract now), so we assert its
+    # absence specifically from the candidate fields.
+    invented = "src/ghost.py:12"
     with tempfile.TemporaryDirectory() as tmp:
-        _init_repo(tmp, {"real.py": "def foo():\n    pass\n"})
+        _init_repo(tmp, {"real.py": "def foo():\n    CONTRACTA_MARKER here\n"})
         cfg = HarnessConfig()
         reviewer = ClosureReviewer(cfg, {
-            "bug_class": "some plausible class",
-            "patterns": [{"regex": "ZZZ_NEVER_MATCHES_ANYTHING_ZZZ",
-                          "rationale": "the sibling lives in "
-                                       "src/hallucinated/ghost.py at line 42"}],
+            "bug_class": f"unchecked result -- sibling at {invented}",
+            "patterns": [{"regex": "CONTRACTA_MARKER",
+                          "rationale": f"the sibling lives at {invented}"}],
         })
-        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["real.py"]))
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["other.py"]))
         r = await _run_in_repo(tmp, orch)
-    check("dispose_passed", r.outcome == Outcome.PASSED)
-    check("dispose_no_candidates", r.closure_report is None)
-    log_blob = json.dumps(r.debate_log, default=str)
-    check("dispose_no_invented_path",
-          "ghost.py" not in log_blob and "hallucinated" not in log_blob)
-    check("dispose_clean_logged",
-          any(e["event"] == "closure_clean" for e in r.debate_log))
+        cands = list(r.closure_report.candidates) if r.closure_report else []
+        # (b) every candidate file is a real path in the repo under test.
+        files_real = bool(cands) and all(
+            os.path.exists(os.path.join(tmp, c.file)) for c in cands)
+    check("contracta_passed", r.outcome == Outcome.PASSED)
+    # (a) a report IS attached with at least one candidate.
+    check("contracta_report_attached",
+          r.closure_report is not None and len(cands) >= 1)
+    check("contracta_candidate_files_real", files_real)
+    # (c) the invented path never appears in any candidate's file or text.
+    check("contracta_invented_absent_from_candidates",
+          all(invented not in c.file and invented not in c.text
+              and "ghost.py" not in c.file and "ghost.py" not in c.text
+              for c in cands))
+    # The invented path IS allowed to appear in bug_class/rationale -- confirm
+    # the report really did carry the model's words (so (c) is meaningful, not
+    # vacuously true because nothing model-supplied was retained).
+    rep = r.closure_report
+    check("contracta_model_text_retained",
+          rep is not None
+          and invented in rep.bug_class
+          and any(invented in p.rationale for p in rep.patterns))
 
     # 3. TOUCHED FILES EXCLUDED: a match inside a file the diff touches is the
     # just-fixed site and must NOT be reported; the untouched sibling must.
@@ -503,6 +535,79 @@ async def main():
           _bound_closure_text(long_regex) not in blob)
     check("longregex_never_truncated",
           blob.count("TRUNCMARK_") == blob.count(long_regex))
+
+    # 12. SIGNAL DEATH IS NOT SUCCESS. A `git grep` killed by a signal returns a
+    # NEGATIVE returncode (-15 SIGTERM, -9 SIGKILL), which is not > 1. If the
+    # result handling only rejected `> 1`, it would fall through and parse the
+    # killed process's PARTIAL stdout as a complete result -- fabricating
+    # candidates from a dead grep. Stub run_subprocess_result to return -15 with
+    # non-empty stdout and assert _git_grep SKIPS the pattern (logs
+    # closure_skipped) and yields NO candidate from that partial output.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"x.py": "hello\n"})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, {"bug_class": "c", "patterns": []})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["x.py"]))
+
+        async def _signal_killed(cmd, *, stdin_text=None):
+            # Partial output a killed grep might have flushed before dying.
+            return (-15, b"ghost.py:1:partial line from a killed grep\n", b"")
+
+        saved = orch_mod.run_subprocess_result
+        orch_mod.run_subprocess_result = _signal_killed
+        try:
+            prev = os.getcwd()
+            os.chdir(tmp)
+            try:
+                grep_result = await orch._git_grep("ANYTHING")
+            finally:
+                os.chdir(prev)
+        finally:
+            orch_mod.run_subprocess_result = saved
+    sig_skips = [e for e in orch.log if e["event"] == "closure_skipped"
+                 and e.get("scope") == "pattern"]
+    check("signal_death_no_candidate", grep_result is None)
+    check("signal_death_skipped_logged", len(sig_skips) == 1)
+    # The partial line must NOT have been parsed into a candidate anywhere.
+    log_blob = json.dumps(orch.log, default=str)
+    check("signal_death_partial_not_parsed", "ghost.py:1:partial" not in log_blob)
+
+    # 13. CAPS BOUND THE WORK, not just the output. A reply with far more than 5
+    # patterns must be capped BEFORE per-pattern validation: only the first 5 are
+    # ever validated/run. We plant a MALFORMED pattern at index 5 -- if the cap
+    # regressed to after-validation, model_validate would raise on it and the
+    # whole reply would become closure_skipped(malformed); with the cap before
+    # validation the malformed 6th is dropped untouched, parsing succeeds, and at
+    # most 5 greps run. `returned` still reports the true count the model sent.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"x.py": "hello\n"})
+        cfg = HarnessConfig()
+        pats = [{"regex": f"NOMATCH_{i}", "rationale": "r"} for i in range(5)]
+        pats.append({"not_a_regex": True})  # malformed: no regex/rationale
+        pats += [{"regex": f"NOMATCH_tail_{i}", "rationale": "r"}
+                 for i in range(10)]
+        reviewer = ClosureReviewer(cfg, {"bug_class": "c", "patterns": pats})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["x.py"]))
+        grep_calls = {"n": 0}
+        orig_grep = orch._git_grep
+
+        async def counting_grep(regex, _orig=orig_grep, _c=grep_calls):
+            _c["n"] += 1
+            return await _orig(regex)
+
+        orch._git_grep = counting_grep
+        r = await _run_in_repo(tmp, orch)
+    pcap = [e for e in r.debate_log if e["event"] == "closure_patterns_capped"]
+    malformed = [e for e in r.debate_log if e["event"] == "closure_skipped"
+                 and e.get("reason") == "malformed"]
+    check("cap_work_passed", r.outcome == Outcome.PASSED)
+    # Cap applied before validation -> the malformed 6th was never validated.
+    check("cap_work_not_malformed", malformed == [])
+    check("cap_work_grep_bounded", grep_calls["n"] <= 5)
+    check("cap_work_returned_true_count",
+          bool(pcap) and pcap[0]["returned"] == len(pats)
+          and pcap[0]["kept"] == 5
+          and pcap[0]["dropped"] == len(pats) - 5)
 
     print("\nALL PASS" if ok else "\nSOME FAILED")
     return ok

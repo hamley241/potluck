@@ -112,11 +112,14 @@ class ClosureCandidate(BaseModel):
     """A single harness-verified sibling site: a real `file:line` that a
     reviewer-proposed pattern actually matched in the repo.
 
-    HARNESS-VERIFIED, never model-supplied: every field here comes from real
-    `git grep` output the harness ran, not from anything the model claimed. A
-    hallucinated path the model invents cannot become a ClosureCandidate,
-    because nothing the model says about locations is ever trusted or echoed --
-    only lines the grep actually found reach the operator.
+    HARNESS-VERIFIED, never model-supplied: `file`, `line`, and `text` all come
+    from real `git grep` output the harness ran -- never from anything the model
+    claimed. A `file:line`-shaped string the model invents (in its bug_class or
+    a rationale) cannot become a ClosureCandidate: candidates are drawn
+    exclusively from grep matches, so a claimed location is never promoted to a
+    reported candidate. `pattern` is the model's regex, kept only to explain WHY
+    this line matched -- it is the one model-supplied field here and is not a
+    location.
 
     `text` is bounded at construction (capped with an elision marker) even
     though it is real grep output, not model-supplied: a single long repo line
@@ -135,10 +138,14 @@ class ClosureReport(BaseModel):
     fix closed, the patterns the reviewer proposed, and the sibling sites the
     HARNESS found by running those patterns.
 
-    `candidates` is populated by the harness from real `git grep` output;
-    model-claimed locations are NEVER trusted or copied into it. The report is
-    advisory only -- it is produced on an already-passed run and can never
-    change the outcome.
+    The honest guarantee: `candidates` is populated exclusively from real
+    `git grep` output the harness ran -- every one is harness-verified. The
+    model-supplied fields -- `bug_class` and each pattern's `regex`/`rationale`
+    -- are EXPLANATION, not evidence: bounded (below) but NOT verified, and NOT
+    locations. A model may write a `src/ghost.py:12`-shaped string into any of
+    them; that never makes it a candidate, because candidates come only from
+    grep matches, never from anything the model claimed. The report is advisory
+    only -- produced on an already-passed run, it can never change the outcome.
 
     Every free-text field carried here -- `bug_class`, each pattern's
     `rationale`, and each candidate's `text` -- is length-bounded with a visible

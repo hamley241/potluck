@@ -53,7 +53,13 @@ from datetime import datetime, timezone
 from typing import NamedTuple
 
 from .config import DiffConfig, HarnessConfig
-from .runner import StepRunner, TimeoutEscalation, ModelUnavailable, run_subprocess
+from .runner import (
+    StepRunner,
+    TimeoutEscalation,
+    ModelUnavailable,
+    run_subprocess,
+    run_subprocess_result,
+)
 from .schemas import (
     ClosureCandidate,
     ClosurePattern,
@@ -1277,8 +1283,16 @@ class Orchestrator:
         diff closed and for grep patterns matching siblings of it, then run
         those patterns ourselves and report only real matches.
 
-        The model never reports a site: it emits patterns, the harness runs
-        them. Every failure of the sweep itself (timeout, model error, malformed
+        What the report GUARANTEES, precisely: every `candidate` is
+        harness-verified -- a real `file:line` that `git grep` actually found in
+        the tree. The model supplies only EXPLANATION -- `bug_class` and each
+        pattern's `regex`/`rationale` -- which is length-bounded but NOT
+        verified and must never be read as a location. A model can write a
+        `src/ghost.py:12`-shaped string into any of those; it can never become a
+        candidate, because candidates come exclusively from grep output, never
+        from anything the model claimed.
+
+        Every failure of the sweep itself (timeout, model error, malformed
         output, uncompilable regex, git failure) logs `closure_skipped` with a
         reason and returns None -- an advisory add-on must never turn a good run
         into an escalation (finding #9)."""
@@ -1307,19 +1321,25 @@ class Orchestrator:
         #     RecursionError (nested-to-death JSON blows json.loads's stack, and
         #     RecursionError is NOT a ValueError). Any OTHER exception type is a
         #     harness bug -- it must crash, not be buried as "malformed".
+        # (d) Cap patterns BEFORE per-pattern validation. _parse_closure caps
+        #     the RAW reply list to _CLOSURE_MAX_PATTERNS before it validates or
+        #     bounds any entry, so a reply with thousands of patterns can't make
+        #     the harness validate thousands of them -- the validation work is
+        #     bounded too, not just the final list. `returned` is the true count
+        #     the model actually sent (measured before the cut), so the
+        #     closure_patterns_capped log stays honest.
         try:
-            bug_class, patterns = _parse_closure(res.output)
+            bug_class, patterns, returned = _parse_closure(
+                res.output, self._CLOSURE_MAX_PATTERNS)
         except (ValueError, RecursionError):
             self._log("closure_skipped", reason="malformed")
             return None
 
-        # (d) Cap patterns; a model that returned more gets the drop logged.
-        if len(patterns) > self._CLOSURE_MAX_PATTERNS:
+        if returned > self._CLOSURE_MAX_PATTERNS:
             self._log("closure_patterns_capped",
-                      returned=len(patterns),
+                      returned=returned,
                       kept=self._CLOSURE_MAX_PATTERNS,
-                      dropped=len(patterns) - self._CLOSURE_MAX_PATTERNS)
-            patterns = patterns[:self._CLOSURE_MAX_PATTERNS]
+                      dropped=returned - self._CLOSURE_MAX_PATTERNS)
 
         # (d2) Reject (never truncate) any over-long regex BEFORE it can run or
         #     reach the report. A shortened regex is a DIFFERENT regex that would
@@ -1357,22 +1377,33 @@ class Orchestrator:
         #     model regex dies at the step timeout instead of hanging the run.
         #     StepResult.output is a str, so the loop serializes its candidates
         #     to JSON at the step boundary and we deserialize on the far side.
+        #     Candidate accumulation STOPS at _CLOSURE_MAX_CANDIDATES (a `.*`
+        #     regex on a big repo won't build a huge in-memory list first) but
+        #     the COUNT keeps going, so `closure_candidates_capped` reports an
+        #     accurate found/dropped -- capping the work, never silently
+        #     truncating the count.
+        max_candidates = self._CLOSURE_MAX_CANDIDATES
+
         async def _grep_all() -> str:
-            found: list[dict] = []
+            kept: list[dict] = []
+            found_total = 0
             for pat in patterns:  # all over-long regexes already rejected in (d2)
                 grep = await self._git_grep(pat.regex)
                 if grep is None:
-                    continue  # >1 exit -- _git_grep logged closure_skipped
+                    continue  # non-0/1 exit -- _git_grep logged closure_skipped
                 for path, lineno, text in grep:
                     if path in touched:
                         continue
+                    found_total += 1
+                    if len(kept) >= max_candidates:
+                        continue  # at the cap: keep counting, stop accumulating
                     # A grep line exists to be eyeballed and printed one-per-line;
                     # bound it here, at construction, so no full-length repo line
                     # (a minified bundle, a long data literal) reaches the report.
-                    found.append({"file": path, "line": lineno,
-                                  "text": _bound_closure_text(text),
-                                  "pattern": pat.regex})
-            return json.dumps(found)
+                    kept.append({"file": path, "line": lineno,
+                                 "text": _bound_closure_text(text),
+                                 "pattern": pat.regex})
+            return json.dumps({"candidates": kept, "found_total": found_total})
 
         grep_res = await self.runner.run(
             "closure_grep", _grep_all, self.cfg.timeouts.gate_seconds)
@@ -1383,16 +1414,18 @@ class Orchestrator:
             self._log("closure_skipped",
                       reason=grep_res.error or "closure grep errored")
             return None
+        payload = json.loads(grep_res.output)
+        found_total = payload["found_total"]
         candidates = [ClosureCandidate.model_validate(c)
-                      for c in json.loads(grep_res.output)]
+                      for c in payload["candidates"]]
 
-        # (g) Cap total candidates; log any excess dropped.
-        if len(candidates) > self._CLOSURE_MAX_CANDIDATES:
+        # (g) Candidates were already capped in the loop; log any excess dropped
+        #     using the true found_total (accumulation stopped, counting did not).
+        if found_total > self._CLOSURE_MAX_CANDIDATES:
             self._log("closure_candidates_capped",
-                      found=len(candidates),
+                      found=found_total,
                       kept=self._CLOSURE_MAX_CANDIDATES,
-                      dropped=len(candidates) - self._CLOSURE_MAX_CANDIDATES)
-            candidates = candidates[:self._CLOSURE_MAX_CANDIDATES]
+                      dropped=found_total - self._CLOSURE_MAX_CANDIDATES)
 
         # (h) Harness-verified candidates only.
         return ClosureReport(bug_class=bug_class, patterns=patterns,
@@ -1400,25 +1433,30 @@ class Orchestrator:
 
     async def _git_grep(self, regex: str) -> list[tuple[str, int, str]] | None:
         """Run `git grep -n -E -- <regex>` in the working tree. Returns the
-        parsed `(path, line, text)` matches on exit 0 or 1 (0 = matches,
-        1 = none -- BOTH success), or None on exit > 1 (a real git error, most
-        often an uncompilable regex), logging `closure_skipped` (scope=pattern)
-        so the skip is never silent. Called directly (not via run_subprocess, which
-        raises on the legitimate exit-1 no-match case)."""
-        proc = await asyncio.create_subprocess_exec(
-            "git", "grep", "-n", "-E", "--", regex,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode is not None and proc.returncode > 1:
-            # A bad model-supplied regex is the common cause. Skip THIS pattern
-            # and log it (never silently) -- but do NOT fail the whole sweep;
-            # the other patterns can still find real siblings. `closure_skipped`
-            # with the offending regex + git's stderr as the reason.
+        parsed `(path, line, text)` matches ONLY on exit 0 or 1 (0 = matches,
+        1 = none -- BOTH success), or None on ANY other exit, logging
+        `closure_skipped` (scope=pattern) so the skip is never silent.
+
+        Goes through run_subprocess_result (not a bare create_subprocess_exec)
+        so a StepRunner timeout tears the whole `git grep` process group down
+        instead of leaking it; run_subprocess itself can't be used because it
+        raises on the legitimate exit-1 no-match case."""
+        returncode, stdout, stderr = await run_subprocess_result(
+            ["git", "grep", "-n", "-E", "--", regex])
+        # Success is EXACTLY exit 0 or 1. Anything else is a failure: a git
+        # error (uncompilable model regex, the common case), OR a process killed
+        # by a signal, which returns a NEGATIVE returncode (-15 SIGTERM, -9
+        # SIGKILL). Do NOT "simplify" this back to `returncode > 1`: signal
+        # death is not > 1, so `> 1` would fall through and parse the killed
+        # grep's PARTIAL stdout as a complete result -- fabricating candidates
+        # from a dead process.
+        if returncode not in (0, 1):
+            # Skip THIS pattern and log it (never silently) -- but do NOT fail
+            # the whole sweep; the other patterns can still find real siblings.
+            # `closure_skipped` with the offending regex + git's stderr.
             self._log("closure_skipped", scope="pattern", regex=regex,
                       reason=stderr.decode(errors="replace").strip()[:500]
-                      or f"git grep exited {proc.returncode}")
+                      or f"git grep exited {returncode}")
             return None
         return _parse_git_grep(stdout.decode(errors="replace"))
 
@@ -1561,10 +1599,23 @@ def _parse_tiebreak(text: str) -> TiebreakVerdict:
     return TiebreakVerdict.model_validate(_extract_json(text))
 
 
-def _parse_closure(text: str) -> tuple[str, list[ClosurePattern]]:
-    """Parse the reviewer's closure reply into (bug_class, patterns). The reply
-    is model-supplied DATA about the bug CLASS and grep patterns only -- it
-    carries NO candidate locations (those are harness-verified downstream).
+def _parse_closure(
+    text: str, max_patterns: int
+) -> tuple[str, list[ClosurePattern], int]:
+    """Parse the reviewer's closure reply into (bug_class, patterns, returned).
+
+    This reply is model-supplied EXPLANATION, not evidence: `bug_class` and each
+    pattern's `regex`/`rationale` are the model's words about a defect class and
+    how to grep for siblings. They are bounded (below) but NOT verified, carry
+    NO candidate locations, and must never be read as locations -- a model can
+    put a `file:line`-shaped string in any of them. The actual sibling sites are
+    harness-verified downstream by running the patterns; nothing here is.
+
+    The RAW `patterns` list is capped to `max_patterns` BEFORE any per-pattern
+    validation or bounding, so a reply with thousands of entries can't make the
+    harness validate thousands of them -- validation work is bounded, not just
+    the returned list. `returned` is the true count the model sent (measured
+    before the cut) so the caller's closure_patterns_capped log stays honest.
 
     Every failure mode here is a ValueError so the caller's narrow
     (ValueError, RecursionError) parse-boundary catch treats a malformed reply
@@ -1590,10 +1641,14 @@ def _parse_closure(text: str) -> tuple[str, list[ClosurePattern]]:
     raw_patterns = data.get("patterns", [])
     if not isinstance(raw_patterns, list):
         raise ValueError("closure reply 'patterns' must be a list")
-    patterns = [ClosurePattern.model_validate(p) for p in raw_patterns]
+    returned = len(raw_patterns)
+    # Cap the RAW list before validation -- bound the validation work, not just
+    # the result. Extra entries are never touched by model_validate.
+    patterns = [ClosurePattern.model_validate(p)
+                for p in raw_patterns[:max_patterns]]
     for p in patterns:
         p.rationale = _bound_closure_text(p.rationale)
-    return bug_class, patterns
+    return bug_class, patterns, returned
 
 
 def _parse_git_grep(output: str) -> list[tuple[str, int, str]]:
@@ -1738,13 +1793,17 @@ async def real_run_gate(gate_path: str = "./.claude/verify.sh") -> str:
 
     No timeout here -- the Orchestrator wraps this via StepRunner.
     """
-    proc = await asyncio.create_subprocess_exec(
-        "bash", gate_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode == 0:
+    # run_subprocess_result (not a bare create_subprocess_exec) so a StepRunner
+    # timeout tears the whole gate process group -- verify.sh often runs an
+    # entire test suite -- down instead of leaking it, which a transparent retry
+    # would then double. run_subprocess can't be used: the gate legitimately
+    # exits non-zero on a failing suite, which run_subprocess would raise on.
+    returncode, stdout, stderr = await run_subprocess_result(
+        ["bash", gate_path])
+    # ok is decided by exit status: exit 0 passes; anything else -- including a
+    # NEGATIVE returncode from a signal-killed gate -- is a failure, never a
+    # silent pass.
+    if returncode == 0:
         return GateResult(
             ok=True, output=stdout.decode(errors="replace")).to_json_str()
     return GateResult(
@@ -1813,12 +1872,10 @@ async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
     # -z: NUL-delimited output. Git allows newlines in filenames, so
     # splitting `ls-files` on '\n' can turn one path into multiple bogus
     # paths -- fine 99% of the time, silently wrong at the edge.
-    listing_bytes_proc = await asyncio.create_subprocess_exec(
-        "git", "ls-files", "-z", "--others", "--exclude-standard",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    listing_bytes, listing_err = await listing_bytes_proc.communicate()
+    # run_subprocess_result (not a bare create_subprocess_exec) so a StepRunner
+    # timeout tears the git process group down instead of leaking it.
+    listing_rc, listing_bytes, listing_err = await run_subprocess_result(
+        ["git", "ls-files", "-z", "--others", "--exclude-standard"])
     # Outcome, not output: check the exit STATUS, don't infer success from a
     # non-empty stdout. On a failing ls-files, listing_bytes is empty,
     # untracked becomes [], and the review diff silently omits EVERY new file
@@ -1826,12 +1883,13 @@ async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
     # adds a whole new file would be invisible to the reviewer) and defeating
     # its skip-markers (silent absence would let a doer bypass review). Failing
     # loudly is mandatory: silently reviewing a diff that drops every new file
-    # is worse than not reviewing. Raise RuntimeError with the trimmed stderr,
-    # matching run_subprocess's contract, so it flows through StepRunner (get_diff
-    # runs under it) into ModelUnavailable("get_diff", ...) -> ESCALATED_NO_SIGNAL.
-    if listing_bytes_proc.returncode != 0:
+    # is worse than not reviewing. ANY non-zero exit raises -- including a
+    # NEGATIVE returncode from signal death -- with the trimmed stderr, matching
+    # run_subprocess's contract, so it flows through StepRunner (get_diff runs
+    # under it) into ModelUnavailable("get_diff", ...) -> ESCALATED_NO_SIGNAL.
+    if listing_rc != 0:
         raise RuntimeError(
-            f"command git ls-files exited {listing_bytes_proc.returncode}: "
+            f"command git ls-files exited {listing_rc}: "
             f"{listing_err.decode(errors='replace')[:500]}"
         )
     untracked = [name.decode(errors="replace")
@@ -1850,24 +1908,25 @@ async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
             continue
         # `git diff --no-index` exits 0 when files are identical and 1 when
         # they differ. We're diffing /dev/null against a non-empty new file,
-        # so it will exit 1 -- capture stdout regardless via a direct
-        # subprocess call (run_subprocess raises on non-zero exit).
-        proc = await asyncio.create_subprocess_exec(
-            "git", "diff", "--no-index", "--", "/dev/null", f,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, diff_err = await proc.communicate()
+        # so it will exit 1 -- capture stdout regardless via
+        # run_subprocess_result (run_subprocess raises on non-zero exit, and a
+        # bare create_subprocess_exec would leak the git process on a StepRunner
+        # timeout).
+        rc, stdout, diff_err = await run_subprocess_result(
+            ["git", "diff", "--no-index", "--", "/dev/null", f])
         # Outcome, not output: 0 (identical) and 1 (differs) are BOTH legitimate
-        # success here -- 1 is the patch we want. Only returncode > 1 is a real
-        # error. Pre-fix, an error was indistinguishable from "no stdout" and
-        # the file's patch was silently dropped. Rather than fail the whole diff
-        # for one unrenderable file, emit a VISIBLE `# skipped:` marker (same
-        # _git_quote_path encoding as the size/binary markers above) so the
-        # omission is surfaced to the reviewer, never silent -- the established
-        # pattern here. This one does NOT raise (unlike ls-files): one bad file
-        # must not lose the entire review diff.
-        if proc.returncode is not None and proc.returncode > 1:
+        # success here -- 1 is the patch we want. ANY other value is a real
+        # error, INCLUDING a NEGATIVE returncode from a signal-killed git. Do
+        # NOT "simplify" this back to `returncode > 1`: signal death is not > 1,
+        # so `> 1` would fall through and parse the killed git's PARTIAL stdout
+        # as a complete patch. Pre-fix, an error was indistinguishable from "no
+        # stdout" and the file's patch was silently dropped. Rather than fail
+        # the whole diff for one unrenderable file, emit a VISIBLE `# skipped:`
+        # marker (same _git_quote_path encoding as the size/binary markers
+        # above) so the omission is surfaced to the reviewer, never silent --
+        # the established pattern here. This one does NOT raise (unlike
+        # ls-files): one bad file must not lose the entire review diff.
+        if rc not in (0, 1):
             parts.append(
                 f"\n# skipped: {_git_quote_path(f)} (diff failed: "
                 f"{diff_err.decode(errors='replace').strip()[:500]})\n")
