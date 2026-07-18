@@ -130,6 +130,13 @@ class ErrorTiebreaker(TiebreakerClient):
 async def gate_pass(): return (True, "all green")
 async def gate_pass_silent(): return (True, "")  # exit 0 but no stdout
 async def gate_fail(): return (False, "")
+# drift-13 gate fixtures. Third tuple element is the exit code; the adapter in
+# make() feeds it through to GateResult so the orchestrator can distinguish a
+# gate that RAN and reported failure (exit 1 -> red) from one that COULD NOT
+# RUN (exit 2 -> no signal) or emitted a garbage code (conservatively red).
+async def gate_env_unusable(): return (False, "verify.sh: uv not found", 2)
+async def gate_red_exit1(): return (False, "1 test failed", 1)
+async def gate_unknown_exit(): return (False, "gate crashed weirdly", 7)
 async def gate_hang():
     await asyncio.sleep(10)  # longer than the tiny test timeout
     return (True, "green")
@@ -154,11 +161,19 @@ async def diff_rename_out_of_sensitive():
 
 
 def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None):
-    # Adapt the test gate fixtures (which return (ok, out)) into the real
-    # orchestrator contract: () -> GateResult.to_json_str().
+    # Adapt the test gate fixtures into the real orchestrator contract:
+    # () -> GateResult.to_json_str(). Fixtures return either (ok, out) -- which
+    # relies on GateResult's default exit_code (0 on pass, 1 on fail) -- or
+    # (ok, out, exit_code) when a test needs to drive a specific exit code
+    # (drift-13: exit 2 = no-signal, other non-zero = red).
     async def run_gate():
-        ok, out = await gate()
-        return GateResult(ok=ok, output=out).to_json_str()
+        res = await gate()
+        if len(res) == 3:
+            ok, out, exit_code = res
+        else:
+            ok, out = res
+            exit_code = None
+        return GateResult(ok=ok, output=out, exit_code=exit_code).to_json_str()
     # Default: no swap -> A=doer, B=reviewer. Deterministic so tests can encode
     # "kimi sides with doer" as sides_with="a" without also asserting on the
     # (real-run) random A/B position.
@@ -988,6 +1003,50 @@ async def main():
     results["invariant_conformant_doer_response_still_passes"] = (
         r.outcome, r.rounds_used)
 
+    # 22. INVARIANT (drift-13): a gate that COULD NOT RUN (exit 2: missing
+    # interpreter / tool / venv) is no signal on correctness -- the same species
+    # as a gate hang -- NOT a red gate. It escalates as ESCALATED_NO_SIGNAL, and
+    # the escalation reason names the gate label AND surfaces the gate's stderr
+    # so the reader sees the missing tool instead of chasing the doer's
+    # (possibly correct) code.
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_env_unusable, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"env-unusable gate (exit 2) must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "initial" in r.escalation_reason, \
+        f"escalation_reason must name the gate label: {r.escalation_reason!r}"
+    assert "uv not found" in r.escalation_reason, \
+        f"escalation_reason must surface the gate stderr: {r.escalation_reason!r}"
+    results["invariant_env_unusable_gate_no_signal"] = (
+        r.outcome, r.rounds_used)
+
+    # 23. INVARIANT (drift-13) regression guard: a gate that RAN and reported
+    # failure (exit 1) is a real correctness failure and still escalates as
+    # ESCALATED_GATE -- the exit-2 carve-out must not swallow honest reds. This
+    # is the load-bearing case for the default exit_code=1 on ok=False.
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_red_exit1, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_GATE, \
+        f"exit-1 red gate must stay ESCALATED_GATE, got {r.outcome}"
+    results["invariant_gate_red_still_escalates_gate"] = (
+        r.outcome, r.rounds_used)
+
+    # 24. INVARIANT (drift-13): an unknown non-zero exit code (garbage, e.g. 7)
+    # falls back conservatively to red. Only the documented exit 2 means
+    # no-signal; anything else the doer must chase, so ESCALATED_GATE.
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_unknown_exit, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_GATE, \
+        f"unknown exit code must fall back to red, got {r.outcome}"
+    results["invariant_unknown_gate_exit_code_treated_as_red"] = (
+        r.outcome, r.rounds_used)
+
     # 21. UNIT: DoerProtocolViolation carries the missing ids and round for the
     # run_feature handler to build the escalation reason from.
     dpv_exc = DoerProtocolViolation({"I2", "I3"}, 2)
@@ -1025,6 +1084,11 @@ async def main():
         "invariant_partial_doer_response_escalates": (
             Outcome.ESCALATED_NO_SIGNAL, 1),
         "invariant_conformant_doer_response_still_passes": (Outcome.PASSED, 1),
+        "invariant_env_unusable_gate_no_signal": (
+            Outcome.ESCALATED_NO_SIGNAL, 0),
+        "invariant_gate_red_still_escalates_gate": (Outcome.ESCALATED_GATE, 0),
+        "invariant_unknown_gate_exit_code_treated_as_red": (
+            Outcome.ESCALATED_GATE, 0),
     }
     ok = True
     for name, got in results.items():

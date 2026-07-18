@@ -349,7 +349,16 @@ class _RunState:
     rounds_used: int = 0
 
 
-class GateResult(NamedTuple):
+class _GateResultBase(NamedTuple):
+    ok: bool
+    output: str
+    # -1 is a sentinel meaning "caller did not pass exit_code"; GateResult's
+    # __new__ resolves it to 0 (ok) or 1 (not ok) before it is ever observed,
+    # so a stored -1 can never escape.
+    exit_code: int = -1
+
+
+class GateResult(_GateResultBase):
     """Result of running the deterministic gate (verify.sh).
 
     A NamedTuple (not a bare (bool, str)) so downstream can't accidentally
@@ -358,20 +367,41 @@ class GateResult(NamedTuple):
     broke silently-green gates (pytest -q, mypy clean) that legitimately
     emit no stdout.
 
+    `exit_code` distinguishes the two structurally different failure signals a
+    gate can emit: exit 1 means the gate RAN and reported failure (red -- real
+    correctness problem), while exit 2 means the gate COULD NOT RUN (missing
+    interpreter/tool/venv) -- no signal on correctness, the same species as a
+    gate hang. When a caller omits it, it defaults to 0 for a passing gate and
+    1 for a failing one, so `GateResult(ok=False, output="...")` keeps behaving
+    as "red" exactly as before this field existed.
+
     Serialized to a JSON string at the callable boundary so StepResult.output
     can stay typed as `str` -- widening it to Any weakened validation on the
     reviewer/tiebreak paths that share the same StepResult contract.
     """
-    ok: bool
-    output: str
+
+    # NamedTuple forbids super()/__class__ inside its methods, so name the base
+    # explicitly rather than super().__new__.
+    def __new__(cls, ok: bool, output: str, exit_code: int | None = None):
+        if exit_code is None:
+            exit_code = 0 if ok else 1
+        return _GateResultBase.__new__(cls, ok, output, exit_code)
 
     def to_json_str(self) -> str:
-        return json.dumps({"ok": self.ok, "output": self.output})
+        return json.dumps(
+            {"ok": self.ok, "output": self.output, "exit_code": self.exit_code})
 
     @classmethod
     def from_json_str(cls, s: str) -> "GateResult":
         d = json.loads(s)
-        return cls(ok=bool(d["ok"]), output=str(d.get("output", "")))
+        ok = bool(d["ok"])
+        # Tolerate the pre-exit_code JSON shape: a stale caller serialising
+        # only {ok, output} maps to the same default a direct constructor
+        # would apply (0 on pass, 1 on fail), preserving red-means-red.
+        exit_code = d.get("exit_code")
+        if exit_code is not None:
+            exit_code = int(exit_code)
+        return cls(ok=ok, output=str(d.get("output", "")), exit_code=exit_code)
 
 
 @dataclass
@@ -624,12 +654,11 @@ class Orchestrator:
         await self._doer_implement(spec, acceptance)
 
         # 2. Gate (correctness is settled by tools, not opinion)
-        passed, detail = await self._gate_or_escalate("initial")
+        passed, detail, exit_code = await self._gate_or_escalate("initial")
         if not passed:
-            reason = "gate could not be made green before review"
-            if detail:
-                reason = f"{reason}: {detail}"
-            return self._escalated(Outcome.ESCALATED_GATE, 0, reason)
+            return self._gate_failure_result(
+                "initial", 0, exit_code, detail,
+                "gate could not be made green before review")
 
         # If debate disabled (e.g. CI) or diff touches human-only paths,
         # stop at the deterministic gate.
@@ -741,13 +770,11 @@ class Orchestrator:
             diff)
 
         # 8. Gate again
-        passed, detail = await self._gate_or_escalate("post-fix")
+        passed, detail, exit_code = await self._gate_or_escalate("post-fix")
         if not passed:
-            reason = "gate failed after applying fixes"
-            if detail:
-                reason = f"{reason}: {detail}"
-            return self._escalated(
-                Outcome.ESCALATED_GATE, state.rounds_used, reason)
+            return self._gate_failure_result(
+                "post-fix", state.rounds_used, exit_code, detail,
+                "gate failed after applying fixes")
 
         # 9. Done
         self._log("passed", rounds=state.rounds_used)
@@ -755,11 +782,14 @@ class Orchestrator:
 
     # --- bounded wrappers around external steps ---
 
-    async def _gate_or_escalate(self, label: str) -> tuple[bool, str]:
-        """Run the gate, return (passed, detail). `detail` is the gate's
-        stdout/stderr on failure (for the escalation reason) or empty on
-        pass. Raises TimeoutEscalation on hangs so the caller doesn't have
-        to distinguish "failed" from "no signal"."""
+    async def _gate_or_escalate(self, label: str) -> tuple[bool, str, int]:
+        """Run the gate, return (passed, detail, exit_code). `detail` is the
+        gate's stdout/stderr on failure (for the escalation reason) or empty
+        on pass. `exit_code` lets the caller distinguish a gate that RAN and
+        reported failure (1 -> red) from one that COULD NOT RUN (2 -> no
+        signal); on a passing gate it is 0. Raises TimeoutEscalation on hangs
+        so the caller doesn't have to distinguish "failed" from "no signal"
+        for the timeout case."""
         res = await self.runner.run(
             f"gate:{label}",
             lambda: self.run_gate(),
@@ -783,9 +813,11 @@ class Orchestrator:
         # misclassified as failures).
         if not res.ok:
             # Gate callable itself errored (not just failed) -- can't judge.
+            # An errored callable is a garbage/unknown signal, so treat it as
+            # red (exit_code 1), the conservative default the doer must chase.
             err = res.error or "gate callable errored"
-            self._log("gate", label=label, passed=False, error=err)
-            return False, err
+            self._log("gate", label=label, passed=False, exit_code=1, error=err)
+            return False, err, 1
         try:
             gate_res = GateResult.from_json_str(res.output)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
@@ -793,13 +825,43 @@ class Orchestrator:
             # -- surface as no-signal, not silent pass. Do NOT crash on the
             # AttributeError that would come from touching .ok on a bare str.
             detail = f"malformed gate response: {e}"
-            self._log("gate", label=label, passed=False, error=detail)
-            return False, detail
-        # Log the actual gate output (stdout on pass, stderr on fail) so the
-        # post-mortem can see WHY a gate failed instead of a generic string.
+            self._log("gate", label=label, passed=False, exit_code=1, error=detail)
+            return False, detail, 1
+        # Log the actual gate output (stdout on pass, stderr on fail) plus the
+        # exit code so the post-mortem can see WHY a gate failed -- and, for
+        # exit 2, that the gate never ran -- instead of a generic string.
         self._log("gate", label=label, passed=gate_res.ok,
-                  output=gate_res.output)
-        return gate_res.ok, gate_res.output if not gate_res.ok else ""
+                  exit_code=gate_res.exit_code, output=gate_res.output)
+        return (gate_res.ok,
+                gate_res.output if not gate_res.ok else "",
+                gate_res.exit_code)
+
+    def _gate_failure_result(self, label: str, rounds: int, exit_code: int,
+                             detail: str, red_reason: str) -> FeatureResult:
+        """Map a non-passing gate to the right escalation, mirroring the gate
+        *timeout* precedent: a gate that COULD NOT RUN is no signal on
+        correctness, not red.
+
+        exit_code 2 -> the gate could not execute (missing interpreter / tool /
+        venv). That is the same species as a gate hang: no signal on
+        correctness. Route it to ESCALATED_NO_SIGNAL and surface the gate's
+        stderr/stdout so the reader sees the missing tool instead of chasing
+        the doer's (possibly correct) code.
+
+        exit_code 1 (real red) OR any other non-zero code -> ESCALATED_GATE.
+        Unknown exit codes are treated conservatively as red: the doer's
+        contract is to make the gate green, so a garbage exit code is the
+        doer's problem to investigate, not a free pass."""
+        if exit_code == 2:
+            reason = (f"gate '{label}' could not run -- no signal on "
+                      f"correctness (environment unusable)")
+            if detail:
+                reason = f"{reason}: {detail}"
+            return self._escalated(Outcome.ESCALATED_NO_SIGNAL, rounds, reason)
+        reason = red_reason
+        if detail:
+            reason = f"{reason}: {detail}"
+        return self._escalated(Outcome.ESCALATED_GATE, rounds, reason)
 
     # --- bounded wrappers around the doer (Claude Code) ---
     # These mirror the reviewer/tiebreaker wrappers: every external call runs
@@ -1190,9 +1252,14 @@ DIFF:
 
 async def real_run_gate(gate_path: str = "./.claude/verify.sh") -> str:
     """Run the project's verification gate. Returns a JSON-serialized
-    GateResult (`{"ok": bool, "output": str}`); `ok` reflects exit code
-    (0 = pass), NOT whether stdout was non-empty -- silently-green gates
-    like `pytest -q` would otherwise be misclassified as failures.
+    GateResult (`{"ok": bool, "output": str, "exit_code": int}`); `ok` reflects
+    exit code (0 = pass), NOT whether stdout was non-empty -- silently-green
+    gates like `pytest -q` would otherwise be misclassified as failures.
+
+    `exit_code` carries the process's real return code so the orchestrator can
+    distinguish a gate that RAN and reported failure (exit 1 -> red) from one
+    that COULD NOT RUN (exit 2 -> no signal, e.g. `uv`/venv/interpreter
+    missing). See GateResult and the verify.sh exit-code convention.
 
     JSON serialization keeps StepResult.output typed as `str` throughout;
     the orchestrator calls `GateResult.from_json_str()` on the other side.
@@ -1207,9 +1274,11 @@ async def real_run_gate(gate_path: str = "./.claude/verify.sh") -> str:
     stdout, stderr = await proc.communicate()
     if proc.returncode == 0:
         return GateResult(
-            ok=True, output=stdout.decode(errors="replace")).to_json_str()
+            ok=True, output=stdout.decode(errors="replace"),
+            exit_code=proc.returncode).to_json_str()
     return GateResult(
-        ok=False, output=stderr.decode(errors="replace")).to_json_str()
+        ok=False, output=stderr.decode(errors="replace"),
+        exit_code=proc.returncode).to_json_str()
 
 
 async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,

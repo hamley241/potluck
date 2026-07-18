@@ -7,6 +7,22 @@
 # (and acceptance criteria) travel with the project's own git repo.
 set -euo pipefail
 
+# Exit-code convention (the loop reads these):
+#   exit 0 -> green: correctness settled, checks passed.
+#   exit 1 -> red:   a check RAN and reported failure (real correctness problem).
+#   exit 2 -> no signal: the gate COULD NOT RUN (missing tool/venv/interpreter).
+#            The orchestrator maps this to ESCALATED_NO_SIGNAL, NOT a red gate,
+#            so a broken environment doesn't get misread as broken code.
+#   other  -> conservatively treated as red.
+#
+# Fail closed on environment problems with exit 2 so a missing tool is
+# distinguishable from a real test failure. Repeat this guard for every tool
+# your checks below depend on (uv, node, pytest, mypy, ...).
+if ! command -v uv >/dev/null 2>&1; then
+  echo "verify.sh: 'uv' not found on PATH — cannot run test suites" >&2
+  exit 2
+fi
+
 # --- Python + TypeScript example (delete what you don't use) ---
 echo "→ python typecheck"; mypy . 2>/dev/null || { echo "mypy failed"; exit 1; }
 echo "→ python tests";     pytest -q

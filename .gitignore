@@ -14,3 +14,6 @@ projects/
 history.jsonl
 __pycache__/
 *.pyc
+# per-run intermediate outputs from potluck fix loops
+.claude/tmp/
+.claude/*.log

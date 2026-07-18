@@ -81,6 +81,15 @@ proves correctness for your stack in it (tests, typecheck, lint, build). A riche
 multi-stack template is at `verify.sh.example` in the repo — copy it and delete
 the lines you don't use.
 
+**Exit-code convention.** The gate distinguishes *code being wrong* from *the gate
+being unable to run*: `0` = green (correctness settled), `1` = red (a check ran and
+reported failure), `2` = **no signal** (the gate could not execute — a missing tool,
+venv, or interpreter), and any other non-zero code is conservatively treated as red.
+Exit `2` routes to `ESCALATED_NO_SIGNAL` rather than a red gate, so a broken
+environment (`uv: command not found`) isn't misread as broken code and every
+debugging effort pointed at the doer. Fail closed with `exit 2` when a required tool
+is absent — see `verify.sh.example` for the guard.
+
 potluck uses the **`personal`** profile by default; select another with
 `--profile ci` (see [Profiles](#profiles)).
 
