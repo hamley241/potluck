@@ -1744,6 +1744,190 @@ async def main():
     assert dirty_err is not None and "allow-dirty" in dirty_err, \
         f"a dirty repo must refuse with an actionable message, got {dirty_err!r}"
 
+    # --- cleanup-breadth fix (round-2): the restore guards must catch ANY
+    # Exception, not just (RuntimeError, OSError). restore_tree is INJECTED, so
+    # the orchestrator cannot assume its exception taxonomy; a ValueError from
+    # it must be handled exactly like a git RuntimeError. BaseException
+    # (CancelledError, KeyboardInterrupt) must still propagate. ---
+
+    class RaisingRestore:
+        """restore_tree stub that raises a GIVEN exception instance at or after
+        the `fail_from` call (1-indexed). Parameterizing the exception lets a
+        test prove the guard's BREADTH: a plain ValueError -- NOT a
+        RuntimeError/OSError -- is still caught, and a BaseException like
+        asyncio.CancelledError is NOT."""
+        def __init__(self, exc, fail_from):
+            self.exc = exc
+            self.fail_from = fail_from
+            self.calls = 0
+        async def __call__(self):
+            self.calls += 1
+            if self.calls >= self.fail_from:
+                raise self.exc
+
+    # 44. INVARIANT (cleanup breadth, post-failure): a post-failure restore that
+    # raises a plain ValueError (NOT RuntimeError/OSError -- outside the old
+    # narrow catch) must not crash and must not mask the original escalation.
+    # Doer errors (per-attempt restore, call 1, succeeds); the post-failure
+    # restore (call 2) raises ValueError. The run must still return the ORIGINAL
+    # ESCALATED_NO_SIGNAL tagged [doer], with a restore_failed event -- pre-fix
+    # this ValueError escaped run_feature and crashed the process.
+    cfg = HarnessConfig()
+    cfg.escalation.retries_before_counting = 0   # exactly one attempt
+    restore = RaisingRestore(
+        ValueError("neither RuntimeError nor OSError"), fail_from=2)
+    orch = make(cfg, ErroringImplementDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")  # must NOT raise
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"a ValueError post-failure restore must preserve the doer escalation, got {r.outcome}"
+    assert r.escalation_reason and "[doer]" in r.escalation_reason, \
+        f"original escalation must win (tagged [doer]): {r.escalation_reason!r}"
+    rf = [e for e in r.debate_log if e["event"] == "restore_failed"]
+    assert rf and rf[0]["reason"] == "implement_error" \
+        and "neither RuntimeError nor OSError" in rf[0]["error"], \
+        f"a ValueError post-failure restore must log restore_failed: {rf!r}"
+
+    # 45. INVARIANT (cleanup breadth, in-attempt): an in-attempt restore that
+    # raises a plain ValueError on the FIRST call escalates ESCALATED_NO_SIGNAL
+    # tagged [restore_tree], no crash. Pre-fix the ValueError escaped the narrow
+    # (RuntimeError, OSError) catch and crashed run_feature.
+    cfg = HarnessConfig()
+    restore = RaisingRestore(
+        ValueError("neither RuntimeError nor OSError"), fail_from=1)
+    orch = make(cfg, StubDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")  # must NOT raise
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"a ValueError in-attempt restore must escalate NO_SIGNAL, got {r.outcome}"
+    assert r.escalation_reason and "[restore_tree]" in r.escalation_reason, \
+        f"in-attempt restore failure must be tagged [restore_tree]: {r.escalation_reason!r}"
+
+    # 46. INVARIANT (cancellation still propagates): asyncio.CancelledError from
+    # restore_tree is a BaseException, NOT an Exception, so it must NOT be
+    # swallowed by either guard -- a cancelled feature or a Ctrl-C must tear down
+    # promptly. This pins the BaseException exclusion so a future refactor cannot
+    # widen `except Exception` to `except BaseException`.
+    cfg = HarnessConfig()
+    restore = RaisingRestore(asyncio.CancelledError(), fail_from=1)
+    orch = make(cfg, StubDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    cancelled_propagated = False
+    try:
+        await orch.run_feature("spec", "acc")
+    except asyncio.CancelledError:
+        cancelled_propagated = True
+    assert cancelled_propagated, \
+        "asyncio.CancelledError from restore_tree must propagate, not be swallowed"
+
+    # 47. INVARIANT (outcome, not output): ensure_clean_tree REFUSES when the
+    # check itself cannot LAUNCH. subprocess.run can raise not just
+    # FileNotFoundError (git absent) but other OSError subclasses at launch --
+    # notably PermissionError (git present but not executable). Pre-fix (catching
+    # only FileNotFoundError) that PermissionError propagated and crashed the
+    # CLI; it must now return the safe-default actionable refusal.
+    import subprocess as _subproc_mod  # noqa: E402
+    _real_run = _subproc_mod.run
+    def _boom_run(*a, **k):
+        raise PermissionError("[Errno 13] Permission denied: 'git'")
+    _subproc_mod.run = _boom_run
+    try:
+        perm_err = ensure_clean_tree(allow_dirty=False)
+    finally:
+        _subproc_mod.run = _real_run
+    assert perm_err is not None and "allow-dirty" in perm_err, \
+        f"a launch PermissionError must refuse with an actionable message, got {perm_err!r}"
+
+    # --- outcome-not-output fix (round-2): real_get_diff's two unchecked
+    # subprocesses now inspect returncode, not just stdout. We force each failure
+    # by monkeypatching create_subprocess_exec in the orchestrator namespace to
+    # override ONLY the target argv and delegate everything else to the real
+    # implementation (so `git diff HEAD` and a healthy ls-files still run). ---
+
+    class _StubProc:
+        def __init__(self, out, err, rc):
+            self._out, self._err, self.returncode = out, err, rc
+        async def communicate(self, input=None):
+            return self._out, self._err
+
+    def _patched_exec(match, out, err, rc):
+        real_exec = asyncio.create_subprocess_exec
+        async def fake(*a, **k):
+            if match(a):
+                return _StubProc(out, err, rc)
+            return await real_exec(*a, **k)
+        return real_exec, fake
+
+    # 48. INVARIANT (outcome, not output): a FAILING `git ls-files` must raise
+    # RuntimeError (with stderr), NOT silently yield a diff with no untracked
+    # files. A silent [] here reopens the exact hole real_get_diff exists to
+    # close (a new file invisible to the reviewer). It escalates via StepRunner
+    # as [get_diff].
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("v1\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp, check=True)
+        (open(f"{tmp}/new_file.py", "w")).write("def X(): pass\n")  # untracked
+        real_exec, fake = _patched_exec(
+            lambda a: len(a) >= 2 and a[0] == "git" and a[1] == "ls-files",
+            b"", b"fatal: ls-files exploded", 2)
+        prev_cwd = os.getcwd()
+        ls_raised = False
+        try:
+            os.chdir(tmp)
+            asyncio.create_subprocess_exec = fake
+            try:
+                await real_get_diff()
+            except RuntimeError as e:
+                ls_raised = "ls-files exploded" in str(e)
+        finally:
+            asyncio.create_subprocess_exec = real_exec
+            os.chdir(prev_cwd)
+    assert ls_raised, \
+        "a failing git ls-files must raise RuntimeError with stderr, not a diff missing untracked files"
+
+    # 49. INVARIANT (outcome, not output): a `git diff --no-index` that exits >1
+    # (a real error, distinct from 0=identical / 1=differs) must NOT silently
+    # drop the file's patch. Instead it emits a VISIBLE `# skipped: <path> (diff
+    # failed: ...)` marker (git-quotePath encoded) and the function still returns
+    # the rest of the diff -- one unrenderable file must not lose the whole
+    # review diff.
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("v1\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("v2 TRACKED_MARKER\n")  # tracked change survives
+        (open(f"{tmp}/new_file.py", "w")).write("def X(): pass\n")  # untracked
+        real_exec, fake = _patched_exec(
+            lambda a: (len(a) >= 3 and a[0] == "git" and a[1] == "diff"
+                       and "--no-index" in a),
+            b"", b"fatal: diff --no-index exploded", 2)
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            asyncio.create_subprocess_exec = fake
+            try:
+                marker_diff = await real_get_diff()
+            finally:
+                asyncio.create_subprocess_exec = real_exec
+        finally:
+            os.chdir(prev_cwd)
+    assert "# skipped: new_file.py (diff failed:" in marker_diff, \
+        f"a diff --no-index error must yield a VISIBLE skip marker: {marker_diff!r}"
+    assert "diff --no-index exploded" in marker_diff, \
+        f"the skip marker must carry the git stderr: {marker_diff!r}"
+    assert "TRACKED_MARKER" in marker_diff, \
+        f"one unrenderable untracked file must not lose the rest of the diff: {marker_diff!r}"
+
     # 35. INVARIANT (Member A): deeply nested MODEL output escalates
     # ESCALATED_NO_SIGNAL instead of crashing. `json.loads` on pathologically
     # nested input raises RecursionError -- which is NOT a ValueError -- so the

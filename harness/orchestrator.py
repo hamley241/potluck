@@ -908,9 +908,24 @@ class Orchestrator:
             # run_feature's existing handler reports ESCALATED_NO_SIGNAL tagged
             # [restore_tree]. (A bare RuntimeError here would be caught by
             # StepRunner and mislabelled ModelUnavailable("doer", ...).)
+            #
+            # CONTRACT: BROAD (precondition guard, not cleanup -- see
+            # _restore_after_failure for the cleanup-path variant), and NOT the
+            # narrow parse-boundary catch. restore_tree is an INJECTED callable -- we
+            # cannot assume any exception taxonomy for it (a ValueError,
+            # AssertionError, or a custom type would escape a narrow
+            # (RuntimeError, OSError) catch, slip past run_feature's handlers,
+            # and crash the process). And every failure of it means the SAME
+            # operational thing here: the baseline could not be established, so
+            # proceeding would run the doer against poisoned state. So catch
+            # Exception. NOT BaseException: asyncio.CancelledError (cancelled
+            # feature) and KeyboardInterrupt (Ctrl-C) MUST keep propagating so
+            # teardown stays prompt. Do NOT "harmonize" this with the narrow
+            # catches at parse boundaries -- they enumerate what untrusted data
+            # raises and crash on a surprise; this one deliberately does not.
             try:
                 await self.restore_tree()
-            except (RuntimeError, OSError) as e:
+            except Exception as e:
                 raise ModelUnavailable(
                     "restore_tree",
                     f"could not restore the working tree before an implement "
@@ -944,17 +959,33 @@ class Orchestrator:
     async def _restore_after_failure(self, reason: str) -> None:
         """Restore the tree after a failed implement step, guarding the restore
         itself so it can never crash the orchestrator or mask the original
-        escalation. On success logs `tree_restored`. On a restore failure
-        (RuntimeError/OSError out of the git reset -- index lock, permissions,
-        mid-rebase) logs `restore_failed` (reason + git error) and RETURNS so
-        the caller re-raises the ORIGINAL TimeoutEscalation/ModelUnavailable
-        that was already about to propagate. The operator must learn both facts:
-        why the run escalated, and that the tree is still dirty. The original,
-        finer-grained signal wins -- consistent with 'a finer-grained signal is
-        never overwritten by a coarser one'."""
+        escalation. On success logs `tree_restored`. On a restore failure (any
+        exception out of the git reset -- index lock, permissions, mid-rebase,
+        or anything an injected restore_tree raises) logs `restore_failed`
+        (reason + error) and RETURNS so the caller re-raises the ORIGINAL
+        TimeoutEscalation/ModelUnavailable that was already about to propagate.
+        The operator must learn both facts: why the run escalated, and that the
+        tree is still dirty. The original, finer-grained signal wins --
+        consistent with 'a finer-grained signal is never overwritten by a
+        coarser one'.
+
+        CONTRACT: BROAD (cleanup on the escalation path), NOT the narrow
+        parse-boundary catch. We are about to deliver a specific, finer-grained
+        escalation; nothing that happens during cleanup may destroy or replace
+        it. restore_tree is an INJECTED callable whose failure taxonomy we
+        cannot enumerate, and "the restore blew up in an unexpected way" changes
+        nothing about why the run escalated -- so a narrow (RuntimeError,
+        OSError) catch here would let a ValueError/AssertionError/custom
+        exception escape, crash run_feature, AND mask the original escalation
+        (the specific harm this guard exists to prevent). So catch Exception.
+        NOT BaseException: asyncio.CancelledError (cancelled feature) and
+        KeyboardInterrupt (Ctrl-C) MUST keep propagating so teardown stays
+        prompt. Do NOT "harmonize" this with the narrow parse-boundary catches
+        -- they guard untrusted data and must crash on a surprise; this one
+        must not."""
         try:
             await self.restore_tree()
-        except (RuntimeError, OSError) as e:
+        except Exception as e:
             self._log("restore_failed", reason=reason, error=str(e))
             return
         self._log("tree_restored", reason=reason)
@@ -1472,7 +1503,22 @@ async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    listing_bytes, _ = await listing_bytes_proc.communicate()
+    listing_bytes, listing_err = await listing_bytes_proc.communicate()
+    # Outcome, not output: check the exit STATUS, don't infer success from a
+    # non-empty stdout. On a failing ls-files, listing_bytes is empty,
+    # untracked becomes [], and the review diff silently omits EVERY new file
+    # -- reopening the exact hole this function exists to close (a doer that
+    # adds a whole new file would be invisible to the reviewer) and defeating
+    # its skip-markers (silent absence would let a doer bypass review). Failing
+    # loudly is mandatory: silently reviewing a diff that drops every new file
+    # is worse than not reviewing. Raise RuntimeError with the trimmed stderr,
+    # matching run_subprocess's contract, so it flows through StepRunner (get_diff
+    # runs under it) into ModelUnavailable("get_diff", ...) -> ESCALATED_NO_SIGNAL.
+    if listing_bytes_proc.returncode != 0:
+        raise RuntimeError(
+            f"command git ls-files exited {listing_bytes_proc.returncode}: "
+            f"{listing_err.decode(errors='replace')[:500]}"
+        )
     untracked = [name.decode(errors="replace")
                  for name in listing_bytes.split(b"\0") if name]
     parts = [tracked] if tracked else []
@@ -1496,7 +1542,21 @@ async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _stderr = await proc.communicate()
+        stdout, diff_err = await proc.communicate()
+        # Outcome, not output: 0 (identical) and 1 (differs) are BOTH legitimate
+        # success here -- 1 is the patch we want. Only returncode > 1 is a real
+        # error. Pre-fix, an error was indistinguishable from "no stdout" and
+        # the file's patch was silently dropped. Rather than fail the whole diff
+        # for one unrenderable file, emit a VISIBLE `# skipped:` marker (same
+        # _git_quote_path encoding as the size/binary markers above) so the
+        # omission is surfaced to the reviewer, never silent -- the established
+        # pattern here. This one does NOT raise (unlike ls-files): one bad file
+        # must not lose the entire review diff.
+        if proc.returncode is not None and proc.returncode > 1:
+            parts.append(
+                f"\n# skipped: {_git_quote_path(f)} (diff failed: "
+                f"{diff_err.decode(errors='replace').strip()[:500]})\n")
+            continue
         if stdout:
             parts.append(stdout.decode(errors="replace"))
     return "".join(parts)

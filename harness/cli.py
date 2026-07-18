@@ -103,12 +103,13 @@ def ensure_clean_tree(allow_dirty: bool = False) -> str | None:
     A dead implement attempt leaves partial edits in the tree; starting from a
     known-clean baseline is what lets restore_tree reset to it safely.
 
-    Safe-default rule: if we cannot PROVE the tree is clean, we refuse. Empty
-    porcelain output is only meaningful when the command actually SUCCEEDED --
-    outside a git repo, with git missing from PATH, or on a permissions error,
-    stdout is empty too and `porcelain.strip()` is falsy, which would silently
-    read as "clean" (worse than a false failure: a failed check that passes).
-    So we check the OUTCOME, not just stdout -- the same lesson the gate learned
+    Safe-default rule: if we cannot PROVE the tree is clean, we refuse. ANY
+    failure to run the check refuses -- empty porcelain output is only
+    meaningful when the command actually SUCCEEDED. Outside a git repo, with
+    git missing from PATH, or when git exists but isn't executable, stdout is
+    empty too and `porcelain.strip()` is falsy, which would silently read as
+    "clean" (worse than a false failure: a failed check that passes). So we
+    check the OUTCOME, not just stdout -- the same lesson the gate learned
     (green comes from exit status, not from empty output). Only an exit-0 status
     with empty porcelain output may return None."""
     if allow_dirty:
@@ -119,9 +120,14 @@ def ensure_clean_tree(allow_dirty: bool = False) -> str | None:
             ["git", "status", "--porcelain"],
             capture_output=True, text=True,
         )
-    except FileNotFoundError:
-        return ("could not verify the working tree: git is not on PATH. "
-                "Install git, or pass --allow-dirty to skip the check.")
+    except OSError as e:
+        # Outcome, not output: a launch failure is NOT a clean tree. OSError is
+        # the parent of both FileNotFoundError (git absent) and PermissionError
+        # (git present but not executable); catching the family keeps the
+        # safe-default refusal the docstring promises instead of letting a
+        # PermissionError crash the CLI.
+        return (f"could not run git: {e}. Install git (or fix its "
+                f"permissions), or pass --allow-dirty to skip the check.")
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
         return (f"could not verify the working tree (git status exited "
