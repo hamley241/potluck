@@ -107,13 +107,15 @@ async def _chatty_child_survives_grace_window() -> bool:
     sentinel = tempfile.NamedTemporaryFile(delete=False)
     sentinel.close()
     # 256 KB is larger than any default pipe buffer, so a handler that flushes
-    # it wedges on write() unless someone is draining the read end.
+    # it wedges on write() unless someone is draining the read end. The handler
+    # records its PID alongside 'clean' so the test can also assert the process
+    # actually exited (drained-and-exited, not drained-but-lingering).
     script = (
-        "import sys, signal, time\n"
+        "import os, sys, signal, time\n"
         "def handler(signum, frame):\n"
         "    sys.stdout.write('x' * (256 * 1024))\n"
         "    sys.stdout.flush()\n"
-        "    open(sys.argv[1], 'w').write('clean')\n"
+        "    open(sys.argv[1], 'w').write('clean ' + str(os.getpid()))\n"
         "    sys.exit(0)\n"
         "signal.signal(signal.SIGTERM, handler)\n"
         "time.sleep(30)\n"
@@ -121,39 +123,62 @@ async def _chatty_child_survives_grace_window() -> bool:
     cmd = [sys.executable, "-c", script, sentinel.name]
 
     try:
-        await asyncio.wait_for(run_subprocess(cmd), timeout=1.0)
-        return False  # it should NOT have completed
-    except asyncio.TimeoutError:
-        pass  # expected -- triggers the SIGTERM+grace teardown
+        try:
+            await asyncio.wait_for(run_subprocess(cmd), timeout=1.0)
+            return False  # it should NOT have completed
+        except asyncio.TimeoutError:
+            pass  # expected -- triggers the SIGTERM+grace teardown
 
-    # Let the handler flush + exit within the grace window and the reap settle.
-    await asyncio.sleep(1.0)
-    return open(sentinel.name).read().strip() == "clean"
+        # Let the handler flush + exit within the grace window and the reap
+        # settle.
+        await asyncio.sleep(1.0)
+        parts = open(sentinel.name).read().strip().split()
+        if len(parts) != 2 or parts[0] != "clean":
+            return False
+        # The child flushed cleanly AND the process is gone -- it exited via the
+        # handler within the grace window rather than being SIGKILLed.
+        return _pid_dead(int(parts[1]))
+    finally:
+        # The sentinel is delete=False (the child, a separate process, writes
+        # it) so we remove it here rather than leaking one tempfile per run.
+        try:
+            os.unlink(sentinel.name)
+        except OSError:
+            pass
 
 
 async def _invalid_utf8_stdout_replaced() -> bool:
     """A backend emitting invalid UTF-8 on stdout must not raise
     UnicodeDecodeError (a ValueError that slips through StepRunner's
-    (RuntimeError, OSError) catch). Strict decode -> errors='replace'."""
+    (RuntimeError, OSError) catch). Strict decode -> errors='replace'.
+
+    Asserts the U+FFFD replacement character actually lands in the returned
+    string: errors='ignore' would silently drop the bad bytes and also not
+    raise, so a bare "isinstance str" check passes under either policy. Pinning
+    U+FFFD is what fails the test if the decode ever regresses to 'ignore'."""
     cmd = [sys.executable, "-c",
            "import sys; sys.stdout.buffer.write(b'\\xff\\xfe'); sys.exit(0)"]
     try:
         out = await run_subprocess(cmd)
     except UnicodeDecodeError:
         return False  # the bug: strict decode crashed the success path
-    return isinstance(out, str)
+    return isinstance(out, str) and "�" in out
 
 
 async def _invalid_utf8_stderr_message_builds() -> bool:
     """Non-zero exit with invalid UTF-8 on stderr: the RuntimeError message
     interpolates stderr, so a strict decode there raises UnicodeDecodeError
-    while building the exception. Must surface as RuntimeError, not decode."""
+    while building the exception. Must surface as RuntimeError, not decode.
+
+    Asserts the U+FFFD replacement character is in the RuntimeError message:
+    errors='ignore' would build the message without raising too, so only
+    pinning U+FFFD distinguishes 'replace' from 'ignore'."""
     cmd = [sys.executable, "-c",
            "import sys; sys.stderr.buffer.write(b'\\xff\\xfe'); sys.exit(1)"]
     try:
         await run_subprocess(cmd)
-    except RuntimeError:
-        return True   # error path reported cleanly
+    except RuntimeError as e:
+        return "�" in str(e)  # error path reported cleanly, bytes replaced
     except UnicodeDecodeError:
         return False  # the bug: message interpolation crashed
     return False      # a non-zero exit must raise SOMETHING

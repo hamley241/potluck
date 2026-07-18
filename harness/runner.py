@@ -215,6 +215,18 @@ async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
                 # discarded: the call is already cancelled, there is no
                 # consumer. The readers are cleaned up on BOTH paths below so
                 # no task leaks past this function.
+                #
+                # Yield the loop once before spawning the drainers.
+                # communicate()'s internal per-stream reader tasks were
+                # cancelled when this coroutine was cancelled, but may not have
+                # unwound yet; StreamReader rejects a concurrent reader with
+                # RuntimeError, which _drain would silently swallow -- leaving
+                # the pipe undrained. A single sleep(0) lets those cancelled
+                # readers finish unwinding and release the streams, making the
+                # drain independent of ready-queue ordering rather than relying
+                # on CPython's FIFO scheduling (an implementation detail, not a
+                # contract).
+                await asyncio.sleep(0)
                 drainers = [
                     asyncio.ensure_future(_drain(stream))
                     for stream in (proc.stdout, proc.stderr)

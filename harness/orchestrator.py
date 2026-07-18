@@ -459,9 +459,16 @@ class RealDoerClient(DoerClient):
         # (RuntimeError, OSError) catch and crash the orchestrator. Raise the
         # same RuntimeError contract run_subprocess uses for CLI failures so
         # it flows through StepRunner -> ModelUnavailable -> ESCALATED_NO_SIGNAL.
+        # ValueError is the exact declared bug class and nothing more: no-JSON
+        # (ValueError from _extract_json), malformed JSON (json.JSONDecodeError)
+        # and schema mismatch (pydantic ValidationError) are ALL ValueError
+        # subclasses. The catch is deliberately narrow: any other exception
+        # type here (TypeError/AttributeError from a refactor of the extractor)
+        # is a harness bug, not a bad model reply, and MUST crash loudly rather
+        # than be mislabelled "malformed response" and buried as no-signal.
         try:
             return DoerResponse.model_validate(_extract_json(raw))
-        except Exception as e:
+        except ValueError as e:
             raise RuntimeError(
                 f"doer returned malformed response: {e}") from e
 
@@ -643,7 +650,24 @@ class Orchestrator:
 
         # If debate disabled (e.g. CI) or diff touches human-only paths,
         # stop at the deterministic gate.
-        diff = await self.get_diff()
+        # get_diff runs under StepRunner like every other external step -- a
+        # hung git (lock contention, huge repo) otherwise stalls the feature
+        # until the coarse feature_seconds budget fires, losing the step-level
+        # signal the design is built on. gate_seconds is the right bound:
+        # get_diff, like the gate, is local deterministic tooling, so it reuses
+        # that knob rather than adding a dead new one. StepRunner returns the
+        # coroutine's value unchanged, so res.output is already the diff str.
+        diff_res = await self.runner.run(
+            "get_diff", lambda: self.get_diff(),
+            self.cfg.timeouts.gate_seconds)
+        if diff_res.timed_out:
+            raise TimeoutEscalation(
+                "get_diff_no_signal",
+                "get_diff hung; cannot assemble the review diff")
+        if not diff_res.ok:
+            raise ModelUnavailable(
+                "get_diff", diff_res.error or "get_diff errored")
+        diff = diff_res.output
         if not self.cfg.debate_enabled:
             self._log("debate_skipped", reason="disabled_by_profile")
             return FeatureResult(Outcome.PASSED, 0, self.log)
@@ -884,10 +908,14 @@ class Orchestrator:
         # propagate as an uncaught traceback -- run_feature's escalation
         # handlers don't know about pydantic. Convert to ModelUnavailable
         # so the outcome is a clean ESCALATED_NO_SIGNAL, same as any other
-        # unusable doer response.
+        # unusable doer response. ValueError covers the whole declared class
+        # and only it: pydantic ValidationError and json.JSONDecodeError both
+        # subclass ValueError. Anything else (a TypeError/AttributeError from a
+        # harness refactor) is a bug, not a bad doer reply, and MUST crash
+        # loudly rather than hide behind the model-quality bucket.
         try:
             return DoerResponse.model_validate_json(res.output)
-        except Exception as e:  # pydantic ValidationError, JSONDecodeError, ...
+        except ValueError as e:  # pydantic ValidationError, JSONDecodeError
             raise ModelUnavailable(
                 "doer", f"doer returned malformed response: {e}") from e
 
@@ -921,12 +949,16 @@ class Orchestrator:
         if not res.ok:
             raise ModelUnavailable("reviewer", res.error or "reviewer call errored")
         # A reviewer answering with prose (no JSON) or a schema mismatch raises
-        # ValueError / pydantic ValidationError, which run_feature does not
-        # catch. Convert to ModelUnavailable so it escalates cleanly, same as
-        # the doer path in _doer_respond_to_review.
+        # ValueError / pydantic ValidationError (a ValueError subclass), which
+        # run_feature does not catch. Convert to ModelUnavailable so it escalates
+        # cleanly, same as the doer path in _doer_respond_to_review. Narrow to
+        # ValueError on purpose: it is exactly the declared bug class (no-JSON,
+        # JSONDecodeError, pydantic ValidationError all subclass it); any other
+        # exception type is a harness bug and MUST crash loudly, not be
+        # mislabelled as a bad reviewer reply.
         try:
             return _parse_verdict(res.output)
-        except Exception as e:
+        except ValueError as e:
             raise ModelUnavailable(
                 "reviewer", f"reviewer returned malformed response: {e}") from e
 
@@ -943,9 +975,12 @@ class Orchestrator:
         if not res.ok:
             raise ModelUnavailable("reviewer", res.error or "reviewer follow-up errored")
         # See _review: malformed reviewer output must escalate, not crash.
+        # ValueError is the entire declared class (JSONDecodeError and pydantic
+        # ValidationError both subclass it) and nothing else -- an unexpected
+        # exception type is a harness bug that MUST crash loudly.
         try:
             return _parse_verdict(res.output)
-        except Exception as e:
+        except ValueError as e:
             raise ModelUnavailable(
                 "reviewer", f"reviewer returned malformed response: {e}") from e
 
@@ -1006,10 +1041,13 @@ class Orchestrator:
                 raise ModelUnavailable("tiebreaker", res.error or "tiebreaker call errored")
             # A malformed tiebreaker response (prose / schema mismatch) escalates
             # the whole run, matching the ERRORED branch above -- NOT the timeout
-            # branch, which merely leaves this issue contested.
+            # branch, which merely leaves this issue contested. ValueError is
+            # exactly the declared bug class (no-JSON, JSONDecodeError, pydantic
+            # ValidationError all subclass it); any other exception type is a
+            # harness bug and MUST crash loudly instead of being buried here.
             try:
                 tb = _parse_tiebreak(res.output)
-            except Exception as e:
+            except ValueError as e:
                 raise ModelUnavailable(
                     "tiebreaker",
                     f"tiebreaker returned malformed response: {e}") from e
@@ -1299,7 +1337,9 @@ async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
     by dropping a large file. A visible marker means the reviewer can see
     something was omitted and ask for it.
 
-    No timeout here -- the Orchestrator wraps this via StepRunner.
+    No timeout here -- the Orchestrator runs this under StepRunner with the
+    gate_seconds bound (get_diff is local deterministic tooling, same class as
+    the gate), so a hung git surfaces as a step-level timeout escalation.
     """
     tracked = await run_subprocess(["git", "diff", "HEAD"])
     # -z: NUL-delimited output. Git allows newlines in filenames, so
@@ -1347,6 +1387,12 @@ def bound_get_diff(diff_cfg: DiffConfig):
     async def _get_diff() -> str:
         return await real_get_diff(
             diff_cfg.max_untracked_bytes, diff_cfg.binary_probe_bytes)
+    # Expose the bound config on the returned callable so a test can verify
+    # production wiring introspectably -- reverting cli to pass bare
+    # real_get_diff (whose defaults shadow the config) would otherwise leave
+    # the suite green. Asserting `orch.get_diff.diff_cfg is cfg.diff` pins that
+    # the config-bearing callable is the one that reached the Orchestrator.
+    _get_diff.diff_cfg = diff_cfg
     return _get_diff
 
 

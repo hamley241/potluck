@@ -216,7 +216,7 @@ class HarnessConfig:
                 ))
 
     def _apply_env(self) -> None:
-        # A couple of high-value env overrides for CI.
+        # One high-value env override for CI: HARNESS_NO_DEBATE.
         if os.environ.get("HARNESS_NO_DEBATE") == "1":
             self.debate_enabled = False
 
