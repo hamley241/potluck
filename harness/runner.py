@@ -44,9 +44,14 @@ class ModelUnavailable(Exception):
     exits non-zero -- but the same applies to the deterministic gate callable
     (verify.sh missing, an OSError/RuntimeError out of run_gate, or a
     malformed GateResult): an errored gate produced NO verdict about the code.
+    It also covers the restore_tree callable: if the working tree cannot be
+    reset to the pre-implement baseline before an attempt (git index lock,
+    permissions, mid-rebase), the attempt would run against poisoned state, so
+    that too is *no signal* and escalates -- tagged role "restore_tree" so the
+    operator debugs git, not the model.
     Like a timeout, all of these are *no signal*, never a verdict: we escalate
-    rather than treat an errored reviewer as approval or an errored gate as a
-    gate failure."""
+    rather than treat an errored reviewer as approval, an errored gate as a
+    gate failure, or an un-restorable tree as a clean baseline."""
 
     def __init__(self, role: str, detail: str):
         self.role = role

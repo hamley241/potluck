@@ -1625,6 +1625,125 @@ async def main():
     assert untracked_gone, \
         "real_restore_tree must remove untracked files"
 
+    # --- restore-boundary fix (follow-up to tree-hygiene) ---
+
+    class FailOnCallRestore:
+        """restore_tree stub that succeeds on the per-attempt call(s) and raises
+        RuntimeError from the post-failure call, so a test can drive the
+        _restore_after_failure guard without tripping the in-attempt path.
+        Raises on every call at or after `fail_from` (1-indexed), mimicking a
+        `git reset` that hit an index.lock collision."""
+        def __init__(self, fail_from):
+            self.calls = 0
+            self.fail_from = fail_from
+        async def __call__(self):
+            self.calls += 1
+            if self.calls >= self.fail_from:
+                raise RuntimeError(
+                    "fatal: Unable to create '.git/index.lock': File exists")
+
+    # 40. INVARIANT (Member A): a post-failure restore that ITSELF fails must not
+    # crash and must not mask the original escalation. Doer errors (per-attempt
+    # restore, call 1, succeeds; doer raises); the post-failure restore (call 2)
+    # raises RuntimeError. The run must still return a FeatureResult with the
+    # ORIGINAL outcome (ESCALATED_NO_SIGNAL from the doer error, reason tagged
+    # [doer]), and the debate log must carry a restore_failed event with the git
+    # error. It must NOT raise out of run_feature.
+    cfg = HarnessConfig()
+    cfg.escalation.retries_before_counting = 0   # exactly one attempt
+    restore = FailOnCallRestore(fail_from=2)     # post-failure call fails
+    orch = make(cfg, ErroringImplementDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"failing post-failure restore must preserve the doer escalation, got {r.outcome}"
+    assert r.escalation_reason and "[doer]" in r.escalation_reason, \
+        f"original escalation must win (tagged [doer]): {r.escalation_reason!r}"
+    rf = [e for e in r.debate_log if e["event"] == "restore_failed"]
+    assert rf and rf[0]["reason"] == "implement_error" \
+        and "index.lock" in rf[0]["error"], \
+        f"a failed post-failure restore must log restore_failed(git error): {rf!r}"
+    assert not any(e["event"] == "tree_restored" for e in r.debate_log), \
+        "a FAILED restore must not also log tree_restored"
+
+    # 41. INVARIANT (Member A): timeout variant of #40. Doer times out (one
+    # attempt), the post-failure restore raises -> ESCALATED_TIMEOUT preserved,
+    # restore_failed logged, no crash.
+    class SleepingImplementDoer(StubDoer):
+        async def implement(self, spec, acceptance):
+            await asyncio.sleep(30)  # exceeds the positive step timeout below
+            return "never"
+    cfg = HarnessConfig()
+    cfg.timeouts.model_call_seconds = 1          # positive: factory runs
+    cfg.escalation.retries_before_counting = 0   # exactly one attempt
+    cfg.escalation.consecutive_same_step_threshold = 5  # don't escalate early
+    cfg.escalation.timeout_count_threshold = 5
+    restore = FailOnCallRestore(fail_from=2)     # post-failure call fails
+    orch = make(cfg, SleepingImplementDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_TIMEOUT, \
+        f"failing post-failure restore must preserve the timeout escalation, got {r.outcome}"
+    rf = [e for e in r.debate_log if e["event"] == "restore_failed"]
+    assert rf and rf[0]["reason"] == "implement_timeout" \
+        and "index.lock" in rf[0]["error"], \
+        f"a failed post-failure restore must log restore_failed on timeout: {rf!r}"
+
+    # 42. INVARIANT (Member A/Kimi): an IN-ATTEMPT restore failure attributes to
+    # restore_tree, NOT the doer. The restore raises on the FIRST call (before
+    # any implement attempt), so the doer never runs. Outcome is
+    # ESCALATED_NO_SIGNAL tagged [restore_tree] -- blaming the doer for a git
+    # failure would send the operator to debug the wrong component.
+    cfg = HarnessConfig()
+    restore = FailOnCallRestore(fail_from=1)     # per-attempt call fails
+    orch = make(cfg, StubDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"in-attempt restore failure must escalate NO_SIGNAL, got {r.outcome}"
+    assert r.escalation_reason and "[restore_tree]" in r.escalation_reason, \
+        f"in-attempt restore failure must be tagged [restore_tree]: {r.escalation_reason!r}"
+    assert "[doer]" not in r.escalation_reason, \
+        f"a restore failure must never be blamed on the doer: {r.escalation_reason!r}"
+
+    # 43. INVARIANT (Member B): the clean-tree precondition REFUSES when the
+    # check itself cannot prove the tree is clean. In a non-repo directory git
+    # status exits non-zero with empty stdout; the old code read that empty
+    # stdout as "clean" and silently passed. It must now return an actionable
+    # message. Companion cases pin that the refusal is about PROVABILITY: a clean
+    # repo returns None, a dirty one returns a message.
+    with tempfile.TemporaryDirectory() as tmp:  # non-repo: refuse
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            non_repo_err = ensure_clean_tree(allow_dirty=False)
+        finally:
+            os.chdir(prev_cwd)
+    assert non_repo_err is not None, \
+        "a non-repo (failed git status) must refuse, not silently pass"
+    with tempfile.TemporaryDirectory() as tmp:  # clean repo: pass
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=tmp, check=True)
+        (open(f"{tmp}/f.txt", "w")).write("v1\n")
+        subprocess.run(["git", "add", "f.txt"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp, check=True)
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            clean_err = ensure_clean_tree(allow_dirty=False)
+            (open(f"{tmp}/f.txt", "w")).write("v2 DIRTY\n")  # now dirty
+            dirty_err = ensure_clean_tree(allow_dirty=False)
+        finally:
+            os.chdir(prev_cwd)
+    assert clean_err is None, \
+        f"a clean repo must pass the precondition, got {clean_err!r}"
+    assert dirty_err is not None and "allow-dirty" in dirty_err, \
+        f"a dirty repo must refuse with an actionable message, got {dirty_err!r}"
+
     # 35. INVARIANT (Member A): deeply nested MODEL output escalates
     # ESCALATED_NO_SIGNAL instead of crashing. `json.loads` on pathologically
     # nested input raises RecursionError -- which is NOT a ValueError -- so the

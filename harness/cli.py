@@ -101,15 +101,33 @@ def ensure_clean_tree(allow_dirty: bool = False) -> str | None:
     precondition is testable without driving the whole CLI.
 
     A dead implement attempt leaves partial edits in the tree; starting from a
-    known-clean baseline is what lets restore_tree reset to it safely."""
+    known-clean baseline is what lets restore_tree reset to it safely.
+
+    Safe-default rule: if we cannot PROVE the tree is clean, we refuse. Empty
+    porcelain output is only meaningful when the command actually SUCCEEDED --
+    outside a git repo, with git missing from PATH, or on a permissions error,
+    stdout is empty too and `porcelain.strip()` is falsy, which would silently
+    read as "clean" (worse than a false failure: a failed check that passes).
+    So we check the OUTCOME, not just stdout -- the same lesson the gate learned
+    (green comes from exit status, not from empty output). Only an exit-0 status
+    with empty porcelain output may return None."""
     if allow_dirty:
         return None
     import subprocess
-    porcelain = subprocess.run(
-        ["git", "status", "--porcelain"],
-        capture_output=True, text=True,
-    ).stdout
-    if porcelain.strip():
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return ("could not verify the working tree: git is not on PATH. "
+                "Install git, or pass --allow-dirty to skip the check.")
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        return (f"could not verify the working tree (git status exited "
+                f"{proc.returncode}): {stderr[:200]}. Run potluck inside a git "
+                f"repository, or pass --allow-dirty to skip the check.")
+    if proc.stdout.strip():
         return ("working tree is not clean. Commit, stash, or pass "
                 "--allow-dirty to run against the current tree.")
     return None

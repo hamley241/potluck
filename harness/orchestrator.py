@@ -892,7 +892,23 @@ class Orchestrator:
         # retry it discards the dead prior attempt's half-edited tree so the
         # retry doesn't run against poisoned state.
         async def _attempt() -> str:
-            await self.restore_tree()
+            # An in-attempt restore failure attributes to the RESTORE, not the
+            # doer: if we cannot establish the pre-implement baseline, the
+            # attempt would run against poisoned state -- the exact failure this
+            # feature exists to prevent -- so escalate rather than proceed, and
+            # name restore_tree so the operator debugs git, not the model.
+            # ModelUnavailable is neither RuntimeError nor OSError, so it passes
+            # through StepRunner's (RuntimeError, OSError) catch untouched and
+            # run_feature's existing handler reports ESCALATED_NO_SIGNAL tagged
+            # [restore_tree]. (A bare RuntimeError here would be caught by
+            # StepRunner and mislabelled ModelUnavailable("doer", ...).)
+            try:
+                await self.restore_tree()
+            except (RuntimeError, OSError) as e:
+                raise ModelUnavailable(
+                    "restore_tree",
+                    f"could not restore the working tree before an implement "
+                    f"attempt: {e}") from e
             return await self.doer.implement(spec, acceptance)
 
         res = await self.runner.run(
@@ -905,18 +921,37 @@ class Orchestrator:
         # edits don't poison the tree for the operator or the next run, and log
         # that the partial work was discarded. This runs ONLY on the implement
         # step's own failure -- never after implement has succeeded, where the
-        # gate/debate pipeline owns the diff.
+        # gate/debate pipeline owns the diff. _restore_after_failure never
+        # raises: if the restore itself fails it logs restore_failed and returns
+        # so the ORIGINAL escalation below still propagates (a restore failure
+        # must never mask why the run escalated).
         if res.timed_out:
-            await self.restore_tree()
-            self._log("tree_restored", reason="implement_timeout")
+            await self._restore_after_failure("implement_timeout")
             raise TimeoutEscalation("doer_no_signal",
                                     "doer timed out during implement")
         if not res.ok:
-            await self.restore_tree()
-            self._log("tree_restored", reason="implement_error")
+            await self._restore_after_failure("implement_error")
             raise ModelUnavailable(
                 "doer", res.error or "doer implement errored")
         return res.output
+
+    async def _restore_after_failure(self, reason: str) -> None:
+        """Restore the tree after a failed implement step, guarding the restore
+        itself so it can never crash the orchestrator or mask the original
+        escalation. On success logs `tree_restored`. On a restore failure
+        (RuntimeError/OSError out of the git reset -- index lock, permissions,
+        mid-rebase) logs `restore_failed` (reason + git error) and RETURNS so
+        the caller re-raises the ORIGINAL TimeoutEscalation/ModelUnavailable
+        that was already about to propagate. The operator must learn both facts:
+        why the run escalated, and that the tree is still dirty. The original,
+        finer-grained signal wins -- consistent with 'a finer-grained signal is
+        never overwritten by a coarser one'."""
+        try:
+            await self.restore_tree()
+        except (RuntimeError, OSError) as e:
+            self._log("restore_failed", reason=reason, error=str(e))
+            return
+        self._log("tree_restored", reason=reason)
 
     async def _doer_respond_to_review(self, spec: str, acceptance: str,
                                       diff: str,
@@ -1367,11 +1402,28 @@ async def real_restore_tree() -> None:
     clean tree (guaranteed by cli's clean-tree precondition), so
     `git reset --hard` + `git clean -fd` restores it exactly.
 
-    No timeout of its own -- like real_run_gate/real_get_diff this is local
-    deterministic git tooling. It runs inside the implement step's StepRunner
-    context, but only at points where that step has already resolved (before an
-    attempt, or after a failure verdict), so it is left unbounded like the
-    pre-existing local git calls above rather than getting a bound of its own.
+    Two call sites, distinct in timing:
+      * Per-attempt hook, INSIDE the bounded implement step -- runs before every
+        implement attempt (StepRunner re-invokes the factory fresh on each
+        retry) so a retry starts from the baseline. Because it runs inside the
+        step, it CONSUMES part of that attempt's model_call_seconds budget.
+      * Post-failure -- after the implement step has already resolved to a
+        failure (timeout/error) and the escalation is about to propagate, to
+        discard the dead attempt's half-edited tree.
+    Neither has a timeout of its own: like real_run_gate/real_get_diff this is
+    local deterministic git tooling. The per-attempt call shares its step's
+    bound; the post-failure call runs after the step resolved -- so it is left
+    unbounded like the pre-existing local git calls above.
+
+    Ignored-file boundary (INTENTIONAL, not a gap): hygiene covers tracked
+    changes and non-ignored untracked files only. `git status --porcelain` (the
+    precondition) omits ignored paths and `git clean -fd` preserves them, so the
+    precondition and the restore are consistent with each other. `-x` is
+    deliberately NOT used here: it would delete `.venv`, `node_modules`, and
+    `.env` -- destroying local environments and secrets, a far worse data-loss
+    footgun than the hole it closes. Ignored paths are already excluded from the
+    review diff by design (`git ls-files --others --exclude-standard`), so they
+    are out of scope for hygiene too.
     """
     await run_subprocess(["git", "reset", "--hard", "--quiet"])
     await run_subprocess(["git", "clean", "-fd", "--quiet"])
