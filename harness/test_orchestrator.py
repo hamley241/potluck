@@ -1482,6 +1482,45 @@ async def main():
     assert r.escalation_reason and "[reviewer]" in r.escalation_reason, \
         f"escalation_reason must be tagged [reviewer]: {r.escalation_reason!r}"
 
+    # 36. INVARIANT (Member A, class closure): a gate callable returning
+    # nested-to-death JSON escalates ESCALATED_NO_SIGNAL "[gate]" instead of
+    # crashing. GateResult.from_json_str calls json.loads, which raises
+    # RecursionError on pathologically nested input -- NOT a ValueError -- so
+    # before the tuple was widened this escaped run_feature and crashed the
+    # harness. We drive the REAL deep-input path (a gate callable actually
+    # returning `'['*N + ']'*N`), not a monkeypatch, so this pins the actual
+    # failure mode at the GateResult parse boundary.
+    cfg = HarnessConfig()
+    async def gate_deep_nested():
+        return "[" * 200000 + "]" * 200000
+    orch = Orchestrator(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                        None, gate_deep_nested, diff_plain,
+                        ab_swap=lambda _id: False)
+    crashed = None
+    try:
+        r = await orch.run_feature("spec", "acc")
+    except BaseException as e:  # must NOT raise
+        crashed = e
+    assert crashed is None, \
+        f"nested-to-death gate output must not crash the harness, got {crashed!r}"
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"nested-to-death gate output must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[gate]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [gate]: {r.escalation_reason!r}"
+
+    # 37. INVARIANT (Member B, class closure): _extract_codex_message skips a
+    # nested-to-death JSONL line instead of crashing. A pathologically nested
+    # line raises RecursionError inside json.loads; the per-line except now
+    # includes RecursionError so the line is skipped like any other unparseable
+    # line (continue semantics unchanged) and a LATER valid item.completed line
+    # still wins (last-wins). Called directly to pin the extractor boundary.
+    nested_line = "[" * 200000 + "]" * 200000
+    valid_line = json.dumps(
+        {"type": "item.completed", "item": {"text": "the real answer"}})
+    extracted = _orch_mod._extract_codex_message(nested_line + "\n" + valid_line)
+    assert extracted == "the real answer", \
+        f"nested-to-death line must be skipped and later valid line win, got {extracted!r}"
+
     # report
     expected = {
         "early_exit": (Outcome.PASSED, 0),
