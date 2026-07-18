@@ -537,6 +537,14 @@ class TiebreakerClient:
             _tiebreak_prompt(spec, acceptance, diff, issue_id, arg_a, arg_b))
 
 
+async def _noop_restore_tree() -> None:
+    """Default restore_tree: does nothing, logs nothing. Used by existing
+    constructions/tests that wire no tree hygiene, and by cli when
+    --allow-dirty is set (we cannot safely reset a tree whose baseline we
+    don't own)."""
+    return None
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -546,6 +554,7 @@ class Orchestrator:
         tiebreaker: TiebreakerClient | None,
         run_gate,             # async callable -> GateResult.to_json_str()
         get_diff,             # async callable -> str
+        restore_tree=None,    # async callable () -> None; restores pre-implement tree
         ab_swap: Callable[[str], bool] | None = None,
     ):
         self.cfg = config
@@ -554,6 +563,12 @@ class Orchestrator:
         self.tiebreaker = tiebreaker
         self.run_gate = run_gate
         self.get_diff = get_diff
+        # restore_tree resets the working tree to the pre-implement baseline.
+        # Defaults to a no-op so every existing construction/test keeps working
+        # unchanged; cli wires the real git reset (or a no-op under
+        # --allow-dirty). Only implement attempts use it -- once the gate/debate
+        # pipeline owns the diff, an escalation must leave the tree intact.
+        self.restore_tree = restore_tree or _noop_restore_tree
         self.runner = StepRunner(config)
         # ab_swap decides per issue_id whether to place the reviewer's argument
         # in slot A (True) or the doer's (False). Randomized by default so a
@@ -876,18 +891,104 @@ class Orchestrator:
     # making the doer the only unbounded path in the loop.
 
     async def _doer_implement(self, spec: str, acceptance: str) -> str:
+        # Per-attempt hook: StepRunner re-invokes this factory fresh on each
+        # retry, so every implement attempt starts from the pre-implement
+        # baseline. On the first attempt the tree is already clean (guaranteed
+        # by cli's clean-tree precondition), so the restore is a no-op; on a
+        # retry it discards the dead prior attempt's half-edited tree so the
+        # retry doesn't run against poisoned state.
+        async def _attempt() -> str:
+            # An in-attempt restore failure attributes to the RESTORE, not the
+            # doer: if we cannot establish the pre-implement baseline, the
+            # attempt would run against poisoned state -- the exact failure this
+            # feature exists to prevent -- so escalate rather than proceed, and
+            # name restore_tree so the operator debugs git, not the model.
+            # ModelUnavailable is neither RuntimeError nor OSError, so it passes
+            # through StepRunner's (RuntimeError, OSError) catch untouched and
+            # run_feature's existing handler reports ESCALATED_NO_SIGNAL tagged
+            # [restore_tree]. (A bare RuntimeError here would be caught by
+            # StepRunner and mislabelled ModelUnavailable("doer", ...).)
+            #
+            # CONTRACT: BROAD (precondition guard, not cleanup -- see
+            # _restore_after_failure for the cleanup-path variant), and NOT the
+            # narrow parse-boundary catch. restore_tree is an INJECTED callable -- we
+            # cannot assume any exception taxonomy for it (a ValueError,
+            # AssertionError, or a custom type would escape a narrow
+            # (RuntimeError, OSError) catch, slip past run_feature's handlers,
+            # and crash the process). And every failure of it means the SAME
+            # operational thing here: the baseline could not be established, so
+            # proceeding would run the doer against poisoned state. So catch
+            # Exception. NOT BaseException: asyncio.CancelledError (cancelled
+            # feature) and KeyboardInterrupt (Ctrl-C) MUST keep propagating so
+            # teardown stays prompt. Do NOT "harmonize" this with the narrow
+            # catches at parse boundaries -- they enumerate what untrusted data
+            # raises and crash on a surprise; this one deliberately does not.
+            try:
+                await self.restore_tree()
+            except Exception as e:
+                raise ModelUnavailable(
+                    "restore_tree",
+                    f"could not restore the working tree before an implement "
+                    f"attempt: {e}") from e
+            return await self.doer.implement(spec, acceptance)
+
         res = await self.runner.run(
             "doer:implement",
-            lambda: self.doer.implement(spec, acceptance),
+            _attempt,
             self.cfg.timeouts.model_call_seconds,
         )
+        # On failure the implement step is fully resolved and the escalation is
+        # about to propagate; restore the baseline so a partial/dead attempt's
+        # edits don't poison the tree for the operator or the next run, and log
+        # that the partial work was discarded. This runs ONLY on the implement
+        # step's own failure -- never after implement has succeeded, where the
+        # gate/debate pipeline owns the diff. _restore_after_failure never
+        # raises: if the restore itself fails it logs restore_failed and returns
+        # so the ORIGINAL escalation below still propagates (a restore failure
+        # must never mask why the run escalated).
         if res.timed_out:
+            await self._restore_after_failure("implement_timeout")
             raise TimeoutEscalation("doer_no_signal",
                                     "doer timed out during implement")
         if not res.ok:
+            await self._restore_after_failure("implement_error")
             raise ModelUnavailable(
                 "doer", res.error or "doer implement errored")
         return res.output
+
+    async def _restore_after_failure(self, reason: str) -> None:
+        """Restore the tree after a failed implement step, guarding the restore
+        itself so it can never crash the orchestrator or mask the original
+        escalation. On success logs `tree_restored`. On a restore failure (any
+        exception out of the git reset -- index lock, permissions, mid-rebase,
+        or anything an injected restore_tree raises) logs `restore_failed`
+        (reason + error) and RETURNS so the caller re-raises the ORIGINAL
+        TimeoutEscalation/ModelUnavailable that was already about to propagate.
+        The operator must learn both facts: why the run escalated, and that the
+        tree is still dirty. The original, finer-grained signal wins --
+        consistent with 'a finer-grained signal is never overwritten by a
+        coarser one'.
+
+        CONTRACT: BROAD (cleanup on the escalation path), NOT the narrow
+        parse-boundary catch. We are about to deliver a specific, finer-grained
+        escalation; nothing that happens during cleanup may destroy or replace
+        it. restore_tree is an INJECTED callable whose failure taxonomy we
+        cannot enumerate, and "the restore blew up in an unexpected way" changes
+        nothing about why the run escalated -- so a narrow (RuntimeError,
+        OSError) catch here would let a ValueError/AssertionError/custom
+        exception escape, crash run_feature, AND mask the original escalation
+        (the specific harm this guard exists to prevent). So catch Exception.
+        NOT BaseException: asyncio.CancelledError (cancelled feature) and
+        KeyboardInterrupt (Ctrl-C) MUST keep propagating so teardown stays
+        prompt. Do NOT "harmonize" this with the narrow parse-boundary catches
+        -- they guard untrusted data and must crash on a surprise; this one
+        must not."""
+        try:
+            await self.restore_tree()
+        except Exception as e:
+            self._log("restore_failed", reason=reason, error=str(e))
+            return
+        self._log("tree_restored", reason=reason)
 
     async def _doer_respond_to_review(self, spec: str, acceptance: str,
                                       diff: str,
@@ -1335,6 +1436,39 @@ async def real_run_gate(gate_path: str = "./.claude/verify.sh") -> str:
         ok=False, output=stderr.decode(errors="replace")).to_json_str()
 
 
+async def real_restore_tree() -> None:
+    """Restore the working tree to the pre-implement baseline: discard all
+    tracked changes and remove untracked files. The baseline is HEAD with a
+    clean tree (guaranteed by cli's clean-tree precondition), so
+    `git reset --hard` + `git clean -fd` restores it exactly.
+
+    Two call sites, distinct in timing:
+      * Per-attempt hook, INSIDE the bounded implement step -- runs before every
+        implement attempt (StepRunner re-invokes the factory fresh on each
+        retry) so a retry starts from the baseline. Because it runs inside the
+        step, it CONSUMES part of that attempt's model_call_seconds budget.
+      * Post-failure -- after the implement step has already resolved to a
+        failure (timeout/error) and the escalation is about to propagate, to
+        discard the dead attempt's half-edited tree.
+    Neither has a timeout of its own: like real_run_gate/real_get_diff this is
+    local deterministic git tooling. The per-attempt call shares its step's
+    bound; the post-failure call runs after the step resolved -- so it is left
+    unbounded like the pre-existing local git calls above.
+
+    Ignored-file boundary (INTENTIONAL, not a gap): hygiene covers tracked
+    changes and non-ignored untracked files only. `git status --porcelain` (the
+    precondition) omits ignored paths and `git clean -fd` preserves them, so the
+    precondition and the restore are consistent with each other. `-x` is
+    deliberately NOT used here: it would delete `.venv`, `node_modules`, and
+    `.env` -- destroying local environments and secrets, a far worse data-loss
+    footgun than the hole it closes. Ignored paths are already excluded from the
+    review diff by design (`git ls-files --others --exclude-standard`), so they
+    are out of scope for hygiene too.
+    """
+    await run_subprocess(["git", "reset", "--hard", "--quiet"])
+    await run_subprocess(["git", "clean", "-fd", "--quiet"])
+
+
 async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
                         binary_probe_bytes: int = 8 * 1024) -> str:
     """Return the current change set for review: tracked changes vs HEAD, plus
@@ -1369,7 +1503,22 @@ async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    listing_bytes, _ = await listing_bytes_proc.communicate()
+    listing_bytes, listing_err = await listing_bytes_proc.communicate()
+    # Outcome, not output: check the exit STATUS, don't infer success from a
+    # non-empty stdout. On a failing ls-files, listing_bytes is empty,
+    # untracked becomes [], and the review diff silently omits EVERY new file
+    # -- reopening the exact hole this function exists to close (a doer that
+    # adds a whole new file would be invisible to the reviewer) and defeating
+    # its skip-markers (silent absence would let a doer bypass review). Failing
+    # loudly is mandatory: silently reviewing a diff that drops every new file
+    # is worse than not reviewing. Raise RuntimeError with the trimmed stderr,
+    # matching run_subprocess's contract, so it flows through StepRunner (get_diff
+    # runs under it) into ModelUnavailable("get_diff", ...) -> ESCALATED_NO_SIGNAL.
+    if listing_bytes_proc.returncode != 0:
+        raise RuntimeError(
+            f"command git ls-files exited {listing_bytes_proc.returncode}: "
+            f"{listing_err.decode(errors='replace')[:500]}"
+        )
     untracked = [name.decode(errors="replace")
                  for name in listing_bytes.split(b"\0") if name]
     parts = [tracked] if tracked else []
@@ -1393,7 +1542,21 @@ async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _stderr = await proc.communicate()
+        stdout, diff_err = await proc.communicate()
+        # Outcome, not output: 0 (identical) and 1 (differs) are BOTH legitimate
+        # success here -- 1 is the patch we want. Only returncode > 1 is a real
+        # error. Pre-fix, an error was indistinguishable from "no stdout" and
+        # the file's patch was silently dropped. Rather than fail the whole diff
+        # for one unrenderable file, emit a VISIBLE `# skipped:` marker (same
+        # _git_quote_path encoding as the size/binary markers above) so the
+        # omission is surfaced to the reviewer, never silent -- the established
+        # pattern here. This one does NOT raise (unlike ls-files): one bad file
+        # must not lose the entire review diff.
+        if proc.returncode is not None and proc.returncode > 1:
+            parts.append(
+                f"\n# skipped: {_git_quote_path(f)} (diff failed: "
+                f"{diff_err.decode(errors='replace').strip()[:500]})\n")
+            continue
         if stdout:
             parts.append(stdout.decode(errors="replace"))
     return "".join(parts)
