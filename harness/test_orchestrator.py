@@ -168,7 +168,7 @@ async def diff_rename_out_of_sensitive():
             "rename to src/util/legacy.py\n")
 
 
-def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None):
+def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None, restore_tree=None):
     # Adapt the test gate fixtures (which return (ok, out)) into the real
     # orchestrator contract: () -> GateResult.to_json_str().
     async def run_gate():
@@ -176,9 +176,23 @@ def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None):
         return GateResult(ok=ok, output=out).to_json_str()
     # Default: no swap -> A=doer, B=reviewer. Deterministic so tests can encode
     # "kimi sides with doer" as sides_with="a" without also asserting on the
-    # (real-run) random A/B position.
+    # (real-run) random A/B position. restore_tree defaults to None -> the
+    # Orchestrator's no-op, keeping every existing construction unchanged.
     return Orchestrator(cfg, doer, reviewer, tb, run_gate, diff,
+                        restore_tree=restore_tree,
                         ab_swap=ab_swap or (lambda _id: False))
+
+
+class RecordingRestore:
+    """Records each restore_tree() call and the interleaving with doer attempts
+    via a shared `order` list, so tests can assert the per-attempt hook fired
+    before every implement attempt."""
+    def __init__(self, order=None):
+        self.calls = 0
+        self.order = order if order is not None else []
+    async def __call__(self):
+        self.calls += 1
+        self.order.append("restore")
 
 
 async def main():
@@ -1455,11 +1469,161 @@ async def main():
     # its bound DiffConfig introspectably. Reverting cli to pass bare
     # real_get_diff (defaults shadowing the config) would fail this: the wired
     # callable's diff_cfg must be the very cfg.diff object.
-    from harness.cli import build_orchestrator  # noqa: E402
+    from harness.cli import build_orchestrator, ensure_clean_tree  # noqa: E402
+    from harness.orchestrator import (  # noqa: E402
+        real_restore_tree, _noop_restore_tree)
     cfg = HarnessConfig()
     built = build_orchestrator(cfg)
     assert built.get_diff.diff_cfg is cfg.diff, \
         "build_orchestrator must wire the config-bound get_diff (diff_cfg is cfg.diff)"
+    # allow_dirty=False wires the REAL git restore; True wires the no-op (we
+    # can't safely reset a tree whose baseline we don't own).
+    assert built.restore_tree is real_restore_tree, \
+        "build_orchestrator(allow_dirty=False) must wire real_restore_tree"
+    built_dirty = build_orchestrator(cfg, allow_dirty=True)
+    assert built_dirty.restore_tree is _noop_restore_tree, \
+        "build_orchestrator(allow_dirty=True) must wire the no-op restore"
+    # --allow-dirty leaves a visible marker in the transcript.
+    assert any(e["event"] == "tree_hygiene_disabled"
+               for e in built_dirty.log), \
+        "build_orchestrator(allow_dirty=True) must log tree_hygiene_disabled"
+
+    # 35. INVARIANT (tree-hygiene): every implement attempt is preceded by a
+    # restore, and retries start clean. A doer whose implement always times out
+    # (positive step timeout + retry) drives two attempts; the recording
+    # restore must fire BEFORE each attempt, interleaved
+    # (restore, attempt, restore, attempt).
+    class TimingOutImplementDoer(StubDoer):
+        def __init__(self, order):
+            super().__init__({})
+            self.order = order
+        async def implement(self, spec, acceptance):
+            self.order.append("attempt")
+            await asyncio.sleep(30)  # exceeds the positive step timeout below
+            return "never"
+    cfg = HarnessConfig()
+    cfg.timeouts.model_call_seconds = 1   # positive: factory actually runs
+    cfg.escalation.retries_before_counting = 1  # -> 2 attempts (retry once)
+    cfg.escalation.consecutive_same_step_threshold = 5  # don't escalate early
+    cfg.escalation.timeout_count_threshold = 5
+    order: list = []
+    restore = RecordingRestore(order)
+    doer = TimingOutImplementDoer(order)
+    orch = make(cfg, doer, StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert restore.calls >= 2, \
+        f"restore must run before both attempts, saw {restore.calls} calls"
+    assert order[:4] == ["restore", "attempt", "restore", "attempt"], \
+        f"restore must interleave before each attempt, got {order!r}"
+    # A tree_restored event records the discarded partial work on the timeout.
+    tr = [e for e in r.debate_log if e["event"] == "tree_restored"]
+    assert tr and tr[0]["reason"] == "implement_timeout", \
+        f"implement timeout must log tree_restored(implement_timeout): {tr!r}"
+    assert r.outcome == Outcome.ESCALATED_TIMEOUT, \
+        f"repeated implement timeout must escalate TIMEOUT, got {r.outcome}"
+
+    # 36. INVARIANT (tree-hygiene): an implement ERROR restores the tree and
+    # logs tree_restored(implement_error); outcome is ESCALATED_NO_SIGNAL. The
+    # error is not retried, so the restore runs (once per-attempt, once on the
+    # failure branch) before the escalation propagates.
+    class ErroringImplementDoer(StubDoer):
+        async def implement(self, spec, acceptance):
+            raise RuntimeError("claude exited 1: implement crashed")
+    cfg = HarnessConfig()
+    restore = RecordingRestore()
+    orch = make(cfg, ErroringImplementDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert restore.calls >= 1, \
+        f"implement error must restore the tree, saw {restore.calls} calls"
+    tr = [e for e in r.debate_log if e["event"] == "tree_restored"]
+    assert tr and tr[0]["reason"] == "implement_error", \
+        f"implement error must log tree_restored(implement_error): {tr!r}"
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"implement error must escalate NO_SIGNAL, got {r.outcome}"
+
+    # 37. INVARIANT (tree-hygiene): the tree is NEVER restored after implement
+    # has succeeded. Both a full PASSED run and a post-implement escalation
+    # (gate failure) must show restore_tree call count == number of implement
+    # attempts (exactly 1 here, the per-attempt hook) -- no trailing restore
+    # that would destroy reviewable work the pipeline now owns.
+    cfg = HarnessConfig()
+    restore = RecordingRestore()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.PASSED, f"expected PASSED, got {r.outcome}"
+    assert restore.calls == 1, \
+        f"PASSED run must restore once (per-attempt only), saw {restore.calls}"
+    assert not any(e["event"] == "tree_restored" for e in r.debate_log), \
+        "a successful implement must not emit tree_restored"
+    # Post-implement escalation: implement succeeds, then the gate fails.
+    cfg = HarnessConfig()
+    restore = RecordingRestore()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_fail, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_GATE, \
+        f"expected ESCALATED_GATE, got {r.outcome}"
+    assert restore.calls == 1, \
+        f"post-implement escalation must not add a trailing restore, saw {restore.calls}"
+    assert not any(e["event"] == "tree_restored" for e in r.debate_log), \
+        "a post-implement escalation must not emit tree_restored"
+
+    # 38. INVARIANT (tree-hygiene): the clean-tree precondition refuses a dirty
+    # tree and --allow-dirty opts out. Exercised on the extracted check function
+    # directly (not the full CLI) in a temp git repo with a dirty tracked file.
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"],
+                       cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/f.txt", "w")).write("v1\n")
+        subprocess.run(["git", "add", "f.txt"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/f.txt", "w")).write("v2 DIRTY\n")  # dirty the tree
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            err = ensure_clean_tree(allow_dirty=False)
+            err_allowed = ensure_clean_tree(allow_dirty=True)
+        finally:
+            os.chdir(prev_cwd)
+    assert err is not None and "allow-dirty" in err, \
+        f"dirty tree must refuse with an actionable message, got {err!r}"
+    assert err_allowed is None, \
+        f"--allow-dirty must bypass the precondition, got {err_allowed!r}"
+
+    # 39. INVARIANT (tree-hygiene): real_restore_tree resets tracked changes and
+    # removes untracked files, restoring the committed baseline exactly.
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"],
+                       cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("BASELINE\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("POISONED\n")  # dirty tracked
+        (open(f"{tmp}/untracked.py", "w")).write("partial edit\n")  # untracked
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            await real_restore_tree()
+            restored = open("tracked.txt").read()
+            untracked_gone = not os.path.exists("untracked.py")
+        finally:
+            os.chdir(prev_cwd)
+    assert restored == "BASELINE\n", \
+        f"real_restore_tree must reset tracked content, got {restored!r}"
+    assert untracked_gone, \
+        "real_restore_tree must remove untracked files"
 
     # report
     expected = {

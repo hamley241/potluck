@@ -537,6 +537,14 @@ class TiebreakerClient:
             _tiebreak_prompt(spec, acceptance, diff, issue_id, arg_a, arg_b))
 
 
+async def _noop_restore_tree() -> None:
+    """Default restore_tree: does nothing, logs nothing. Used by existing
+    constructions/tests that wire no tree hygiene, and by cli when
+    --allow-dirty is set (we cannot safely reset a tree whose baseline we
+    don't own)."""
+    return None
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -546,6 +554,7 @@ class Orchestrator:
         tiebreaker: TiebreakerClient | None,
         run_gate,             # async callable -> GateResult.to_json_str()
         get_diff,             # async callable -> str
+        restore_tree=None,    # async callable () -> None; restores pre-implement tree
         ab_swap: Callable[[str], bool] | None = None,
     ):
         self.cfg = config
@@ -554,6 +563,12 @@ class Orchestrator:
         self.tiebreaker = tiebreaker
         self.run_gate = run_gate
         self.get_diff = get_diff
+        # restore_tree resets the working tree to the pre-implement baseline.
+        # Defaults to a no-op so every existing construction/test keeps working
+        # unchanged; cli wires the real git reset (or a no-op under
+        # --allow-dirty). Only implement attempts use it -- once the gate/debate
+        # pipeline owns the diff, an escalation must leave the tree intact.
+        self.restore_tree = restore_tree or _noop_restore_tree
         self.runner = StepRunner(config)
         # ab_swap decides per issue_id whether to place the reviewer's argument
         # in slot A (True) or the doer's (False). Randomized by default so a
@@ -870,15 +885,35 @@ class Orchestrator:
     # making the doer the only unbounded path in the loop.
 
     async def _doer_implement(self, spec: str, acceptance: str) -> str:
+        # Per-attempt hook: StepRunner re-invokes this factory fresh on each
+        # retry, so every implement attempt starts from the pre-implement
+        # baseline. On the first attempt the tree is already clean (guaranteed
+        # by cli's clean-tree precondition), so the restore is a no-op; on a
+        # retry it discards the dead prior attempt's half-edited tree so the
+        # retry doesn't run against poisoned state.
+        async def _attempt() -> str:
+            await self.restore_tree()
+            return await self.doer.implement(spec, acceptance)
+
         res = await self.runner.run(
             "doer:implement",
-            lambda: self.doer.implement(spec, acceptance),
+            _attempt,
             self.cfg.timeouts.model_call_seconds,
         )
+        # On failure the implement step is fully resolved and the escalation is
+        # about to propagate; restore the baseline so a partial/dead attempt's
+        # edits don't poison the tree for the operator or the next run, and log
+        # that the partial work was discarded. This runs ONLY on the implement
+        # step's own failure -- never after implement has succeeded, where the
+        # gate/debate pipeline owns the diff.
         if res.timed_out:
+            await self.restore_tree()
+            self._log("tree_restored", reason="implement_timeout")
             raise TimeoutEscalation("doer_no_signal",
                                     "doer timed out during implement")
         if not res.ok:
+            await self.restore_tree()
+            self._log("tree_restored", reason="implement_error")
             raise ModelUnavailable(
                 "doer", res.error or "doer implement errored")
         return res.output
@@ -1314,6 +1349,22 @@ async def real_run_gate(gate_path: str = "./.claude/verify.sh") -> str:
             ok=True, output=stdout.decode(errors="replace")).to_json_str()
     return GateResult(
         ok=False, output=stderr.decode(errors="replace")).to_json_str()
+
+
+async def real_restore_tree() -> None:
+    """Restore the working tree to the pre-implement baseline: discard all
+    tracked changes and remove untracked files. The baseline is HEAD with a
+    clean tree (guaranteed by cli's clean-tree precondition), so
+    `git reset --hard` + `git clean -fd` restores it exactly.
+
+    No timeout of its own -- like real_run_gate/real_get_diff this is local
+    deterministic git tooling. It runs inside the implement step's StepRunner
+    context, but only at points where that step has already resolved (before an
+    attempt, or after a failure verdict), so it is left unbounded like the
+    pre-existing local git calls above rather than getting a bound of its own.
+    """
+    await run_subprocess(["git", "reset", "--hard", "--quiet"])
+    await run_subprocess(["git", "clean", "-fd", "--quiet"])
 
 
 async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,

@@ -33,6 +33,7 @@ from .orchestrator import (
     ReviewerClient,
     TiebreakerClient,
     real_run_gate,
+    real_restore_tree,
     bound_get_diff,
 )
 from . import resolve as resolve_mod
@@ -69,16 +70,49 @@ def write_log(result: dict, args):
         print(f"\nFull log written to {args.log_file}")
 
 
-def build_orchestrator(cfg: HarnessConfig) -> Orchestrator:
+def build_orchestrator(cfg: HarnessConfig,
+                       allow_dirty: bool = False) -> Orchestrator:
     """Wire a cfg into a production Orchestrator (real doer/reviewer/tiebreaker,
-    real gate, config-bound get_diff). Pure: cfg -> Orchestrator, no argparse
-    and no I/O, so a test can build the exact object cmd_fix runs and assert on
-    the wiring (e.g. `orch.get_diff.diff_cfg is cfg.diff`)."""
+    real gate, config-bound get_diff, real tree restore). Pure: cfg ->
+    Orchestrator, no argparse and no I/O, so a test can build the exact object
+    cmd_fix runs and assert on the wiring (e.g. `orch.get_diff.diff_cfg is
+    cfg.diff`).
+
+    restore_tree is the real `git reset --hard` + `git clean -fd` when
+    allow_dirty is False; when True (operator opted out of the clean-tree
+    precondition), it is a no-op -- we cannot safely reset a tree whose
+    baseline we don't own -- and we log a `tree_hygiene_disabled` event so the
+    transcript shows hygiene was turned off."""
     doer = RealDoerClient()
     reviewer = ReviewerClient(cfg)
     tiebreaker = TiebreakerClient(cfg) if cfg.debate.use_tiebreaker else None
-    return Orchestrator(cfg, doer, reviewer, tiebreaker, real_run_gate,
-                        bound_get_diff(cfg.diff))
+    restore_tree = None if allow_dirty else real_restore_tree
+    orch = Orchestrator(cfg, doer, reviewer, tiebreaker, real_run_gate,
+                        bound_get_diff(cfg.diff), restore_tree=restore_tree)
+    if allow_dirty:
+        orch._log("tree_hygiene_disabled", allow_dirty=True)
+    return orch
+
+
+def ensure_clean_tree(allow_dirty: bool = False) -> str | None:
+    """Clean-tree precondition for `potluck fix`. Returns an actionable error
+    message when the working tree is dirty (`git status --porcelain` non-empty)
+    and --allow-dirty was NOT passed, else None. Extracted from cmd_fix so the
+    precondition is testable without driving the whole CLI.
+
+    A dead implement attempt leaves partial edits in the tree; starting from a
+    known-clean baseline is what lets restore_tree reset to it safely."""
+    if allow_dirty:
+        return None
+    import subprocess
+    porcelain = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True, text=True,
+    ).stdout
+    if porcelain.strip():
+        return ("working tree is not clean. Commit, stash, or pass "
+                "--allow-dirty to run against the current tree.")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +131,9 @@ def add_fix_parser(subparsers):
     p.add_argument("--no-tiebreaker", action="store_true")
     p.add_argument("--max-rounds", type=int, default=None)
     p.add_argument("--gate-timeout", type=int, default=None)
+    p.add_argument("--allow-dirty", action="store_true",
+                   help="Run against a dirty working tree; skips the clean-tree "
+                        "precondition AND all tree-restore behavior")
     p.add_argument("--json-output", action="store_true")
     p.add_argument("--log-file", type=str, default=None)
     p.set_defaults(func=cmd_fix)
@@ -125,13 +162,22 @@ def cmd_fix(args):
               file=sys.stderr)
         sys.exit(1)
 
+    # Clean-tree precondition (before the banner): a dead implement attempt
+    # leaves partial edits behind, so we start from a known-clean baseline that
+    # restore_tree can reset to. --allow-dirty is the visible, committed opt-out.
+    allow_dirty = getattr(args, "allow_dirty", False)
+    dirty_err = ensure_clean_tree(allow_dirty)
+    if dirty_err:
+        print(f"Error: {dirty_err}", file=sys.stderr)
+        sys.exit(1)
+
     print(f"potluck: profile={cfg.profile}, debate={'on' if cfg.debate_enabled else 'off'}, "
           f"max_rounds={cfg.debate.max_rounds}")
     print(f"roles: reviewer={cfg.models.reviewer.name}, tiebreaker={cfg.models.tiebreaker.name}")
     print(f"spec: {spec[:80]}{'...' if len(spec) > 80 else ''}\n")
 
     async def _run():
-        orch = build_orchestrator(cfg)
+        orch = build_orchestrator(cfg, allow_dirty=allow_dirty)
         return await orch.run_feature(spec, acceptance)
 
     result = asyncio.run(_run())
@@ -260,6 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-tiebreaker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--max-rounds", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--gate-timeout", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--allow-dirty", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--json-output", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--log-file", type=str, default=None, help=argparse.SUPPRESS)
     return p
