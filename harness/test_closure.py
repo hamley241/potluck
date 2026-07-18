@@ -1,0 +1,404 @@
+"""Class-closure sweep: after a fix PASSES, the reviewer backend names the bug
+CLASS it closed and emits grep patterns; the HARNESS runs them and reports only
+real file:line matches it found. These tests pin the whole contract:
+
+  1. happy path end-to-end (a planted sibling is found and reported)
+  2. framework disposes -- model-claimed locations are ignored
+  3. files touched by the diff are excluded (those are the fixed sites)
+  4. advisory -- a failing sweep can never break a PASSED run
+  5. disabled by config -- no model call, no closure events
+  6. a clean sweep is still recorded (the question was asked)
+  7. caps (5 patterns, 20 candidates) are visible, never silent truncation
+  8. the FINAL (step-9) PASSED path -- reached through a real debate round,
+     apply_fixes, and the post-fix gate -- attaches the report and logs
+     closure_report / closure_clean too, not just the early-exit path
+
+Tests 1-7 all converge through the early-exit PASSED branch (review finds
+nothing blocking), so on their own they leave the second wiring point unpinned.
+Test 8 is that OTHER wiring point: a reviewer that raises a blocking issue, a
+doer that accepts it, fixes applied, gate re-run -- so a regression where the
+sweep stops attaching on the final PASSED path is caught.
+
+The sweep greps the real working tree, so tests run inside a temp git repo with
+planted files. No real model calls: the reviewer's closure reply is scripted.
+"""
+
+import asyncio
+import json
+import os
+import subprocess
+import tempfile
+
+from harness.config import HarnessConfig
+from harness.orchestrator import (
+    Orchestrator, DoerClient, ReviewerClient, GateResult,
+)
+from harness.schemas import DoerResponse, IssueResponse, Outcome
+
+
+# --- stubs ---------------------------------------------------------------
+
+class StubDoer(DoerClient):
+    async def implement(self, spec, acceptance): return "implemented"
+    async def respond_to_review(self, spec, acceptance, diff, verdict):
+        return DoerResponse(responses=[])
+    async def apply_fixes(self, issues, diff): return "applied"
+
+
+class AcceptingDoer(StubDoer):
+    """Doer that ACCEPTS every issue the reviewer raises, driving the debate
+    loop through apply_fixes + the post-fix gate to the FINAL (step-9) PASSED
+    return -- the second place the closure sweep must attach. Records
+    apply_fixes calls so a test can confirm fixes really flowed."""
+    def __init__(self):
+        self.apply_fixes_calls: list[dict] = []
+
+    async def respond_to_review(self, spec, acceptance, diff, verdict):
+        return DoerResponse(responses=[
+            IssueResponse(id=i.id, decision="accept", reasoning="stub")
+            for i in verdict.issues])
+
+    async def apply_fixes(self, issues, diff):
+        self.apply_fixes_calls.append(
+            {"issues": [i.model_dump() for i in issues]})
+        return "applied"
+
+
+class ClosureReviewer(ReviewerClient):
+    """Reviewer that returns a SCRIPTED first-review verdict and a SCRIPTED
+    closure reply. `review_reply` defaults to an empty verdict (nothing
+    blocking -> early-exit PASSED); pass one with a blocking/major issue to
+    drive the full debate path to the final PASSED. `closure_reply` may be a
+    dict/list (json-encoded), a raw str (fed verbatim -- for the prose/malformed
+    case), or an Exception instance (raised, for the model-errored case).
+    Records call count so a test can assert the sweep was or wasn't invoked."""
+    def __init__(self, cfg, closure_reply, review_reply=None):
+        super().__init__(cfg)
+        self.closure_reply = closure_reply
+        self.review_reply = (review_reply if review_reply is not None
+                             else {"issues": []})
+        self.closure_calls = 0
+
+    async def review(self, spec, acceptance, diff):
+        return json.dumps(self.review_reply)
+
+    async def respond(self, spec, acceptance, diff, rejections):
+        return json.dumps({"issues": []})
+
+    async def closure_scan(self, spec, diff):
+        self.closure_calls += 1
+        r = self.closure_reply
+        if isinstance(r, BaseException):
+            raise r
+        return r if isinstance(r, str) else json.dumps(r)
+
+
+async def gate_pass():
+    return (True, "green")
+
+
+def make(cfg, doer, reviewer, gate, diff):
+    async def run_gate():
+        ok, out = await gate()
+        return GateResult(ok=ok, output=out).to_json_str()
+    return Orchestrator(cfg, doer, reviewer, None, run_gate, diff,
+                        ab_swap=lambda _id: False)
+
+
+def diff_for(paths):
+    """An async get_diff returning a diff whose `diff --git` headers name each
+    of `paths` (the sites just fixed -- the sweep must exclude them)."""
+    header = "".join(
+        f"diff --git a/{p} b/{p}\n@@ -1 +1 @@\n-old\n+new\n" for p in paths)
+
+    async def _diff():
+        return header
+    return _diff
+
+
+def _init_repo(tmp, files):
+    subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=tmp, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp, check=True)
+    for name, content in files.items():
+        path = os.path.join(tmp, name)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+    subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp, check=True)
+
+
+async def _run_in_repo(tmp, orch, spec="spec", acc="acc"):
+    prev = os.getcwd()
+    try:
+        os.chdir(tmp)
+        return await orch.run_feature(spec, acc)
+    finally:
+        os.chdir(prev)
+
+
+def _closure_events(log):
+    return [e for e in log if e["event"].startswith("closure")]
+
+
+async def main():
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+
+    # 1. HAPPY PATH: a planted sibling matching a reviewer-supplied regex is
+    # found by the harness and reported; a closure_report event is logged.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {
+            "sibling.py": "def foo():\n    proc.communicate()  # SIBLING_MARKER\n",
+        })
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, {
+            "bug_class": "unchecked subprocess result",
+            "patterns": [{"regex": "SIBLING_MARKER",
+                          "rationale": "same unchecked-result shape"}],
+        })
+        orch = make(cfg, StubDoer(), reviewer, gate_pass,
+                    diff_for(["src/feature.py"]))
+        r = await _run_in_repo(tmp, orch)
+    check("happy_passed", r.outcome == Outcome.PASSED)
+    check("happy_report_attached", r.closure_report is not None)
+    cand = [(c.file, c.line) for c in (r.closure_report.candidates
+                                       if r.closure_report else [])]
+    check("happy_candidate_found", ("sibling.py", 2) in cand)
+    check("happy_scan_called_once", reviewer.closure_calls == 1)
+    rep_ev = [e for e in r.debate_log if e["event"] == "closure_report"]
+    check("happy_report_event", len(rep_ev) == 1)
+    check("happy_report_event_fields",
+          bool(rep_ev)
+          and rep_ev[0]["bug_class"] == "unchecked subprocess result"
+          and rep_ev[0]["candidate_count"] == 1
+          and any(c["file"] == "sibling.py" and c["line"] == 2
+                  and c["pattern"] == "SIBLING_MARKER"
+                  for c in rep_ev[0]["candidates"]))
+
+    # 2. FRAMEWORK DISPOSES: a model that claims a plausible but NONEXISTENT
+    # location (in its rationale) with a regex matching nothing yields zero
+    # candidates, and the invented path appears NOWHERE in the report or log.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"real.py": "def foo():\n    pass\n"})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, {
+            "bug_class": "some plausible class",
+            "patterns": [{"regex": "ZZZ_NEVER_MATCHES_ANYTHING_ZZZ",
+                          "rationale": "the sibling lives in "
+                                       "src/hallucinated/ghost.py at line 42"}],
+        })
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["real.py"]))
+        r = await _run_in_repo(tmp, orch)
+    check("dispose_passed", r.outcome == Outcome.PASSED)
+    check("dispose_no_candidates", r.closure_report is None)
+    log_blob = json.dumps(r.debate_log, default=str)
+    check("dispose_no_invented_path",
+          "ghost.py" not in log_blob and "hallucinated" not in log_blob)
+    check("dispose_clean_logged",
+          any(e["event"] == "closure_clean" for e in r.debate_log))
+
+    # 3. TOUCHED FILES EXCLUDED: a match inside a file the diff touches is the
+    # just-fixed site and must NOT be reported; the untouched sibling must.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {
+            "touched.py": "MATCH_MARKER lives here\n",
+            "untouched.py": "MATCH_MARKER lives here too\n",
+        })
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, {
+            "bug_class": "c",
+            "patterns": [{"regex": "MATCH_MARKER", "rationale": "r"}]})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass,
+                    diff_for(["touched.py"]))
+        r = await _run_in_repo(tmp, orch)
+    reported = sorted(c.file for c in (r.closure_report.candidates
+                                       if r.closure_report else []))
+    check("touched_only_untouched_reported", reported == ["untouched.py"])
+
+    # 4. ADVISORY: a failing sweep can never break a PASSED run. Three flavors,
+    # each PASSED with a closure_skipped event logged.
+    # (a) the closure model call errors.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"x.py": "hello\n"})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, RuntimeError("claude exited 1: no auth"))
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["x.py"]))
+        r = await _run_in_repo(tmp, orch)
+    check("advisory_error_passed", r.outcome == Outcome.PASSED)
+    check("advisory_error_skipped",
+          any(e["event"] == "closure_skipped" for e in r.debate_log))
+
+    # (b) it returns prose (no JSON) -> malformed.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"x.py": "hello\n"})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, "I think everything looks fine here.")
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["x.py"]))
+        r = await _run_in_repo(tmp, orch)
+    skip_ev = [e for e in r.debate_log if e["event"] == "closure_skipped"]
+    check("advisory_prose_passed", r.outcome == Outcome.PASSED)
+    check("advisory_prose_skipped_malformed",
+          bool(skip_ev) and skip_ev[0].get("reason") == "malformed")
+
+    # (c) a returned regex is invalid so `git grep` exits > 1.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"x.py": "hello\n"})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, {
+            "bug_class": "c",
+            "patterns": [{"regex": "[unterminated", "rationale": "r"}]})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["x.py"]))
+        r = await _run_in_repo(tmp, orch)
+    bad_skip = [e for e in r.debate_log if e["event"] == "closure_skipped"]
+    check("advisory_badregex_passed", r.outcome == Outcome.PASSED)
+    check("advisory_badregex_skipped",
+          any(e.get("regex") == "[unterminated" for e in bad_skip))
+
+    # 5. DISABLED BY CONFIG: no closure model call is made and no closure events
+    # are logged.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"sibling.py": "SIBLING_MARKER\n"})
+        cfg = HarnessConfig()
+        cfg.closure_enabled = False
+        reviewer = ClosureReviewer(cfg, {
+            "bug_class": "c",
+            "patterns": [{"regex": "SIBLING_MARKER", "rationale": "r"}]})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["a.py"]))
+        r = await _run_in_repo(tmp, orch)
+    check("disabled_passed", r.outcome == Outcome.PASSED)
+    check("disabled_no_scan_call", reviewer.closure_calls == 0)
+    check("disabled_no_closure_events", _closure_events(r.debate_log) == [])
+    check("disabled_report_none", r.closure_report is None)
+
+    # 6. CLEAN SWEEP RECORDED: the model answers "none" -> PASSED, a
+    # closure_clean event is logged, and closure_report is None (our convention).
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"x.py": "hello\n"})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, {"bug_class": "none", "patterns": []})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["x.py"]))
+        r = await _run_in_repo(tmp, orch)
+    clean_ev = [e for e in r.debate_log if e["event"] == "closure_clean"]
+    check("clean_passed", r.outcome == Outcome.PASSED)
+    check("clean_event_logged", len(clean_ev) == 1)
+    check("clean_report_none", r.closure_report is None)
+    check("clean_no_report_event",
+          not any(e["event"] == "closure_report" for e in r.debate_log))
+
+    # 7. CAPS ARE VISIBLE.
+    # (a) more than 5 patterns -> excess dropped AND recorded.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"x.py": "hello\n"})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, {
+            "bug_class": "c",
+            "patterns": [{"regex": f"NOMATCH_{i}", "rationale": "r"}
+                         for i in range(7)]})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["x.py"]))
+        r = await _run_in_repo(tmp, orch)
+    pcap = [e for e in r.debate_log if e["event"] == "closure_patterns_capped"]
+    check("cap_patterns_passed", r.outcome == Outcome.PASSED)
+    check("cap_patterns_logged",
+          bool(pcap) and pcap[0]["returned"] == 7
+          and pcap[0]["kept"] == 5 and pcap[0]["dropped"] == 2)
+
+    # (b) more than 20 candidates found -> capped at 20, excess recorded.
+    with tempfile.TemporaryDirectory() as tmp:
+        many = "".join(f"line CANDIDATE_MARKER {i}\n" for i in range(25))
+        _init_repo(tmp, {"many.py": many})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, {
+            "bug_class": "c",
+            "patterns": [{"regex": "CANDIDATE_MARKER", "rationale": "r"}]})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["other.py"]))
+        r = await _run_in_repo(tmp, orch)
+    ccap = [e for e in r.debate_log if e["event"] == "closure_candidates_capped"]
+    check("cap_candidates_passed", r.outcome == Outcome.PASSED)
+    check("cap_candidates_count",
+          r.closure_report is not None
+          and len(r.closure_report.candidates) == 20)
+    check("cap_candidates_logged",
+          bool(ccap) and ccap[0]["found"] == 25
+          and ccap[0]["kept"] == 20 and ccap[0]["dropped"] == 5)
+
+    # 8. FINAL (step-9) PASSED PATH. Tests 1-7 all take the early-exit branch;
+    # this one drives the full loop -- reviewer raises a BLOCKING issue, the
+    # doer ACCEPTS it, fixes are applied, and the post-fix gate passes -- so the
+    # run returns the FINAL PASSED. The sweep must attach there too.
+    # (a) with a planted sibling -> report attached + closure_report event.
+    blocking = {"issues": [{
+        "id": "I1", "severity": "blocking",
+        "issue": "unchecked subprocess result", "suggested_fix": "check it"}]}
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {
+            "sibling.py": "def foo():\n    proc.communicate()  # STEP9_MARKER\n",
+        })
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(
+            cfg,
+            {"bug_class": "unchecked subprocess result",
+             "patterns": [{"regex": "STEP9_MARKER",
+                           "rationale": "same unchecked-result shape"}]},
+            review_reply=blocking)
+        doer = AcceptingDoer()
+        orch = make(cfg, doer, reviewer, gate_pass, diff_for(["src/feature.py"]))
+        r = await _run_in_repo(tmp, orch)
+    events = [e["event"] for e in r.debate_log]
+    check("step9_passed", r.outcome == Outcome.PASSED)
+    # Confirm we took the FULL path, not the early-exit branch the other tests
+    # ride: a real round ran, fixes were applied, and `passed` (step 9) fired.
+    check("step9_not_early_exit", "early_exit" not in events)
+    check("step9_passed_event", "passed" in events)
+    check("step9_debated", r.rounds_used == 1)
+    check("step9_fixes_applied", len(doer.apply_fixes_calls) == 1)
+    check("step9_report_attached", r.closure_report is not None)
+    s9cand = [(c.file, c.line) for c in (r.closure_report.candidates
+                                         if r.closure_report else [])]
+    check("step9_candidate_found", ("sibling.py", 2) in s9cand)
+    check("step9_scan_called_once", reviewer.closure_calls == 1)
+    s9_rep = [e for e in r.debate_log if e["event"] == "closure_report"]
+    check("step9_report_event",
+          len(s9_rep) == 1
+          and s9_rep[0]["bug_class"] == "unchecked subprocess result"
+          and s9_rep[0]["candidate_count"] == 1
+          and any(c["file"] == "sibling.py" and c["line"] == 2
+                  and c["pattern"] == "STEP9_MARKER"
+                  for c in s9_rep[0]["candidates"]))
+
+    # (b) same full path but a CLEAN sweep -> closure_clean logged on the final
+    # PASSED path too, report left None (the step-6 convention holds here).
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"x.py": "hello\n"})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(
+            cfg, {"bug_class": "none", "patterns": []},
+            review_reply=blocking)
+        doer = AcceptingDoer()
+        orch = make(cfg, doer, reviewer, gate_pass, diff_for(["src/feature.py"]))
+        r = await _run_in_repo(tmp, orch)
+    events = [e["event"] for e in r.debate_log]
+    clean_ev = [e for e in r.debate_log if e["event"] == "closure_clean"]
+    check("step9_clean_passed", r.outcome == Outcome.PASSED)
+    check("step9_clean_not_early_exit",
+          "early_exit" not in events and "passed" in events)
+    check("step9_clean_fixes_applied", len(doer.apply_fixes_calls) == 1)
+    check("step9_clean_event_logged", len(clean_ev) == 1)
+    check("step9_clean_report_none", r.closure_report is None)
+    check("step9_clean_no_report_event",
+          not any(e["event"] == "closure_report" for e in r.debate_log))
+
+    print("\nALL PASS" if ok else "\nSOME FAILED")
+    return ok
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(0 if asyncio.run(main()) else 1)

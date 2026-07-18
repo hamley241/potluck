@@ -209,6 +209,11 @@ def cmd_fix(args):
         "outcome": result.outcome.value,
         "rounds_used": result.rounds_used,
         "escalation_reason": result.escalation_reason,
+        # Harness-verified class-closure sweep (None unless the run PASSED and
+        # the sweep found sibling candidates). JSON mode carries it here; the
+        # human-readable section below is printed only in non-JSON mode.
+        "closure_report": (result.closure_report.model_dump(mode="json")
+                           if result.closure_report else None),
         "debate_log": result.debate_log,
     }
 
@@ -220,6 +225,21 @@ def cmd_fix(args):
         if out["escalation_reason"]:
             print(f"  Reason: {out['escalation_reason']}")
         print(f"{'='*60}")
+        # Class-closure sweep: only on a PASSED run that found siblings. These
+        # are UNVERIFIED candidates for the operator to judge, NOT confirmed
+        # bugs -- the harness grepped for the same shape elsewhere; whether each
+        # match is really the same defect is a human call.
+        cr = out["closure_report"]
+        if out["outcome"] == "passed" and cr and cr["candidates"]:
+            print("\nCLASS-CLOSURE SWEEP")
+            print("  These are UNVERIFIED candidates for you to judge, NOT "
+                  "confirmed bugs.")
+            print("  The fix closed this class here; the same shape may still "
+                  "be open at:")
+            print(f"  Bug class: {cr['bug_class']}")
+            for c in cr["candidates"]:
+                print(f"    {c['file']}:{c['line']}: {c['text'].strip()}")
+                print(f"        (matched pattern: {c['pattern']})")
         if out["debate_log"]:
             print("\nDebate log:")
             for entry in out["debate_log"]:

@@ -91,6 +91,48 @@ class Outcome(str, Enum):
     ABORTED_BUDGET = "aborted_budget"                  # whole-feature wall-clock blown
 
 
+class ClosurePattern(BaseModel):
+    """One grep pattern the reviewer model proposes for the class-closure sweep.
+
+    The model NEVER reports a site. It names the bug class and emits patterns;
+    the harness runs them itself. `regex` is POSIX ERE, run by the harness via
+    `git grep -E`. `rationale` explains why a match here would be the same bug.
+    """
+    regex: str
+    rationale: str
+
+
+class ClosureCandidate(BaseModel):
+    """A single harness-verified sibling site: a real `file:line` that a
+    reviewer-proposed pattern actually matched in the repo.
+
+    HARNESS-VERIFIED, never model-supplied: every field here comes from real
+    `git grep` output the harness ran, not from anything the model claimed. A
+    hallucinated path the model invents cannot become a ClosureCandidate,
+    because nothing the model says about locations is ever trusted or echoed --
+    only lines the grep actually found reach the operator.
+    """
+    file: str
+    line: int
+    text: str
+    pattern: str   # which regex matched, so the operator can judge relevance
+
+
+class ClosureReport(BaseModel):
+    """Result of a class-closure sweep after a run PASSED: the bug class the
+    fix closed, the patterns the reviewer proposed, and the sibling sites the
+    HARNESS found by running those patterns.
+
+    `candidates` is populated by the harness from real `git grep` output;
+    model-claimed locations are NEVER trusted or copied into it. The report is
+    advisory only -- it is produced on an already-passed run and can never
+    change the outcome.
+    """
+    bug_class: str                     # one line: the class this fix closed
+    patterns: list[ClosurePattern] = Field(default_factory=list)
+    candidates: list[ClosureCandidate] = Field(default_factory=list)
+
+
 class StepResult(BaseModel):
     """Uniform result for any bounded step (model call, gate run).
 
