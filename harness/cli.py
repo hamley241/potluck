@@ -33,7 +33,7 @@ from .orchestrator import (
     ReviewerClient,
     TiebreakerClient,
     real_run_gate,
-    real_get_diff,
+    bound_get_diff,
 )
 from . import resolve as resolve_mod
 
@@ -122,7 +122,8 @@ def cmd_fix(args):
         doer = RealDoerClient()
         reviewer = ReviewerClient(cfg)
         tiebreaker = TiebreakerClient(cfg) if cfg.debate.use_tiebreaker else None
-        orch = Orchestrator(cfg, doer, reviewer, tiebreaker, real_run_gate, real_get_diff)
+        orch = Orchestrator(cfg, doer, reviewer, tiebreaker, real_run_gate,
+                            bound_get_diff(cfg.diff))
         return await orch.run_feature(spec, acceptance)
 
     result = asyncio.run(_run())

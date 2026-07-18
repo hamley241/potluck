@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import NamedTuple
 
-from .config import HarnessConfig
+from .config import DiffConfig, HarnessConfig
 from .runner import StepRunner, TimeoutEscalation, ModelUnavailable, run_subprocess
 from .schemas import (
     DoerResponse,
@@ -1272,6 +1272,16 @@ async def real_get_diff(max_untracked_bytes: int = 4 * 1024 * 1024,
         if stdout:
             parts.append(stdout.decode(errors="replace"))
     return "".join(parts)
+
+
+def bound_get_diff(diff_cfg: DiffConfig):
+    """Async get_diff callable with the config's untracked-file guards
+    bound in; cli wiring passes bound_get_diff(cfg.diff) instead of the
+    bare real_get_diff whose parameter defaults shadowed the config."""
+    async def _get_diff() -> str:
+        return await real_get_diff(
+            diff_cfg.max_untracked_bytes, diff_cfg.binary_probe_bytes)
+    return _get_diff
 
 
 def _untracked_skip_reason(path: str, max_bytes: int,

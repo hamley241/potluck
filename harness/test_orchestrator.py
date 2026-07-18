@@ -798,6 +798,92 @@ async def main():
     except ValueError:
         pass
 
+    # 15j. INVARIANT: DiffConfig knobs flow to behavior THROUGH the production
+    # callable. Pre-fix, cli passed bare `real_get_diff` and the Orchestrator
+    # invoked it zero-arg, so `cfg.diff.max_untracked_bytes` /
+    # `binary_probe_bytes` were dead. `bound_get_diff(cfg.diff)` is the exact
+    # object production wires, so exercising it proves config reaches behavior.
+    from harness.orchestrator import bound_get_diff  # noqa: E402
+    from harness.config import DiffConfig  # noqa: E402
+
+    def _init_repo(tmp):
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"],
+                       cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/README", "w")).write("hello\n")
+        subprocess.run(["git", "add", "README"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"],
+                       cwd=tmp, check=True)
+
+    async def _diff_via(tmp, get_diff):
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            return await get_diff()
+        finally:
+            os.chdir(prev_cwd)
+
+    # (a) Restrictive max_untracked_bytes skips; permissive default includes --
+    #     both through bound_get_diff, the production call shape.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp)
+        (open(f"{tmp}/notes.txt", "w")).write("X" * 64 + "\n")  # > 16 bytes
+        restrictive = await _diff_via(
+            tmp, bound_get_diff(DiffConfig(max_untracked_bytes=16)))
+        permissive = await _diff_via(tmp, bound_get_diff(DiffConfig()))
+    assert "# skipped: notes.txt (size" in restrictive, \
+        f"tiny max_untracked_bytes must skip via factory: {restrictive!r}"
+    assert "# skipped: notes.txt (size" not in permissive, \
+        f"permissive default must NOT skip: {permissive!r}"
+    assert "XXXX" in permissive, \
+        f"permissive default must include file content: {permissive!r}"
+
+    # (b) binary_probe_bytes flows both directions. First NUL sits at offset
+    #     100: a probe smaller than that finds no NUL (treated as text, not
+    #     skipped); a probe larger than that finds it (skipped as binary).
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp)
+        with open(f"{tmp}/probe.bin", "wb") as fp:
+            fp.write(b"T" * 100 + b"\x00" + b"tail\n")
+        small_probe = await _diff_via(
+            tmp, bound_get_diff(DiffConfig(binary_probe_bytes=16)))
+        large_probe = await _diff_via(
+            tmp, bound_get_diff(DiffConfig(binary_probe_bytes=1024)))
+    assert "# skipped: probe.bin (binary)" not in small_probe, \
+        f"probe smaller than NUL offset must NOT skip as binary: {small_probe!r}"
+    assert "probe.bin" in small_probe, \
+        f"non-skipped file must appear in diff: {small_probe!r}"
+    assert "# skipped: probe.bin (binary)" in large_probe, \
+        f"probe larger than NUL offset must skip as binary: {large_probe!r}"
+
+    # 15k. INVARIANT: deleting the dead round_seconds field drops the phantom
+    # validation floor. feature_seconds=350 >= max(model_call=120, gate=300)
+    # now validates; under the old code the dead default round_seconds=400
+    # made max(step_bounds)=400 > 350 and raised for a knob that governed
+    # nothing.
+    floor = _HC()
+    floor.timeouts.model_call_seconds = 120
+    floor.timeouts.gate_seconds = 300
+    floor.timeouts.feature_seconds = 350
+    floor.validate()  # must not raise
+
+    # 15l. INVARIANT: round_seconds stays deleted from Timeouts. Trivially true
+    # today; guards against the field being reintroduced without being wired to
+    # a real per-round budget (dead config that constrains live config).
+    from harness.config import Timeouts as _TO  # noqa: E402
+    assert not hasattr(_TO(), "round_seconds"), \
+        "round_seconds must not be reintroduced without wiring"
+
+    # 15m. INVARIANT: old TOML setting timeouts.round_seconds still loads. The
+    # `_apply` hasattr guard silently ignores it (same contract as any unknown
+    # key) -- neither raises nor creates the attribute.
+    stale = _HC()
+    stale._apply({"timeouts": {"round_seconds": 999}})  # must not raise
+    assert not hasattr(stale.timeouts, "round_seconds"), \
+        "stale round_seconds key must NOT create the attribute"
+
     # 16. INVARIANT: rejected `major` issues reach the deadlock/tiebreak path
     # instead of being silently discarded. Pre-fix, `unresolved_blocking` was
     # computed from `blocking_ids` only, so a rejected major left it empty and

@@ -29,8 +29,6 @@ class Timeouts:
     # Per verification-gate run. Build/test can legitimately take a while;
     # tune per project -- this default is deliberately generous.
     gate_seconds: int = 300
-    # Per debate round (a round may involve several calls).
-    round_seconds: int = 400
     # Outer bound on a single feature across all rounds/retries.
     feature_seconds: int = 1800  # 30 min
 
@@ -163,14 +161,13 @@ class HarnessConfig:
            load beats mysterious immediate-fire escalations later.
         """
         t = self.timeouts
-        for name in ("model_call_seconds", "gate_seconds", "round_seconds",
-                     "feature_seconds"):
+        for name in ("model_call_seconds", "gate_seconds", "feature_seconds"):
             v = getattr(t, name)
             if not isinstance(v, int) or v < 0:
                 raise ValueError(
                     f"timeouts.{name} must be a non-negative int, got {v!r}"
                 )
-        step_bounds = (t.model_call_seconds, t.gate_seconds, t.round_seconds)
+        step_bounds = (t.model_call_seconds, t.gate_seconds)
         max_step = max(step_bounds)
         # feature_seconds == 0 is a special case: it fires immediately, but
         # so does the step timeout, so the invariant is vacuously satisfied
