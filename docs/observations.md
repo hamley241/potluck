@@ -54,6 +54,35 @@ foreign models fail differently, so they catch Claude's blind spots."
 These numbers are that claim showing up as measured behavior, not as
 doctrine. Two data points in hand; a running log will accumulate more.
 
+## 003 — Fixes get verified where they were applied, not where the class lives
+
+The malformed-model-response crash was found by kimi during PR #1's review
+rounds — on the doer path. The fix guarded one layer, the review verified
+that layer, and the round closed. A later full-repo review found the same
+bug class alive at three sibling sites (`_review`, `_review_followup`,
+`_tiebreak` — fixed as run 1 of the self-hosted campaign), and then a
+class-closure sweep of *that* fix found a fourth: the original doer-path
+guard wrapped a can't-fail *re*-parse of already-serialized JSON in
+`_doer_respond_to_review`, while the live parse one layer down in
+`RealDoerClient.respond_to_review` sat exposed (run 1b). Three models
+across four review rounds looked at this class and each verified the
+cited site, not the class.
+
+Practical takeaway for specs and reviews: when a finding names an
+exception type escaping a boundary, enumerate the CLASS — grep for every
+parse/decode/validate site on the same kind of input — then sweep for
+members. Don't stop at the cited site, and don't trust that a guard
+"on the doer path" guards the parse that actually runs on live output.
+
+Second lesson, from run 1b's ending: the run escalated
+`ESCALATED_NO_SIGNAL` *after* the code had survived debate (codex raised
+one major, the doer rejected with reasoning, codex conceded) — because
+the harness called `apply_fixes` with zero accepted issues and that
+pointless model call errored. The honest-failure machinery refused to
+report PASSED when its own apply step errored, exactly as designed; the
+wart (skip `apply_fixes` on an empty accept list) became finding #9
+rather than a silent success.
+
 ## Ship criterion for review rounds
 
 Not "zero findings" — infinite regress. The ship criterion is
