@@ -151,7 +151,12 @@ async def _drain(stream: asyncio.StreamReader) -> None:
     loop, so we retry a few times here -- yielding again between attempts --
     before giving up. Once a read succeeds we fall back into the normal
     drain-to-EOF loop; a transient concurrent-reader error must not end the
-    drain permanently and re-open the wedge-on-full-pipe failure."""
+    drain permanently and re-open the wedge-on-full-pipe failure.
+
+    The retry bound (3 attempts) is a deliberate pragmatic choice, not an
+    oversight: an unbounded retry could spin here during teardown -- which is
+    exactly when we must not hang -- so a persistent concurrent-reader error
+    (one that outlasts the bound) ends the drain rather than looping forever."""
     _MAX_RUNTIME_RETRIES = 3
     attempts = 0
     try:
@@ -252,9 +257,12 @@ async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
                 # release the streams in the common case. A single yield is not
                 # a guarantee -- under a loaded loop the readers may need more
                 # than one turn to unwind -- so _drain itself retries on the
-                # concurrent-reader RuntimeError rather than giving up. No claim
-                # of ready-queue-ordering independence: the yield narrows the
-                # window, the retry closes it.
+                # concurrent-reader RuntimeError rather than giving up. Together
+                # the yield and _drain's bounded retry make the drain robust in
+                # practice. That retry is BOUNDED, though: if a cancelled reader
+                # holds the stream past the bound this narrows rather than
+                # eliminates the window -- no claim of ready-queue-ordering
+                # independence.
                 await asyncio.sleep(0)
                 drainers = [
                     asyncio.ensure_future(_drain(stream))

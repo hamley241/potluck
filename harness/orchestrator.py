@@ -864,11 +864,17 @@ class Orchestrator:
             raise ModelUnavailable("gate", err)
         try:
             gate_res = GateResult.from_json_str(res.output)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError,
+                RecursionError) as e:
             # Stale caller returning the old str contract (or malformed JSON):
             # the gate produced no parseable verdict, so surface as no-signal,
             # not a gate failure and not a silent pass. Do NOT crash on the
             # AttributeError that would come from touching .ok on a bare str.
+            # RecursionError covers a gate callable returning nested-to-death
+            # JSON (json.loads blows the stack): that is an unusable gate
+            # response, not a harness bug, so it becomes no-signal too. Keep
+            # KeyError/TypeError explicit -- they cover a structurally-wrong
+            # but valid-JSON payload that ValueError does not.
             detail = f"malformed gate response: {e}"
             self._log("gate", label=label, passed=False, error=detail)
             raise ModelUnavailable("gate", detail)
@@ -1219,7 +1225,10 @@ def _extract_codex_message(jsonl_output: str) -> str:
             event = json.loads(line)
             if event.get("type") == "item.completed":
                 last_text = event.get("item", {}).get("text", "")
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, RecursionError):
+            # A nested-to-death line (json.loads blows the stack) is skipped
+            # like any other unparseable line, not fatal: one bad line must
+            # not discard the rest of the stream.
             continue
     return last_text if last_text is not None else jsonl_output
 
