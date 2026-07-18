@@ -882,7 +882,15 @@ class Orchestrator:
                                     "reviewer timed out; refusing to proceed without review")
         if not res.ok:
             raise ModelUnavailable("reviewer", res.error or "reviewer call errored")
-        return _parse_verdict(res.output)
+        # A reviewer answering with prose (no JSON) or a schema mismatch raises
+        # ValueError / pydantic ValidationError, which run_feature does not
+        # catch. Convert to ModelUnavailable so it escalates cleanly, same as
+        # the doer path in _doer_respond_to_review.
+        try:
+            return _parse_verdict(res.output)
+        except Exception as e:
+            raise ModelUnavailable(
+                "reviewer", f"reviewer returned malformed response: {e}") from e
 
     async def _review_followup(self, spec, acceptance, diff,
                                response) -> ReviewVerdict:
@@ -896,7 +904,12 @@ class Orchestrator:
                                     "reviewer follow-up timed out")
         if not res.ok:
             raise ModelUnavailable("reviewer", res.error or "reviewer follow-up errored")
-        return _parse_verdict(res.output)
+        # See _review: malformed reviewer output must escalate, not crash.
+        try:
+            return _parse_verdict(res.output)
+        except Exception as e:
+            raise ModelUnavailable(
+                "reviewer", f"reviewer returned malformed response: {e}") from e
 
     async def _tiebreak(self, spec, acceptance, diff, blocking: set[str],
                         verdict: ReviewVerdict,
@@ -953,7 +966,15 @@ class Orchestrator:
                 # different signal: the adjudicator itself is unavailable, so we
                 # escalate as no-signal rather than mislabel it as disagreement.
                 raise ModelUnavailable("tiebreaker", res.error or "tiebreaker call errored")
-            tb = _parse_tiebreak(res.output)
+            # A malformed tiebreaker response (prose / schema mismatch) escalates
+            # the whole run, matching the ERRORED branch above -- NOT the timeout
+            # branch, which merely leaves this issue contested.
+            try:
+                tb = _parse_tiebreak(res.output)
+            except Exception as e:
+                raise ModelUnavailable(
+                    "tiebreaker",
+                    f"tiebreaker returned malformed response: {e}") from e
             if tb.sides_with == "a":
                 winning_role = role_of_a
             elif tb.sides_with == "b":
@@ -1099,8 +1120,15 @@ def _extract_verdict_json(text: str) -> dict:
         end = stripped.rfind("]")
         if end == -1:
             raise ValueError(f"no JSON array found in model output: {stripped[:200]}")
-        issues = json.loads(stripped[: end + 1])
-        return {"issues": issues}
+        # The widest slice can span trailing prose that itself contains `]`
+        # (e.g. "[]\n\nNote: see [the docs]"). Mirror _extract_json's object
+        # fallback: walk `]` candidates from the right until one parses.
+        while end != -1:
+            try:
+                return {"issues": json.loads(stripped[: end + 1])}
+            except json.JSONDecodeError:
+                end = stripped.rfind("]", 0, end)
+        raise ValueError(f"no parseable JSON array in model output: {stripped[:200]}")
     return _extract_json(text)
 
 

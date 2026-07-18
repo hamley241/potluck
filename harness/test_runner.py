@@ -94,10 +94,43 @@ time.sleep(30)
     return _pid_dead(child_pid) and _pid_dead(grand_pid)
 
 
+async def _invalid_utf8_stdout_replaced() -> bool:
+    """A backend emitting invalid UTF-8 on stdout must not raise
+    UnicodeDecodeError (a ValueError that slips through StepRunner's
+    (RuntimeError, OSError) catch). Strict decode -> errors='replace'."""
+    cmd = [sys.executable, "-c",
+           "import sys; sys.stdout.buffer.write(b'\\xff\\xfe'); sys.exit(0)"]
+    try:
+        out = await run_subprocess(cmd)
+    except UnicodeDecodeError:
+        return False  # the bug: strict decode crashed the success path
+    return isinstance(out, str)
+
+
+async def _invalid_utf8_stderr_message_builds() -> bool:
+    """Non-zero exit with invalid UTF-8 on stderr: the RuntimeError message
+    interpolates stderr, so a strict decode there raises UnicodeDecodeError
+    while building the exception. Must surface as RuntimeError, not decode."""
+    cmd = [sys.executable, "-c",
+           "import sys; sys.stderr.buffer.write(b'\\xff\\xfe'); sys.exit(1)"]
+    try:
+        await run_subprocess(cmd)
+    except RuntimeError:
+        return True   # error path reported cleanly
+    except UnicodeDecodeError:
+        return False  # the bug: message interpolation crashed
+    return False      # a non-zero exit must raise SOMETHING
+
+
 def main():
     results = {}
     results["child_process_killed_on_timeout"] = asyncio.run(
         _process_killed_on_timeout())
+    # Arbitrary byte output must never raise UnicodeDecodeError on either path.
+    results["invalid_utf8_stdout_replaced"] = asyncio.run(
+        _invalid_utf8_stdout_replaced())
+    results["invalid_utf8_stderr_message_builds"] = asyncio.run(
+        _invalid_utf8_stderr_message_builds())
     # Both teardown paths: (a) grandchild respects SIGTERM (dies in grace
     # window); (b) grandchild ignores SIGTERM (SIGKILL fallback kicks in).
     # In both, the whole process group must be gone.
