@@ -94,9 +94,13 @@ class Outcome(str, Enum):
 class ClosurePattern(BaseModel):
     """One grep pattern the reviewer model proposes for the class-closure sweep.
 
-    The model NEVER reports a site. It names the bug class and emits patterns;
-    the harness runs them itself. `regex` is POSIX ERE, run by the harness via
-    `git grep -E`. `rationale` explains why a match here would be the same bug.
+    The model supplies patterns and explanation ONLY: no location it claims
+    ever becomes a reported candidate. It names the bug class and emits
+    patterns; the harness runs them itself and draws candidates exclusively
+    from real `git grep` output. `regex` is POSIX ERE, run by the harness via
+    `git grep -E`, and `rationale` explains why a match here would be the same
+    bug -- both are UNVERIFIED model text that may contain `file:line`-shaped
+    strings, and neither is ever read as a location.
 
     `rationale` is bounded (single line, capped with an elision marker) before
     it reaches a ClosureReport: this pattern rides FeatureResult straight into

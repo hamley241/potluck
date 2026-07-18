@@ -294,7 +294,23 @@ async def _spawn_and_communicate(
             input=stdin_text.encode() if stdin_text is not None else None
         )
     except BaseException:
-        await _teardown_process_group(proc)
+        # Teardown itself has several await points (proc.wait(), sleep(0), the
+        # grace wait_for, _cancel_drainers). A SECOND cancellation arriving
+        # while it runs -- the outer feature_seconds budget firing during a
+        # step-level teardown, or a Ctrl-C -- would otherwise abort cleanup
+        # before the SIGKILL fallback and the final reap, leaking the child,
+        # its grandchildren, or the drainer tasks. Run teardown as a shielded
+        # task so a further cancel of THIS coroutine doesn't interrupt it; if
+        # the shielded await is itself cancelled, the finally still awaits the
+        # teardown task to completion before we re-raise. This changes only
+        # whether cleanup FINISHES -- the original exception (CancelledError or
+        # KeyboardInterrupt included) always propagates unchanged to the caller.
+        teardown = asyncio.ensure_future(_teardown_process_group(proc))
+        try:
+            await asyncio.shield(teardown)
+        finally:
+            if not teardown.done():
+                await teardown
         raise
     return proc.returncode, stdout, stderr
 

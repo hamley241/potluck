@@ -1276,6 +1276,11 @@ class Orchestrator:
     # Caps -- surfaced as log events when they bite; no silent truncation.
     _CLOSURE_MAX_PATTERNS = 5
     _CLOSURE_MAX_CANDIDATES = 20
+    # Per-file match cap passed to `git grep -m`. Set a little ABOVE
+    # _CLOSURE_MAX_CANDIDATES so a single noisy file (many hits of a broad
+    # regex) cannot dominate the whole candidate budget, while git itself
+    # bounds the per-file match work at the source rather than after the read.
+    _CLOSURE_GREP_MAX_PER_FILE = 25
 
     async def _closure_sweep(self, spec: str,
                              diff: str) -> ClosureReport | None:
@@ -1432,17 +1437,29 @@ class Orchestrator:
                              candidates=candidates)
 
     async def _git_grep(self, regex: str) -> list[tuple[str, int, str]] | None:
-        """Run `git grep -n -E -- <regex>` in the working tree. Returns the
-        parsed `(path, line, text)` matches ONLY on exit 0 or 1 (0 = matches,
-        1 = none -- BOTH success), or None on ANY other exit, logging
+        """Run `git grep -n -E -m <N> -- <regex>` in the working tree. Returns
+        the parsed `(path, line, text)` matches ONLY on exit 0 or 1 (0 =
+        matches, 1 = none -- BOTH success), or None on ANY other exit, logging
         `closure_skipped` (scope=pattern) so the skip is never silent.
 
         Goes through run_subprocess_result (not a bare create_subprocess_exec)
         so a StepRunner timeout tears the whole `git grep` process group down
         instead of leaking it; run_subprocess itself can't be used because it
-        raises on the legitimate exit-1 no-match case."""
+        raises on the legitimate exit-1 no-match case.
+
+        What IS bounded: `-m _CLOSURE_GREP_MAX_PER_FILE` caps matches PER FILE
+        so one noisy file can't dominate the candidate budget;
+        _CLOSURE_MAX_CANDIDATES caps total candidates accumulated across files
+        (in _grep_all); and the whole sweep is bounded in wall-clock by the
+        gate_seconds StepRunner step that wraps it. What is NOT bounded: a broad
+        regex (`.*`) across very many files can still make git emit -- and this
+        function decode, and _parse_git_grep materialize -- a large intermediate
+        result before those caps apply. That residual read is a deliberate,
+        bounded-in-time tradeoff for an ADVISORY sweep that cannot change a
+        run's outcome, NOT a claim that the read/parse work is fully bounded."""
         returncode, stdout, stderr = await run_subprocess_result(
-            ["git", "grep", "-n", "-E", "--", regex])
+            ["git", "grep", "-n", "-E",
+             "-m", str(self._CLOSURE_GREP_MAX_PER_FILE), "--", regex])
         # Success is EXACTLY exit 0 or 1. Anything else is a failure: a git
         # error (uncompilable model regex, the common case), OR a process killed
         # by a signal, which returns a NEGATIVE returncode (-15 SIGTERM, -9

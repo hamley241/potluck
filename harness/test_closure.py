@@ -609,6 +609,36 @@ async def main():
           and pcap[0]["kept"] == 5
           and pcap[0]["dropped"] == len(pats) - 5)
 
+    # 14. PER-FILE CAP. _git_grep must pass `-m <_CLOSURE_GREP_MAX_PER_FILE>` so
+    # git itself caps matches PER FILE at the source -- one noisy file can't
+    # dominate the whole candidate budget. A recording stub captures the argv;
+    # assert `-m` and the constant are present and that the constant sits above
+    # _CLOSURE_MAX_CANDIDATES (so a single file can't monopolize the budget).
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp, {"x.py": "hello\n"})
+        cfg = HarnessConfig()
+        reviewer = ClosureReviewer(cfg, {"bug_class": "c", "patterns": []})
+        orch = make(cfg, StubDoer(), reviewer, gate_pass, diff_for(["x.py"]))
+        recorded = {}
+
+        async def _record(cmd, *, stdin_text=None):
+            recorded["cmd"] = list(cmd)
+            return (1, b"", b"")  # exit 1 = no matches (a success, empty result)
+
+        saved = orch_mod.run_subprocess_result
+        orch_mod.run_subprocess_result = _record
+        try:
+            await orch._git_grep("SOME_REGEX")
+        finally:
+            orch_mod.run_subprocess_result = saved
+    argv = recorded.get("cmd", [])
+    m_flag_ok = ("-m" in argv
+                 and argv[argv.index("-m") + 1]
+                 == str(orch._CLOSURE_GREP_MAX_PER_FILE))
+    check("per_file_cap_m_flag_passed", m_flag_ok)
+    check("per_file_cap_constant_above_candidates",
+          orch._CLOSURE_GREP_MAX_PER_FILE > orch._CLOSURE_MAX_CANDIDATES)
+
     print("\nALL PASS" if ok else "\nSOME FAILED")
     return ok
 
