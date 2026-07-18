@@ -1461,6 +1461,27 @@ async def main():
     assert built.get_diff.diff_cfg is cfg.diff, \
         "build_orchestrator must wire the config-bound get_diff (diff_cfg is cfg.diff)"
 
+    # 35. INVARIANT (Member A): deeply nested MODEL output escalates
+    # ESCALATED_NO_SIGNAL instead of crashing. `json.loads` on pathologically
+    # nested input raises RecursionError -- which is NOT a ValueError -- so the
+    # ValueError-only narrowing would have let it crash the harness. The
+    # boundary now catches (ValueError, RecursionError); a model emitting
+    # nested-to-death JSON is bad model output (the no-signal bucket), not a
+    # harness bug. We drive the REAL deep-input path (not a monkeypatch) so this
+    # proves the actual failure mode: the reviewer returns `'['*N + ']'*N`,
+    # which blows json.loads's recursion limit inside _parse_verdict.
+    class DeepNestedReviewer(ReviewerClient):
+        async def review(self, spec, acceptance, diff):
+            return "[" * 200000 + "]" * 200000
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), DeepNestedReviewer(cfg), None,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"deeply nested reviewer output must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[reviewer]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [reviewer]: {r.escalation_reason!r}"
+
     # report
     expected = {
         "early_exit": (Outcome.PASSED, 0),

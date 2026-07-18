@@ -137,10 +137,32 @@ async def _drain(stream: asyncio.StreamReader) -> None:
     """Read a stream to EOF, discarding everything. Used during the SIGTERM
     grace window so a child flushing buffered output doesn't wedge on a full
     pipe. Any error (the transport tearing down under us as the process dies)
-    is swallowed -- this is best-effort cleanup on an already-cancelled call."""
+    is swallowed -- this is best-effort cleanup on an already-cancelled call.
+
+    RuntimeError from `stream.read` is special-cased: communicate()'s cancelled
+    reader may still hold the stream when we start (StreamReader rejects a
+    concurrent reader with RuntimeError). The sleep(0) at the call site yields
+    once to let it unwind, but a single yield is not a guarantee under a loaded
+    loop, so we retry a few times here -- yielding again between attempts --
+    before giving up. Once a read succeeds we fall back into the normal
+    drain-to-EOF loop; a transient concurrent-reader error must not end the
+    drain permanently and re-open the wedge-on-full-pipe failure."""
+    _MAX_RUNTIME_RETRIES = 3
+    attempts = 0
     try:
-        while await stream.read(65536):
-            pass
+        while True:
+            try:
+                chunk = await stream.read(65536)
+            except RuntimeError:
+                attempts += 1
+                if attempts > _MAX_RUNTIME_RETRIES:
+                    return
+                # The concurrent reader hasn't released the stream yet; yield
+                # and retry rather than abandoning the drain.
+                await asyncio.sleep(0)
+                continue
+            if not chunk:
+                return  # EOF
     except Exception:
         pass
 
@@ -220,12 +242,14 @@ async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
                 # communicate()'s internal per-stream reader tasks were
                 # cancelled when this coroutine was cancelled, but may not have
                 # unwound yet; StreamReader rejects a concurrent reader with
-                # RuntimeError, which _drain would silently swallow -- leaving
-                # the pipe undrained. A single sleep(0) lets those cancelled
-                # readers finish unwinding and release the streams, making the
-                # drain independent of ready-queue ordering rather than relying
-                # on CPython's FIFO scheduling (an implementation detail, not a
-                # contract).
+                # RuntimeError, which _drain would otherwise hit on its first
+                # read. This sleep(0) yields so those cancelled readers can
+                # release the streams in the common case. A single yield is not
+                # a guarantee -- under a loaded loop the readers may need more
+                # than one turn to unwind -- so _drain itself retries on the
+                # concurrent-reader RuntimeError rather than giving up. No claim
+                # of ready-queue-ordering independence: the yield narrows the
+                # window, the retry closes it.
                 await asyncio.sleep(0)
                 drainers = [
                     asyncio.ensure_future(_drain(stream))
