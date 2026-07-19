@@ -362,3 +362,54 @@ looked — it did, and the record says so.
 one `reprompt` log event per retry — routed through the established
 `_pack_event`/`_truncate_walk` envelope, changing no control flow. The next
 malformed-reply decision can be shown from the log, not argued.
+
+## 014 — evidence precedes rejection (PROMOTED: candidate → canon)
+
+**Promoted 2026-07-19** on two firings of its stated trigger, one slice
+apart. Filed as a candidate in 012; met in 012 (`_note_kw`'s two false
+claims) and again in 013's successor slice B3 (the counters-cannot-drift
+claim, false on the retry-timeout path). Both times the loop settled a
+finding on an empirical claim NOBODY RAN.
+
+The rule is the sibling of *evidence precedes act*:
+
+> **Evidence precedes rejection.** A rejection whose rationale makes a
+> testable claim attaches the test — the command and its output — or the
+> claim does not qualify as a rationale.
+>
+> **A reviewer may not concede to an unevidenced empirical claim.** The
+> legal moves are REQUEST THE EVIDENCE or HOLD. A hold routes to
+> adjudication, where someone runs it.
+
+**What it does structurally:** it converts "who tests the rebuttal?" from a
+vigilance question into a protocol answer. The concession itself is gated on
+evidence, so nobody has to notice the pattern in the moment — which is the
+only reliable form, because both wrong concessions were made by participants
+who had every reason to be careful and were not being careless.
+
+Two wrong concessions in two consecutive slices also updates a prior: **the
+debate's concede step is its softest joint.** Round-one findings get
+scrutiny; concessions get waved through. The new rule hardens exactly that
+joint.
+
+## 015 — every instrumentation family ships a conservation invariant
+
+The general form behind B3b's cure.
+
+> **Every instrumentation family ships with its conservation invariant, or
+> states why none exists.**
+
+B3's instance: `reprompts_issued == cured + recurred + timed_out + not_ok`.
+Every issued retry is an OBLIGATION that must terminate in a counted
+outcome. An unaccounted retry is a lost concern wearing a different costume
+— the fifth guarantee's shape one level down, and the ledger-accounting
+discipline applied to a measuring device.
+
+A measuring device without a conservation law has blind spots exactly where
+reconciliation fails, and B3 proved where that real estate is: the rarest,
+most error-adjacent path. The worst possible place for a gap.
+
+**The meta-irony, recorded because it is the point:** the slice whose entire
+purpose was measurement shipped the unaccountable path, and it was caught by
+MEASURING THE MEASUREMENT — running the counters against the stream on a
+path the tests did not cover.
