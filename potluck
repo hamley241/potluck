@@ -6,5 +6,20 @@
 # This sets PYTHONPATH automatically so you don't have to remember it.
 set -euo pipefail
 HARNESS_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
+
+# The core lives beside this repo after the engine extraction; potluck's
+# harness imports it (StepRunner, config layering, resolve, jsonx). It is NOT
+# pip-installed, so the launcher must put it on the path — otherwise potluck
+# only works when the TARGET repo happens to contain a harness_core/ package,
+# which is working by accident, not by design.
+CORE_DIR="$(cd "$HARNESS_DIR/../harness_core" 2>/dev/null && pwd || echo "")"
+
+# -P is load-bearing: without it Python prepends the CURRENT WORKING DIRECTORY
+# to sys.path, ahead of PYTHONPATH. potluck runs from inside the TARGET repo,
+# so any target that has its own `harness/` package SHADOWS potluck's own
+# modules and the loop imports the target's code as if it were its own. menu
+# is exactly such a repo: `potluck fix` run there loaded menu/harness/cli.py
+# and died. -P disables the cwd prepend so PYTHONPATH wins.
 exec uv run --no-project --python 3.11 --with pydantic \
-  env PYTHONPATH="$HARNESS_DIR" python3.11 -m harness.cli "$@"
+  env PYTHONPATH="$HARNESS_DIR${CORE_DIR:+:$CORE_DIR}" \
+  python3.11 -P -m harness.cli "$@"
