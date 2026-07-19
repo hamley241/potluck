@@ -272,3 +272,55 @@ being believed.
 **Cheap fix, when the review prompts are next touched:** include the repo's
 test-runner convention in the reviewer's context. One line prevents a whole
 class of discovery-assumption findings.
+
+## 012 — wrong-concession case #1: the debate settled a finding incorrectly
+
+**Occurred:** 2026-07-19, slice B2. **This is a first.** Every prior entry
+records the debate MISSING something. This one records it reaching a wrong
+outcome that survived to commit.
+
+Codex raised I2 (major): the wrappers use `_note_kw()` to omit `retry_note`
+entirely when it is `None`, rather than passing it unconditionally as the
+spec's `call(retry_note)` contract required. The doer rejected it with a
+rationale making TWO empirical claims:
+
+  1. omitting keeps the first-attempt prompt byte-identical to today's;
+  2. stubs predating the param keep working.
+
+Codex conceded. The run PASSED. **Both claims fail when tested:**
+
+  1. `_with_retry_note(tail, None) == tail` — the prompt is byte-identical
+     whether the kwarg is omitted OR passed as `None`. The hedge buys
+     nothing it claims to buy.
+  2. A client lacking the param raises `TypeError: unexpected keyword
+     argument 'retry_note'` on the RETRY. `TypeError` is outside the caught
+     set, so it escapes as a traceback instead of escalating.
+
+Nobody in-loop ran either claim. Post-loop review did.
+
+**What this adds to observation 001's ledger:** fresh-context review does
+not only catch what the debate *missed* — it catches what the debate
+*wrongly settled*. In the record, a concession to a confident-but-wrong
+rebuttal is INDISTINGUISHABLE from a concession to a correct one. The only
+thing that separates them is someone testing the rebuttal's claims.
+
+**Filed as a candidate, NOT built:** when a rejection rationale makes
+empirical claims, adjudication should be RUNNING them, not weighing them —
+menu's concession-reason audit discipline pointed at potluck's own loop.
+*Trigger: next time the orchestrator's debate handling is touched.*
+
+## 013 — the class: a hedge that defers a failure to the recovery path
+
+The general shape behind 012's defect, entering the standing vocabulary:
+
+> **Any compatibility shim that succeeds on the common path and fails on
+> the error path has hidden the incompatibility in the single hardest place
+> to debug — the moment something else has already gone wrong.**
+
+`_note_kw()` is the instance: legacy clients work on every normal call and
+crash only during error recovery. A shim that failed on call one would have
+been found by the first test run.
+
+The sibling sweep (the tenth) greps for the shape, not the symbol: optional
+kwargs threaded only on a fallback path, `**kwargs` spreads that vary by
+branch, `getattr(x, "f", None)` guards that only cover the happy call.
