@@ -19,6 +19,46 @@ run() {
     env PYTHONPATH="$REPO:$CORE" python3.11 -m "$1"
 }
 
+fail=0
+
+# --- packaging checks (ruling, 2026-07-18) ------------------------------
+# The suites test the CODE; nothing tested the PACKAGING. A runtime import
+# failure of harness_core would leave every suite green while `potluck
+# fix` was broken — a review caught exactly that, and these convert the
+# catch into a permanent gate layer.
+#
+# TWO checks, because the claim has two halves and one check implying both
+# is observation 004's defect (an earlier draft passed --with-editable,
+# supplying the dependency itself, so it could not fail when the
+# dependency was undeclared):
+#   (1) DECLARATION — static; the only half that catches "a PYTHONPATH was
+#       masking it".
+#   (2) IMPORTABILITY — dynamic; runs in a stateful uv environment, so it
+#       does NOT independently prove the declaration exists.
+echo "=== packaging (1/2): harness-core declared in pyproject ==="
+python3 - "$REPO/pyproject.toml" <<'PY' || fail=1
+import re, sys, tomllib, pathlib
+data = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
+names = set()
+for d in data.get("project", {}).get("dependencies", []):
+    m = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)", d)
+    if m:
+        names.add(re.sub(r"[-_.]+", "-", m.group(1)).lower())
+if "harness-core" not in names:
+    print("  [FAIL] harness-core is NOT declared in [project.dependencies];"
+          " a PYTHONPATH that happens to supply it would mask this")
+    sys.exit(1)
+print("  [PASS] harness-core declared")
+PY
+echo "=== packaging (2/2): potluck doctor imports and runs ==="
+if ( cd "$REPO" && uv run --project "$REPO" python -m harness.cli doctor ) >/dev/null 2>&1; then
+  echo "  [PASS] potluck doctor imports and runs"
+else
+  echo "  [FAIL] potluck doctor could not import and run" >&2
+  fail=1
+fi
+echo
+
 # Discover suites from disk so a new harness/test_*.py file is picked up
 # automatically -- a hard-coded list is the "new test suite silently skipped"
 # failure mode. NUL-delimited + array iteration so paths with spaces or
@@ -36,7 +76,6 @@ if [[ ${#suites[@]} -eq 0 ]]; then
   exit 1
 fi
 
-fail=0
 for suite in "${suites[@]}"; do
   echo "=== $suite ==="
   run "$suite" || fail=1

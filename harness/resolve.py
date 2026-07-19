@@ -26,18 +26,23 @@ Usage:
 from __future__ import annotations
 
 import os
-import shutil
 import sys
-from dataclasses import dataclass
 from pathlib import Path
+
+# PORTED to harness_core 2026-07-18 (engine extraction, step 2).
+# The role-free half — backend construction, detection, single-
+# backend health check — now lives in the core. What remains here
+# names potluck's ROLES (reviewer, tiebreaker), which is exactly
+# what HC4 keeps out of a shared core. harness/resolve.py's local
+# copies of the moved functions are gone from THIS file, but the
+# module itself stays until step 4 per the HC1 ruling.
+from harness_core.resolve import (  # noqa: F401  (re-exported)
+    CODEX_PATHS, KIMI_PATHS, Backend, _ask_use, _find,
+    _model_suffix, _toml_str, check_backend, claude_backend,
+    codex_backend, detect, kimi_backend)
 
 # Known install locations to probe when a binary isn't on PATH. Codex ships
 # inside the desktop app bundle; Kimi installs under the home dir.
-CODEX_PATHS = [
-    "/Applications/Codex.app/Contents/Resources/codex",
-    "/Applications/ChatGPT.app/Contents/Resources/codex",
-]
-KIMI_PATHS = [os.path.expanduser("~/.kimi-code/bin/kimi")]
 
 # Claude models for the two resolved roles when they fall back to Claude. The
 # doer runs on whatever the interactive session defaults to (usually Opus), so
@@ -46,79 +51,22 @@ CLAUDE_REVIEWER_MODEL = "sonnet"
 CLAUDE_TIEBREAKER_MODEL = "haiku"
 
 
-def _toml_str(s: str) -> str:
-    """Render a string as a TOML basic string, escaping backslashes and quotes
-    so a path with such characters can't produce an invalid .resolved.toml."""
-    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
 
 
-@dataclass
-class Backend:
-    name: str
-    cmd: list[str]
-    fmt: str
-    stdin: bool = True   # True: prompt on stdin; False: prompt appended as argv
-
-    def as_toml_table(self) -> str:
-        cmd_items = ", ".join(_toml_str(c) for c in self.cmd)
-        return (f'name = {_toml_str(self.name)}\n'
-                f'cmd = [{cmd_items}]\n'
-                f'fmt = {_toml_str(self.fmt)}\n'
-                f'stdin = {"true" if self.stdin else "false"}\n')
 
 
 # --- backend builders ---
 
-def claude_backend(model: str, claude_path: str = "claude") -> Backend:
-    # `claude -p` reads the prompt from stdin. `--tools ""` disables ALL tools so
-    # the reviewer/tiebreaker are genuinely read-only judgment calls -- they
-    # cannot edit the workspace or run commands, matching Codex's read-only
-    # sandbox. (The doer is a separate call that keeps its edit tools.)
-    return Backend("claude", [claude_path, "-p", "--tools", "", "--model", model],
-                   "text", stdin=True)
 
 
-def codex_backend(path: str) -> Backend:
-    # `codex exec` reads the prompt from stdin. Read-only sandbox: the reviewer
-    # grades code, it never edits it.
-    return Backend("codex", [path, "exec", "--json", "--sandbox", "read-only"],
-                   "codex_jsonl", stdin=True)
 
 
-def kimi_backend(path: str) -> Backend:
-    # `kimi -p <prompt>` takes the prompt as an ARGUMENT, not on stdin, so the
-    # runner appends it to cmd.
-    # Caveat: the tiebreak prompt embeds the diff, so on a very large change it
-    # can exceed the OS per-arg / ARG_MAX limit. That surfaces as an OSError,
-    # which the StepRunner catches and the loop escalates as ESCALATED_NO_SIGNAL
-    # (a missing adjudication, never a silent "approved"). It is not a crash,
-    # but Kimi tiebreak is unavailable on outsized diffs -- a known v1 limit.
-    return Backend("kimi", [path, "-p"], "text", stdin=False)
 
 
 # --- detection ---
 
-def _find(name: str, extra_paths: list[str]) -> str | None:
-    on_path = shutil.which(name)
-    if on_path:
-        return on_path
-    for candidate in extra_paths:
-        # Must be an executable FILE -- a directory or non-executable file at a
-        # known path is not a usable backend, so fall through to the Claude
-        # fallback rather than write a dead command into .resolved.toml.
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
 
 
-def detect() -> dict[str, str | None]:
-    """Return {model_name: resolved_path_or_None} for each supported backend."""
-    return {
-        "claude": _find("claude", []),
-        "codex": _find("codex", CODEX_PATHS),
-        "kimi": _find("kimi", KIMI_PATHS),
-    }
 
 
 # --- role resolution (pure; this is what the tests exercise) ---
@@ -158,24 +106,10 @@ def plan_summary(roles: dict[str, Backend]) -> str:
     return f"{line}\n{note}"
 
 
-def _model_suffix(b: Backend) -> str:
-    if b.name == "claude" and "--model" in b.cmd:
-        return f" ({b.cmd[b.cmd.index('--model') + 1]})"
-    return ""
 
 
 # --- health checks ---
 
-def check_backend(b: Backend) -> str | None:
-    """Return None if b's executable is runnable, else a short problem string."""
-    exe = b.cmd[0]
-    if "/" not in exe:
-        if shutil.which(exe) is None:
-            return f"{b.name}: '{exe}' not found on PATH"
-        return None
-    if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
-        return f"{b.name}: '{exe}' is not an executable file"
-    return None
 
 
 def check_models(models) -> list[str]:
@@ -217,13 +151,6 @@ def write_resolved(roles: dict[str, Backend], path: Path | None = None) -> Path:
 
 # --- interactive prompts ---
 
-def _ask_use(model: str, path: str | None) -> bool:
-    if not path:
-        print(f"  {model}: not found on this machine -- skipping "
-              f"(the {model} role falls back to a Claude model).")
-        return False
-    ans = input(f"  Use {model} for its role? found at {path}  [Y/n] ").strip().lower()
-    return ans in ("", "y", "yes")
 
 
 def _ask_install_mode(model: str) -> None:
