@@ -434,13 +434,27 @@ def test_budget_derivation() -> bool:
     pa_budget, pa_source, pa_bound = _derive_argv_budget(
         cmd, margin, 5_000_000, environ)
     arg_max_total = 5_000_000 - _overhead(cmd, environ, margin)
+    # The exact per-arg cap is _MAX_ARG_STRLEN - 1 - margin: the kernel's
+    # per-argument length check counts the terminating NUL, so the usable
+    # CONTENT is one byte below the constant.
+    per_arg_exact = _MAX_ARG_STRLEN - 1 - margin
     per_arg_binds = (pa_bound == "per_arg"
-                     and pa_budget == _MAX_ARG_STRLEN - margin
+                     and pa_budget == per_arg_exact
                      and pa_budget != arg_max_total
                      and pa_source == "sysconf")
     ok = ok and per_arg_binds
     print(f"  [{'PASS' if per_arg_binds else 'FAIL'}] budget: per-arg cap binds "
-          f"({pa_budget} == {_MAX_ARG_STRLEN - margin}, not {arg_max_total})")
+          f"({pa_budget} == {per_arg_exact}, not {arg_max_total})")
+
+    # PER-ARG CAP IS EXACT AT margin=0. The default margin swamps the NUL, so
+    # the off-by-one only surfaces here: with no margin the returned budget must
+    # be exactly _MAX_ARG_STRLEN - 1, so a prompt packed to it plus its NUL sits
+    # exactly at the kernel limit -- not one byte over (E2BIG at the boundary).
+    zm_budget, _, zm_bound = _derive_argv_budget(cmd, 0, 5_000_000, environ)
+    zero_margin_exact = zm_bound == "per_arg" and zm_budget == _MAX_ARG_STRLEN - 1
+    ok = ok and zero_margin_exact
+    print(f"  [{'PASS' if zero_margin_exact else 'FAIL'}] budget: per-arg cap "
+          f"exact at margin=0 ({zm_budget} == {_MAX_ARG_STRLEN - 1})")
 
     # ...and the bound is LOGGED in prompt_budget so the transcript explains it.
     orig_am = orch._os_arg_max

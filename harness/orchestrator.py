@@ -438,7 +438,12 @@ def _derive_argv_budget(cmd, margin_bytes: int, arg_max: int | None,
 
     # Apply the stricter of the total limit and Linux's per-argument cap, and
     # report which one bound so the transcript explains the budget.
-    per_arg = _MAX_ARG_STRLEN - margin_bytes
+    # The `- 1` is NOT redundant with the margin: Linux's per-argument check
+    # counts the terminating NUL. copy_strings() rejects when
+    # strnlen_user(str, MAX_ARG_STRLEN) -- which INCLUDES the NUL -- exceeds
+    # _MAX_ARG_STRLEN, so the usable CONTENT is one byte less than the constant.
+    # Keep it explicit; do not "simplify" it into the margin.
+    per_arg = _MAX_ARG_STRLEN - 1 - margin_bytes
     if per_arg < total:
         return per_arg, source, "per_arg"
     return total, source, "arg_max"
