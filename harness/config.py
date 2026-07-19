@@ -12,14 +12,32 @@ backends for THIS machine* -- which CLI/path backs the reviewer and tiebreaker
 roles. It is written by `potluck resolve` (see harness/resolve.py) and never
 committed, exactly like credentials: model paths differ per machine, defaults
 must stay portable.
+
+EXTRACTED IN PART to harness_core 2026-07-18 (engine extraction, step 3).
+config.py is a SPLIT, and a PERMANENT one — the two harnesses' `Timeouts`,
+`DebateConfig`, `Models` and `HarnessConfig` genuinely differ (potluck has
+`gate_seconds` and `DiffConfig` for a subprocess gate menu lacks; menu has
+`run_seconds` and `exhaustion_threshold` for a tripwire potluck lacks), so
+forcing one shape on both would put profile knowledge in the core, which HC4
+forbids. See AMENDMENTS A-3.
+
+What moved: `EscalationConfig`, `Backend`, and the layering MOVES —
+`read_layers`, `overlay_keys`, `overlay_sections`, `overlay_backend`. What
+stayed: the composed shapes above, the role names `_apply_models` iterates,
+the env knobs `_apply_env` reads, `validate()`'s invariants, and the default
+resolved-file location — every one of them potluck vocabulary.
 """
 
 from __future__ import annotations
 
 import os
-import tomllib
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+
+from harness_core.config import (  # noqa: F401  (EscalationConfig/Backend re-exported)
+    Backend, EscalationConfig, overlay_backend, overlay_keys, overlay_sections,
+    read_layers,
+)
 
 
 @dataclass
@@ -45,32 +63,10 @@ class DebateConfig:
     # (When tiebreaker is off, ANY unresolved blocking issue escalates.)
 
 
-@dataclass
-class EscalationConfig:
-    # A single timeout is retried once, transparently.
-    retries_before_counting: int = 1
-    # Escalate if this many timeouts accumulate within one feature...
-    timeout_count_threshold: int = 3
-    # ...OR if the SAME step times out this many times in a row.
-    # (Consecutive same-step timeouts usually mean a broken environment,
-    #  which is a different signal from scattered provider slowness.)
-    consecutive_same_step_threshold: int = 2
-
-
-@dataclass
-class Backend:
-    """One resolved model backend for a role.
-
-    `cmd` is a CLI invocation template; the reply comes back on stdout. `fmt`
-    selects how we extract the model's message from that stdout (Codex wraps it
-    in JSONL; Claude and Kimi return plain text). `stdin` says how the prompt is
-    delivered: True feeds it on stdin (Claude `-p`, Codex `exec`); False appends
-    it as a final argv argument (Kimi `-p <prompt>`).
-    """
-    name: str = "claude"                                   # claude | codex | kimi
-    cmd: list[str] = field(default_factory=lambda: ["claude", "-p"])
-    fmt: str = "text"                                      # text | codex_jsonl
-    stdin: bool = True
+# `EscalationConfig` and `Backend` are imported from harness_core above.
+# Both were byte-identical in the two harnesses, which is exactly the bar
+# A-3 set for the core owning a piece. They stay importable from here so no
+# call site had to change.
 
 
 @dataclass
@@ -130,16 +126,15 @@ class HarnessConfig:
     def load(cls, profile_path: Path | None = None,
              resolved_path: Path | None = None) -> "HarnessConfig":
         cfg = cls()
-        if profile_path and profile_path.exists():
-            with open(profile_path, "rb") as f:
-                cfg._apply(tomllib.load(f))
-        # Machine-local model resolution takes precedence over the profile.
+        # Where potluck keeps its machine-local resolution is potluck's
+        # business; the core is handed paths, never asked to find them.
         if resolved_path is None:
             from .paths import resolved_path as _default_resolved
             resolved_path = _default_resolved()
-        if resolved_path and resolved_path.exists():
-            with open(resolved_path, "rb") as f:
-                cfg._apply(tomllib.load(f))
+        # Lowest precedence first: machine-local model resolution takes
+        # precedence over the profile. The ORDER of this list is the layering.
+        for layer in read_layers([profile_path, resolved_path]):
+            cfg._apply(layer)
         cfg._apply_env()
         cfg.validate()
         return cfg
@@ -187,37 +182,31 @@ class HarnessConfig:
             )
 
     def _apply(self, data: dict) -> None:
-        for k in ("profile", "interactive", "debate_enabled", "human_only_paths"):
-            if k in data:
-                setattr(self, k, data[k])
-        for section, obj in (
-            ("timeouts", self.timeouts),
-            ("debate", self.debate),
-            ("escalation", self.escalation),
-            ("diff", self.diff),
-        ):
-            if section in data:
-                for k, v in data[section].items():
-                    if hasattr(obj, k):
-                        setattr(obj, k, v)
+        # The KEYS and the SECTION names are potluck's vocabulary and stay
+        # here; the moves that consume them are the core's.
+        overlay_keys(self, data,
+                     ("profile", "interactive", "debate_enabled",
+                      "human_only_paths"))
+        overlay_sections(data, {
+            "timeouts": self.timeouts,
+            "debate": self.debate,
+            "escalation": self.escalation,
+            "diff": self.diff,
+        })
         if "models" in data:
             self._apply_models(data["models"])
 
     def _apply_models(self, m: dict) -> None:
-        # Merge field-wise onto the current backend so a partial override (e.g.
-        # a .resolved.toml table that sets only `cmd`) keeps the lower-precedence
-        # values for the fields it omits -- honouring the documented layering
-        # (defaults <- profile <- resolved <- env) at the field level.
+        # The ROLE names stay local -- potluck has a `reviewer`, menu has a
+        # `red_team`, and a core enumerating either would know one profile
+        # from another (HC4 as ruled). The field-wise merge itself is shared:
+        # a partial override (e.g. a .resolved.toml table setting only `cmd`)
+        # keeps the lower-precedence values for the fields it omits, honouring
+        # the documented layering at the FIELD level.
         for role in ("reviewer", "tiebreaker"):
             if role in m and isinstance(m[role], dict):
-                b = m[role]
-                cur = getattr(self.models, role)
-                setattr(self.models, role, Backend(
-                    name=b.get("name", cur.name),
-                    cmd=list(b.get("cmd", cur.cmd)),
-                    fmt=b.get("fmt", cur.fmt),
-                    stdin=b.get("stdin", cur.stdin),
-                ))
+                setattr(self.models, role,
+                        overlay_backend(getattr(self.models, role), m[role]))
 
     def _apply_env(self) -> None:
         # A couple of high-value env overrides for CI.
