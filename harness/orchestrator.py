@@ -2399,10 +2399,10 @@ async def real_run_gate(gate_path: str = "./.claude/verify.sh") -> str:
     if returncode == 0:
         return GateResult(
             ok=True, output=stdout.decode(errors="replace"),
-            exit_code=proc.returncode).to_json_str()
+            exit_code=returncode).to_json_str()
     return GateResult(
         ok=False, output=stderr.decode(errors="replace"),
-        exit_code=proc.returncode).to_json_str()
+        exit_code=returncode).to_json_str()
 
 
 async def real_restore_tree() -> None:
