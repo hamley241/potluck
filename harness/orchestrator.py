@@ -19,11 +19,30 @@ Flow (convergent / bug-fix & feature profiles):
   8. GATE again -> must pass
   9. PASSED -> diff + debate log surfaced for human approval
 
-The four control guarantees, all visible here:
+The five control guarantees, all visible here:
   * round cap with early exit            (steps 3, 5)
   * structured verdicts                  (schemas drive every branch)
   * human escalation on disagreement     (step 6)
   * timeout-with-escalation on hangs      (StepRunner wraps every external call)
+  * inaction is never completion         (an accepted issue creates an
+                                          OBLIGATION that discharges only through
+                                          OBSERVABLE CHANGE; a non-answer is never
+                                          silently treated as approved)
+
+That fifth guarantee entered the record after a live foreign-repo run reported a
+false PASSED: the doer's implement changed nothing, the gate passed trivially on
+the unchanged tree, the reviewer's issues were all ACCEPTED (not rejected, so the
+debate loop exited with nothing unresolved), apply_fixes then changed nothing,
+and the gate passed trivially again -- PASSED on an empty diff that both the
+reviewer and the doer had agreed was not implemented. Non-WORK is a non-answer
+too. The cause was that acceptance was booked as RESOLUTION on the assumption
+apply_fixes discharges it -- and assumptions are not invariants. Its mechanical
+form is two checks in `_run`: an EMPTY diff after doer:implement escalates
+(step 1a), and a NON-EMPTY accepted set whose apply_fixes leaves the diff
+UNCHANGED FROM ITS PRE-APPLY STATE escalates (step 7). "No change was needed" is
+a legitimate outcome, but ONLY A HUMAN MAY CONCLUDE it: the machine escalates
+WITH THE EVIDENCE and never infers it -- the same line drawn by refusing to treat
+a timeout as approval.
 
 The doer steps are abstracted behind a DoerClient so this file stays testable
 without invoking Claude Code, and so the same loop drives any convergent profile.
@@ -1132,6 +1151,28 @@ class Orchestrator:
         #    with no step-level signal).
         await self._doer_implement(spec, acceptance)
 
+        # 1a. Inaction guarantee, Member A: capture the diff the implement step
+        #     produced BEFORE the gate. An EMPTY diff is no signal -- a fix run
+        #     that changed nothing has not done the job, and the gate would pass
+        #     trivially on the unchanged tree (the exact green-gate-on-empty-diff
+        #     blind spot this guarantee closes). "No change was needed" is a
+        #     legitimate outcome, but ONLY A HUMAN MAY CONCLUDE it: escalate WITH
+        #     THE EVIDENCE (a detail stating what was observed, not a conclusion)
+        #     via the established ModelUnavailable("doer", ...) no-signal channel,
+        #     and never infer it -- the same line drawn by refusing to treat a
+        #     timeout as approval. The diff is captured once here and reused for
+        #     the review below (the gate is local read-only tooling and does not
+        #     change the tree, so a second capture would cost a bounded step for
+        #     no analytic gain).
+        diff = await self._capture_diff("initial")
+        if not diff.strip():
+            raise ModelUnavailable(
+                "doer",
+                "doer:implement produced no changes; a fix run that changed "
+                "nothing has not done the job. If no change was genuinely "
+                "required, a human must confirm that -- the loop cannot infer "
+                "it.")
+
         # 2. Gate (correctness is settled by tools, not opinion)
         passed, detail = await self._gate_or_escalate("initial")
         if not passed:
@@ -1141,24 +1182,6 @@ class Orchestrator:
 
         # If debate disabled (e.g. CI) or diff touches human-only paths,
         # stop at the deterministic gate.
-        # get_diff runs under StepRunner like every other external step -- a
-        # hung git (lock contention, huge repo) otherwise stalls the feature
-        # until the coarse feature_seconds budget fires, losing the step-level
-        # signal the design is built on. gate_seconds is the right bound:
-        # get_diff, like the gate, is local deterministic tooling, so it reuses
-        # that knob rather than adding a dead new one. StepRunner returns the
-        # coroutine's value unchanged, so res.output is already the diff str.
-        diff_res = await self.runner.run(
-            "get_diff", lambda: self.get_diff(),
-            self.cfg.timeouts.gate_seconds)
-        if diff_res.timed_out:
-            raise TimeoutEscalation(
-                "get_diff_no_signal",
-                "get_diff hung; cannot assemble the review diff")
-        if not diff_res.ok:
-            raise ModelUnavailable(
-                "get_diff", diff_res.error or "get_diff errored")
-        diff = diff_res.output
         if not self.cfg.debate_enabled:
             self._log("debate_skipped", reason="disabled_by_profile")
             return FeatureResult(Outcome.PASSED, 0, self.log)
@@ -1273,11 +1296,52 @@ class Orchestrator:
         #    step 8 still runs (it is local + deterministic and guards against
         #    any unexpected tree mutation during debate).
         if accepted_issues_by_id:
+            accepted_ids = sorted(accepted_issues_by_id)
+            # Inaction guarantee, Member B: an accepted issue creates an
+            # OBLIGATION that discharges only through OBSERVABLE CHANGE. Capture
+            # the diff immediately BEFORE and immediately AFTER apply_fixes and
+            # require the post-apply diff to DIFFER FROM THE PRE-APPLY diff.
+            #
+            # The assertion is CHANGED-FROM-PRE-APPLY, NOT merely non-empty: the
+            # implement step's own changes are already in the tree, so a
+            # non-empty check would be satisfied by them and would MASK
+            # apply_fixes doing nothing -- which is exactly the failure being
+            # closed (the reviewer AND the doer agreed the work was not done, yet
+            # the run reported success). Non-empty pins the wrong invariant;
+            # changed-from-pre-apply pins the right one.
+            #
+            # RESIDUAL (stated, not defended): a doer making a trivial cosmetic
+            # change (a whitespace edit) would satisfy this diff-changed floor
+            # without addressing the issue. We do NOT build a defense against
+            # that now: the deterministic floor plus the standing post-loop human
+            # review covers it, and a semantic "does this diff address the issue?"
+            # check is a model call with its own failure modes. TRIGGER: if a
+            # false PASSED ever recurs THROUGH this invariant via a cosmetic
+            # change, THAT is when a final fresh-context pass ("does the applied
+            # diff actually address the accepted issues?") gets built. Evidence
+            # first, machinery second.
+            pre_diff = await self._capture_diff("pre-apply")
             await self._doer_apply_fixes(
-                [accepted_issues_by_id[k]
-                 for k in sorted(accepted_issues_by_id)],
-                diff)
+                [accepted_issues_by_id[k] for k in accepted_ids], diff)
+            post_diff = await self._capture_diff("post-apply")
+            # Log both diff sizes so the transcript shows what was actually
+            # produced (the no-silent-caps habit) -- never just the verdict.
+            self._log("apply_fixes_diff",
+                      accepted_ids=accepted_ids,
+                      pre_bytes=len(pre_diff.encode("utf-8")),
+                      post_bytes=len(post_diff.encode("utf-8")),
+                      changed=(post_diff != pre_diff))
+            if post_diff == pre_diff:
+                raise ModelUnavailable(
+                    "doer",
+                    f"doer:apply_fixes left the diff unchanged from its "
+                    f"pre-apply state for accepted issue(s) {accepted_ids}; an "
+                    f"accepted issue that produces no edit has not done the "
+                    f"job. If no change was genuinely required, a human must "
+                    f"confirm that -- the loop cannot infer it.")
         else:
+            # Empty accepted set: apply_fixes is already skipped (nothing to
+            # discharge), and Member B does not apply -- do not change that.
             self._log("apply_fixes_skipped", reason="no_accepted_issues")
 
         # 8. Gate again
@@ -1297,6 +1361,32 @@ class Orchestrator:
         return result
 
     # --- bounded wrappers around external steps ---
+
+    async def _capture_diff(self, label: str) -> str:
+        """Run get_diff under StepRunner and return the diff string. get_diff
+        runs bounded like every other external step -- a hung git (lock
+        contention, huge repo) otherwise stalls the feature until the coarse
+        feature_seconds budget fires, losing the step-level signal the design is
+        built on. gate_seconds is the right bound: get_diff, like the gate, is
+        local deterministic tooling, so it reuses that knob rather than adding a
+        dead new one. StepRunner returns the coroutine's value unchanged, so
+        res.output is already the diff str.
+
+        Shared by the initial review capture and the inaction-guarantee captures
+        (pre/post apply_fixes, Member B). `label` names the capture point so a
+        hang/error names WHERE it happened in the transcript; a hang escalates as
+        a timeout and an errored callable as no-signal, same contract everywhere."""
+        res = await self.runner.run(
+            "get_diff", lambda: self.get_diff(),
+            self.cfg.timeouts.gate_seconds)
+        if res.timed_out:
+            raise TimeoutEscalation(
+                "get_diff_no_signal",
+                f"get_diff hung ({label}); cannot assemble the review diff")
+        if not res.ok:
+            raise ModelUnavailable(
+                "get_diff", res.error or "get_diff errored")
+        return res.output
 
     async def _gate_or_escalate(self, label: str) -> tuple[bool, str]:
         """Run the gate, return (passed, detail). `detail` is the gate's

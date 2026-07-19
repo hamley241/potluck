@@ -67,9 +67,17 @@ class AcceptingDoer(StubDoer):
     """Doer that ACCEPTS every issue the reviewer raises, driving the debate
     loop through apply_fixes + the post-fix gate to the FINAL (step-9) PASSED
     return -- the second place the closure sweep must attach. Records
-    apply_fixes calls so a test can confirm fixes really flowed."""
-    def __init__(self):
+    apply_fixes calls so a test can confirm fixes really flowed.
+
+    Wired to a `MutatingDiff` so apply_fixes observably changes the tree: the
+    inaction guarantee (orchestrator's fifth control guarantee) now escalates an
+    accepted issue whose apply produced no edit, so a step-9 stub that leaves the
+    diff untouched would (correctly) escalate instead of PASSED. Modeling a real
+    apply is what lets these tests reach the FINAL PASSED they are asserting on."""
+    def __init__(self, diff):
         self.apply_fixes_calls: list[dict] = []
+        self._diff = diff
+        self._napply = 0
 
     async def respond_to_review(self, spec, acceptance, diff, verdict):
         return DoerResponse(responses=[
@@ -79,6 +87,10 @@ class AcceptingDoer(StubDoer):
     async def apply_fixes(self, issues, diff):
         self.apply_fixes_calls.append(
             {"issues": [i.model_dump() for i in issues]})
+        # Advance the tree diff so the post-apply capture DIFFERS from pre-apply
+        # (observable change discharges the accepted-issue obligation).
+        self._napply += 1
+        self._diff.state += f"@@ applied {self._napply} @@\n+fix\n"
         return "applied"
 
 
@@ -123,15 +135,33 @@ def make(cfg, doer, reviewer, gate, diff):
                         ab_swap=lambda _id: False)
 
 
+def _diff_header(paths):
+    """The `diff --git` header text naming each of `paths`."""
+    return "".join(
+        f"diff --git a/{p} b/{p}\n@@ -1 +1 @@\n-old\n+new\n" for p in paths)
+
+
 def diff_for(paths):
     """An async get_diff returning a diff whose `diff --git` headers name each
     of `paths` (the sites just fixed -- the sweep must exclude them)."""
-    header = "".join(
-        f"diff --git a/{p} b/{p}\n@@ -1 +1 @@\n-old\n+new\n" for p in paths)
+    header = _diff_header(paths)
 
     async def _diff():
         return header
     return _diff
+
+
+class MutatingDiff:
+    """A stateful get_diff whose output can be advanced by a wired doer, so the
+    step-9 tests can model apply_fixes making a real edit -- required now that
+    the orchestrator escalates an accepted issue whose apply produced no
+    observable change. Seeded with the touched-path header so the closure sweep
+    (which reuses the step-3 diff) still sees the fixed sites to exclude."""
+    def __init__(self, paths):
+        self.state = _diff_header(paths)
+
+    async def __call__(self):
+        return self.state
 
 
 def _init_repo(tmp, files):
@@ -391,8 +421,9 @@ async def main():
              "patterns": [{"regex": "STEP9_MARKER",
                            "rationale": "same unchecked-result shape"}]},
             review_reply=blocking)
-        doer = AcceptingDoer()
-        orch = make(cfg, doer, reviewer, gate_pass, diff_for(["src/feature.py"]))
+        mdiff = MutatingDiff(["src/feature.py"])
+        doer = AcceptingDoer(mdiff)
+        orch = make(cfg, doer, reviewer, gate_pass, mdiff)
         r = await _run_in_repo(tmp, orch)
     events = [e["event"] for e in r.debate_log]
     check("step9_passed", r.outcome == Outcome.PASSED)
@@ -424,8 +455,9 @@ async def main():
         reviewer = ClosureReviewer(
             cfg, {"bug_class": "none", "patterns": []},
             review_reply=blocking)
-        doer = AcceptingDoer()
-        orch = make(cfg, doer, reviewer, gate_pass, diff_for(["src/feature.py"]))
+        mdiff = MutatingDiff(["src/feature.py"])
+        doer = AcceptingDoer(mdiff)
+        orch = make(cfg, doer, reviewer, gate_pass, mdiff)
         r = await _run_in_repo(tmp, orch)
     events = [e["event"] for e in r.debate_log]
     clean_ev = [e for e in r.debate_log if e["event"] == "closure_clean"]

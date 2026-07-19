@@ -178,6 +178,53 @@ async def diff_rename_out_of_sensitive():
     return ("diff --git a/src/security/legacy.py b/src/util/legacy.py\n"
             "similarity index 100%\nrename from src/security/legacy.py\n"
             "rename to src/util/legacy.py\n")
+# An empty diff: the implement step changed NOTHING. Reproduces the observed
+# false-PASSED input for the inaction guarantee (Member A) -- a fix run that
+# changed nothing.
+async def diff_empty():
+    return ""
+
+
+class MutatingDiff:
+    """A stateful get_diff stub whose output tracks tree mutations, so a test
+    can model 'implement changed the tree' and 'apply_fixes changed the tree'
+    independently -- required now that the orchestrator asserts OBSERVABLE
+    CHANGE at both boundaries (inaction is never completion). Starts empty
+    (nothing implemented yet); a wired WorkingDoer advances `state`."""
+    def __init__(self):
+        self.state = ""
+
+    async def __call__(self):
+        return self.state
+
+
+class WorkingDoer(StubDoer):
+    """Doer wired to a MutatingDiff. implement() writes a first non-empty diff
+    (satisfies Member A); apply_fixes() advances the diff to a DIFFERENT value
+    when `apply_changes` (satisfies Member B's changed-from-pre-apply floor) and
+    leaves it unchanged otherwise (drives the Member B escalation). Still records
+    apply_fixes calls like StubDoer so context-threading assertions keep working."""
+    _IMPLEMENT_DIFF = ("diff --git a/src/feature.py b/src/feature.py\n"
+                       "@@ -1 +1 @@\n-old\n+new\n")
+
+    def __init__(self, decisions, diff, *, apply_changes=True):
+        super().__init__(decisions)
+        self.diff = diff
+        self.apply_changes = apply_changes
+        self._napply = 0
+
+    async def implement(self, spec, acceptance):
+        self.diff.state = self._IMPLEMENT_DIFF
+        return "implemented"
+
+    async def apply_fixes(self, issues, diff):
+        self.apply_fixes_calls.append(
+            {"issues": [i.model_dump() for i in issues], "diff": diff})
+        self._napply += 1
+        if self.apply_changes:
+            # A real edit: extend the tree diff so the post-apply capture differs.
+            self.diff.state += f"@@ apply {self._napply} @@\n+fix\n"
+        return "applied"
 
 
 def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None, restore_tree=None):
@@ -620,8 +667,13 @@ async def main():
         first={"issues": [{"id": "M1", "severity": "major",
                            "issue": "MAJOR_ISSUE_TEXT",
                            "suggested_fix": "MAJOR_FIX_TEXT"}]})
-    doer = StubDoer({"M1": "accept"})
-    orch = make(cfg, doer, reviewer, None, gate_pass, diff_plain)
+    # WorkingDoer (not StubDoer) so implement + apply_fixes each observably
+    # change the tree: the inaction guarantee (Member A/B) now escalates a
+    # no-op implement or a no-op apply, so a doer whose apply_fixes changed
+    # nothing would be a false escalation here, not a PASSED.
+    mdiff = MutatingDiff()
+    doer = WorkingDoer({"M1": "accept"}, mdiff)
+    orch = make(cfg, doer, reviewer, None, gate_pass, mdiff)
     r = await orch.run_feature("spec", "acc")
     assert len(doer.apply_fixes_calls) == 1, \
         f"expected 1 apply_fixes call, got {len(doer.apply_fixes_calls)}"
@@ -2052,6 +2104,130 @@ async def main():
     assert extracted == "the real answer", \
         f"nested-to-death line must be skipped and later valid line win, got {extracted!r}"
 
+    # === Fifth control guarantee: inaction is never completion ===
+
+    # 50. REGRESSION (Member C -- non-negotiable): reproduce the EXACT observed
+    # false-PASSED sequence -- a doer whose implement changes NOTHING (empty
+    # diff), a gate that passes, a reviewer raising a BLOCKING issue, a doer that
+    # ACCEPTS it, and an apply_fixes that changes nothing. Pre-fix this reported
+    # PASSED on an empty working tree; it must now ESCALATE, and the escalation
+    # reason must name the inaction. (Post-fix, Member A fires first -- the empty
+    # implement diff is caught before the reviewer is even consulted -- so the
+    # reviewer/accept setup below is the sequence that WOULD have passed, exactly
+    # the point of a regression test for a false PASSED.)
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "not implemented",
+                           "suggested_fix": "implement it"}]})
+    doer = StubDoer({"I1": "accept"})   # accept-all: nothing is REJECTED
+    orch = make(cfg, doer, reviewer, None, gate_pass, diff_empty)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome != Outcome.PASSED, \
+        f"a no-op implement + accept-all + no-op apply must NOT PASS, got {r.outcome}"
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"the observed sequence must escalate no-signal, got {r.outcome}"
+    assert r.escalation_reason and "produced no changes" in r.escalation_reason, \
+        f"escalation reason must name the inaction: {r.escalation_reason!r}"
+    results["inaction_reproduction_escalates"] = (r.outcome, r.rounds_used)
+
+    # 51. (Tests #2) An EMPTY implement diff ALONE escalates -- no reviewer
+    # needed to reach it. We wire a reviewer that RAISES if consulted; because
+    # Member A fires before the review, the escalation is tagged [doer] (not
+    # [reviewer]), proving the empty-diff guard short-circuits ahead of the
+    # reviewer.
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), ErrorReviewer(cfg), None,
+                gate_pass, diff_empty)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"empty implement diff must escalate no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[doer]" in r.escalation_reason, \
+        f"empty-diff escalation must be tagged [doer] (before reviewer): {r.escalation_reason!r}"
+    assert "produced no changes" in r.escalation_reason, \
+        f"escalation reason must state the evidence: {r.escalation_reason!r}"
+    # "no change needed" is explicitly left as a human-only conclusion.
+    assert "a human must confirm" in r.escalation_reason and \
+        "cannot infer" in r.escalation_reason, \
+        f"reason must leave 'no change needed' to a human: {r.escalation_reason!r}"
+    results["inaction_empty_implement_escalates"] = (r.outcome, r.rounds_used)
+
+    # 52. (Member B, precise) An accepted issue whose apply_fixes changes NOTHING
+    # escalates -- even though the diff is NON-EMPTY. implement changes the tree
+    # (passes Member A), the reviewer raises a blocking issue, the doer ACCEPTS
+    # it, and apply_fixes leaves the diff unchanged. A non-empty check would be
+    # fooled by the implement diff already in the tree; the assertion is
+    # CHANGED-FROM-PRE-APPLY, so this must escalate and name the accepted id.
+    cfg = HarnessConfig()
+    mdiff = MutatingDiff()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]})
+    doer = WorkingDoer({"I1": "accept"}, mdiff, apply_changes=False)
+    orch = make(cfg, doer, reviewer, None, gate_pass, mdiff)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"a no-op apply on an accepted issue must escalate, got {r.outcome}"
+    assert r.escalation_reason and "I1" in r.escalation_reason, \
+        f"Member B escalation must name the accepted id: {r.escalation_reason!r}"
+    assert "unchanged from its pre-apply state" in r.escalation_reason, \
+        f"Member B escalation must state the evidence: {r.escalation_reason!r}"
+    # apply_fixes DID run (the obligation was attempted, not skipped); the
+    # transcript logs both diff sizes so what was produced is visible.
+    assert len(doer.apply_fixes_calls) == 1, \
+        f"apply_fixes must run for a non-empty accepted set: {doer.apply_fixes_calls}"
+    afd = [e for e in r.debate_log if e["event"] == "apply_fixes_diff"]
+    assert afd and afd[0]["changed"] is False, \
+        f"apply_fixes_diff must log changed=False on a no-op apply: {afd!r}"
+    assert "pre_bytes" in afd[0] and "post_bytes" in afd[0], \
+        f"apply_fixes_diff must log both pre/post diff sizes: {afd[0]!r}"
+    results["inaction_noop_apply_escalates"] = (r.outcome, r.rounds_used)
+
+    # 53. (Tests #3) A NORMAL run still PASSES: real change at implement, issue
+    # accepted, apply_fixes edits the tree. This is the check that the new
+    # invariant has not made the loop unusable -- no false escalation.
+    cfg = HarnessConfig()
+    mdiff = MutatingDiff()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]})
+    doer = WorkingDoer({"I1": "accept"}, mdiff, apply_changes=True)
+    orch = make(cfg, doer, reviewer, None, gate_pass, mdiff)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.PASSED, \
+        f"a normal run with real changes + real apply must PASS, got {r.outcome}"
+    assert len(doer.apply_fixes_calls) == 1, "apply_fixes must have run"
+    afd = [e for e in r.debate_log if e["event"] == "apply_fixes_diff"]
+    assert afd and afd[0]["changed"] is True, \
+        f"a real apply must log apply_fixes_diff changed=True: {afd!r}"
+    results["inaction_normal_run_passes"] = (r.outcome, r.rounds_used)
+
+    # 54. (Tests #4) The empty-accepted-set path still SKIPS apply_fixes and
+    # still PASSES -- Member B does not apply where there is nothing to
+    # discharge. Reviewer raises a blocking issue, the doer REJECTS it, the
+    # reviewer concedes: the accepted set is empty, apply_fixes is skipped, and
+    # the run converges. (Distinct from #25 in that it explicitly re-pins the
+    # skip survives the new Member B check.)
+    cfg = HarnessConfig()
+    mdiff = MutatingDiff()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]},
+        followups=[{"issues": []}])  # reviewer concedes -> nothing held
+    doer = WorkingDoer({"I1": "reject"}, mdiff)
+    orch = make(cfg, doer, reviewer, None, gate_pass, mdiff)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.PASSED, \
+        f"empty accepted set must skip apply and PASS, got {r.outcome}"
+    assert doer.apply_fixes_calls == [], \
+        f"apply_fixes must be skipped for an empty accepted set: {doer.apply_fixes_calls}"
+    events = [e["event"] for e in r.debate_log]
+    assert "apply_fixes_skipped" in events, \
+        f"empty accepted set must log apply_fixes_skipped: {events}"
+    assert not any(e == "apply_fixes_diff" for e in events), \
+        "the skipped path must NOT log apply_fixes_diff (Member B does not apply)"
+    results["inaction_empty_accept_still_skips"] = (r.outcome, r.rounds_used)
+
     # report
     expected = {
         "early_exit": (Outcome.PASSED, 0),
@@ -2100,6 +2276,15 @@ async def main():
         "invariant_tiebreaker_malformed_escalates": (
             Outcome.ESCALATED_NO_SIGNAL, 2),
         "invariant_verdict_array_shapes_parse": (Outcome.PASSED, 0),
+        # Fifth guarantee: inaction is never completion. Member A fires before
+        # the reviewer, so rounds_used=0 for the empty-implement cases.
+        "inaction_reproduction_escalates": (Outcome.ESCALATED_NO_SIGNAL, 0),
+        "inaction_empty_implement_escalates": (Outcome.ESCALATED_NO_SIGNAL, 0),
+        # Member B fires after round 1 completes (issue accepted), so
+        # rounds_used=1.
+        "inaction_noop_apply_escalates": (Outcome.ESCALATED_NO_SIGNAL, 1),
+        "inaction_normal_run_passes": (Outcome.PASSED, 1),
+        "inaction_empty_accept_still_skips": (Outcome.PASSED, 1),
     }
     ok = True
     for name, got in results.items():
