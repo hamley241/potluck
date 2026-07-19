@@ -58,7 +58,7 @@ from harness.schemas import DoerResponse, IssueResponse, Outcome
 
 class StubDoer(DoerClient):
     async def implement(self, spec, acceptance): return "implemented"
-    async def respond_to_review(self, spec, acceptance, diff, verdict):
+    async def respond_to_review(self, spec, acceptance, diff, verdict, retry_note=None):
         return DoerResponse(responses=[])
     async def apply_fixes(self, issues, diff): return "applied"
 
@@ -79,7 +79,7 @@ class AcceptingDoer(StubDoer):
         self._diff = diff
         self._napply = 0
 
-    async def respond_to_review(self, spec, acceptance, diff, verdict):
+    async def respond_to_review(self, spec, acceptance, diff, verdict, retry_note=None):
         return DoerResponse(responses=[
             IssueResponse(id=i.id, decision="accept", reasoning="stub")
             for i in verdict.issues])
@@ -109,10 +109,10 @@ class ClosureReviewer(ReviewerClient):
                              else {"issues": []})
         self.closure_calls = 0
 
-    async def review(self, spec, acceptance, diff):
+    async def review(self, spec, acceptance, diff, retry_note=None):
         return json.dumps(self.review_reply)
 
-    async def respond(self, spec, acceptance, diff, rejections):
+    async def respond(self, spec, acceptance, diff, rejections, retry_note=None):
         return json.dumps({"issues": []})
 
     async def closure_scan(self, spec, diff, retry_note=None):

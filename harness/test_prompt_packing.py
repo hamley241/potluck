@@ -231,7 +231,7 @@ def test_framing_exact_fit_no_diff() -> bool:
 
 class _StubDoer(DoerClient):
     async def implement(self, spec, acceptance): return "done"
-    async def respond_to_review(self, spec, acceptance, diff, verdict):
+    async def respond_to_review(self, spec, acceptance, diff, verdict, retry_note=None):
         return DoerResponse(responses=[])
     async def apply_fixes(self, issues, diff): return "applied"
 

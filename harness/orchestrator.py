@@ -215,15 +215,6 @@ def _schema_tail(schema: str) -> str:
     return f"Return exactly ONE JSON value matching: {schema}"
 
 
-def _note_kw(retry_note: str | None) -> dict:
-    """Thread the bounded re-prompt's correction note to a client as a kwarg --
-    but ONLY when there is one. On the first attempt (`None`) the client is
-    called with no `retry_note` at all, so the prompt it builds is BYTE-IDENTICAL
-    to today's and stubs that predate this param keep working; only the single
-    recovery call carries the note."""
-    return {"retry_note": retry_note} if retry_note is not None else {}
-
-
 def _with_retry_note(tail: str, retry_note: str | None) -> str:
     """Append the correction note AFTER slice A's schema tail so the concrete
     defect is the LAST thing the model reads. `None` (the first attempt) returns
@@ -260,6 +251,50 @@ def _retry_note(e: Exception, schema: str) -> str:
                 f"return exactly one object matching this schema: {schema}")
     return (f"your reply could not be parsed: {e}; "
             f"return exactly one object matching this schema: {schema}")
+
+
+# The two defect kinds slice B3's instrumentation splits malformed replies by.
+_DEFECT_KINDS = ("ambiguity", "validation")
+
+# The five message types the bounded re-prompt fires for -- one per boundary
+# threaded through `_call_and_parse`. Kept distinct from the `step` strings
+# ("reviewer:review", ...) and the `role` strings ("reviewer", ...): a message
+# type is what the retry instrumentation counts by, and the reviewer role
+# produces THREE of them (review / followup / closure), so neither existing
+# axis is a substitute.
+_MSG_TYPES = ("review", "followup", "doer_response", "tiebreak", "closure")
+
+
+def _new_reprompt_metrics() -> dict:
+    """The per-message-type re-prompt counters (slice B3's measuring device).
+    For every message type: `malformed_seen` split by defect kind, the number
+    of `reprompts_issued`, and the retry `cured`/`recurred` tally. Fully
+    pre-seeded (every type, every defect kind at 0) so a before/after read never
+    has to distinguish "key absent" from "count zero" -- a zero that was
+    measured and a zero that was never looked at are different claims, and the
+    dense shape keeps them from being confused (scope-of-claim)."""
+    return {
+        mt: {
+            "malformed_seen": {k: 0 for k in _DEFECT_KINDS},
+            "reprompts_issued": 0,
+            "cured": 0,
+            "recurred": 0,
+        }
+        for mt in _MSG_TYPES
+    }
+
+
+def _defect_kind(e: Exception) -> str:
+    """Classify a parse failure into the two kinds B3 measures. `ambiguity` --
+    the reply carried more than one top-level JSON value and the core refused to
+    guess (`jsonx.AmbiguousJSON`). `validation` -- EVERYTHING else a bad MODEL
+    REPLY raises: no JSON found, a non-object, a pydantic schema mismatch,
+    nested-to-death. AmbiguousJSON subclasses ValueError, so it MUST be tested
+    first or it falls through to `validation`. This is a pure classifier of the
+    exception the shared boundary already caught; it opens no new catch."""
+    if isinstance(e, jsonx.AmbiguousJSON):
+        return "ambiguity"
+    return "validation"
 
 
 def _now_iso() -> str:
@@ -1237,6 +1272,12 @@ class Orchestrator:
         # a deterministic function so they can assert on which side "wins".
         self._ab_swap = ab_swap or (lambda _id: random.random() < 0.5)
         self.log: list[dict] = []
+        # Per-message-type re-prompt counters (slice B3). The measuring device
+        # for the malformed-reply before/after: seen-by-defect, re-prompts
+        # issued, cured vs recurred. Updated ALONGSIDE the `reprompt` log event
+        # in one helper so the aggregate and the event stream cannot diverge;
+        # reading them changes no control flow.
+        self._reprompt_metrics = _new_reprompt_metrics()
         # Route each client's prompt instrumentation into this run's debate log
         # so prompt_size/prompt_large/prompt_packed events are captured. Done
         # here (not in cli wiring) because the clients are handed to us already
@@ -1782,8 +1823,8 @@ class Orchestrator:
             return
         self._log("tree_restored", reason=reason)
 
-    async def _call_and_parse(self, *, step, role, call, parse, timeout,
-                              on_timeout, schema, malformed_prefix=None,
+    async def _call_and_parse(self, *, step, role, msg_type, call, parse,
+                              timeout, on_timeout, schema, malformed_prefix=None,
                               not_ok_detail=None,
                               on_not_ok=None, on_malformed=None):
         """The ONE shared model-call-and-parse boundary. Does exactly what each
@@ -1841,6 +1882,13 @@ class Orchestrator:
             return parse(res.output)
         except (ValueError, RecursionError) as e:
             # ONE bounded re-prompt: state the exact defect and ask again ONCE.
+            # Instrumentation (slice B3): a malformed reply of this defect kind
+            # was seen and a re-prompt is about to issue -- count both BEFORE the
+            # retry runs, so the tally is honest even if the retry then times out
+            # or errors (outcomes that are their OWN events, not cured/recurred).
+            # The counter bump touches no branch below.
+            defect = _defect_kind(e)
+            self._reprompt_issued(msg_type, defect)
             note = _retry_note(e, schema)
             retry = await self.runner.run(step, lambda: call(note), timeout)
             # The retry is a fresh model call: its own timeout / not-ok are
@@ -1854,8 +1902,13 @@ class Orchestrator:
                     return on_not_ok(retry)
                 raise ModelUnavailable(role, retry.error or not_ok_detail)
             try:
-                return parse(retry.output)
+                parsed = parse(retry.output)
             except (ValueError, RecursionError) as e2:
+                # The defect recurred: the second reply is also malformed. Record
+                # its kind as a second malformed-seen, then escalate EXACTLY as
+                # before -- the log event and counter bump change no branch.
+                self._reprompt_outcome(msg_type, defect, "recurred",
+                                       second_defect=_defect_kind(e2))
                 if on_malformed is not None:
                     return on_malformed(e2, retry.output)
                 # Member B: carry the offending reply (truncated + length) into
@@ -1867,6 +1920,11 @@ class Orchestrator:
                     role,
                     f"{malformed_prefix}{e2} "
                     f"| payload ({plen} chars): {body}") from e2
+            # The re-prompt cured the defect: the second reply parsed. Emitted
+            # OUTSIDE the try (like the first attempt's bare `return parse(...)`)
+            # so the log/counter call can never be mistaken for a parse failure.
+            self._reprompt_outcome(msg_type, defect, "cured")
+            return parsed
 
     async def _doer_respond_to_review(self, spec: str, acceptance: str,
                                       diff: str,
@@ -1878,7 +1936,7 @@ class Orchestrator:
         # extra round-trip is trivial compared to the model call itself.
         async def _call(retry_note) -> str:
             resp = await self.doer.respond_to_review(
-                spec, acceptance, diff, verdict, **_note_kw(retry_note))
+                spec, acceptance, diff, verdict, retry_note=retry_note)
             return resp.model_dump_json()
 
         # A malformed doer JSON must NOT propagate as an uncaught traceback --
@@ -1888,7 +1946,8 @@ class Orchestrator:
         # the same narrow (ValueError, RecursionError) catch -- see
         # _call_and_parse for why that set and not a broader one.
         return await self._call_and_parse(
-            step="doer:respond", role="doer", call=_call,
+            step="doer:respond", role="doer", msg_type="doer_response",
+            call=_call,
             parse=DoerResponse.model_validate_json,
             timeout=self.cfg.timeouts.model_call_seconds,
             on_timeout=_raises(TimeoutEscalation(
@@ -1921,9 +1980,9 @@ class Orchestrator:
         # _call_and_parse for the shared timeout/not-ok/malformed handling and
         # the narrow (ValueError, RecursionError) catch it applies.
         return await self._call_and_parse(
-            step="reviewer:review", role="reviewer",
+            step="reviewer:review", role="reviewer", msg_type="review",
             call=lambda note: self.reviewer.review(
-                spec, acceptance, diff, **_note_kw(note)),
+                spec, acceptance, diff, retry_note=note),
             parse=_parse_verdict,
             timeout=self.cfg.timeouts.model_call_seconds,
             on_timeout=_raises(TimeoutEscalation(
@@ -1940,9 +1999,9 @@ class Orchestrator:
         # cleanly rather than crashing. _call_and_parse applies the shared
         # narrow (ValueError, RecursionError) catch.
         return await self._call_and_parse(
-            step="reviewer:followup", role="reviewer",
+            step="reviewer:followup", role="reviewer", msg_type="followup",
             call=lambda note: self.reviewer.respond(
-                spec, acceptance, diff, response, **_note_kw(note)),
+                spec, acceptance, diff, response, retry_note=note),
             parse=_parse_verdict,
             timeout=self.cfg.timeouts.model_call_seconds,
             on_timeout=_raises(TimeoutEscalation(
@@ -2002,9 +2061,10 @@ class Orchestrator:
             # for the narrow (ValueError, RecursionError) parse catch.
             tb = await self._call_and_parse(
                 step="tiebreaker:adjudicate", role="tiebreaker",
+                msg_type="tiebreak",
                 call=lambda note: self.tiebreaker.adjudicate(
                     spec, acceptance, diff, issue_id, arg_a, arg_b,
-                    **_note_kw(note)),
+                    retry_note=note),
                 parse=_parse_tiebreak,
                 timeout=self.cfg.timeouts.model_call_seconds,
                 on_timeout=lambda: _TIEBREAK_TIMED_OUT,
@@ -2149,9 +2209,9 @@ class Orchestrator:
         #     the model actually sent (measured before the cut), so the
         #     closure_patterns_capped log stays honest.
         parsed = await self._call_and_parse(
-            step="closure", role="reviewer",
+            step="closure", role="reviewer", msg_type="closure",
             call=lambda note: self.reviewer.closure_scan(
-                spec, diff, **_note_kw(note)),
+                spec, diff, retry_note=note),
             parse=lambda out: _parse_closure(out, self._CLOSURE_MAX_PATTERNS),
             timeout=self.cfg.timeouts.model_call_seconds,
             on_timeout=_on_timeout,
@@ -2324,6 +2384,36 @@ class Orchestrator:
     def _escalated(self, outcome: Outcome, rounds: int, reason: str) -> FeatureResult:
         self._log("escalated", outcome=outcome.value, reason=reason)
         return FeatureResult(outcome, rounds, self.log, escalation_reason=reason)
+
+    def _reprompt_issued(self, msg_type: str, defect: str) -> None:
+        """A malformed reply was seen and the ONE bounded re-prompt is about to
+        go out. Bump the two counters that do NOT depend on the retry's result:
+        a malformed reply of this `defect` kind was seen, and a re-prompt was
+        issued. Pure bookkeeping -- no log append, no branch, no raise; the
+        retry itself is unaffected (instrumentation must not change control
+        flow)."""
+        m = self._reprompt_metrics[msg_type]
+        m["malformed_seen"][defect] += 1
+        m["reprompts_issued"] += 1
+
+    def _reprompt_outcome(self, msg_type: str, defect: str, outcome: str,
+                          second_defect: str | None = None) -> None:
+        """Record the re-prompt's terminal PARSE outcome and emit the one
+        per-retry log event. `outcome` is 'cured' (the retry parsed) or
+        'recurred' (it produced a second malformed reply); `second_defect`, set
+        only on a recurrence, is that second reply's kind -- another malformed
+        reply seen. `defect` on the event is the FIRST reply's kind, the one the
+        re-prompt was written to fix. Emitting through `_log` gives this event
+        the SAME `_pack_event`/`_truncate_walk` treatment every other event
+        gets -- no second-shaped truncation at this boundary (a real slice-A
+        blocking finding). Counter bump + event share this one call site so the
+        aggregate and the stream cannot drift apart."""
+        m = self._reprompt_metrics[msg_type]
+        m[outcome] += 1
+        if second_defect is not None:
+            m["malformed_seen"][second_defect] += 1
+        self._log("reprompt", msg_type=msg_type, defect=defect,
+                  outcome=outcome)
 
     def _log(self, event: str, event_version: int = 1, **kw) -> None:
         self.log.append(_pack_event(event, event_version, **kw))

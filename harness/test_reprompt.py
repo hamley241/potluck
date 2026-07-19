@@ -20,6 +20,21 @@ mechanism to its contract:
   7. `_closure_sweep` still returns None on a twice-malformed reply and logs
      its existing `malformed` reason -- it does not start raising.
 
+Slice B3 extends the same fixture with three more:
+
+  8. (Item 1) a client whose method does NOT accept `retry_note` fails on the
+     FIRST call, VISIBLY -- a loud TypeError before any parse or retry -- not
+     deferred to the recovery path the way the deleted `_note_kw` hedge did;
+  9. (Item 3) the per-message-type re-prompt counters and the one `reprompt`
+     log event per retry: malformed-seen split by defect kind (ambiguity vs
+     validation), re-prompts issued, cured vs recurred -- the event routed
+     through `_log` so it gets the established `_pack_event`/`_truncate_walk`
+     envelope, and the instrumentation changing no control flow;
+ 10. (Item 4) the two RECONSTRUCTED fixtures classify to the defect kinds they
+     were reconstructed as -- and where a reconstruction no longer reproduces
+     against today's tree, the test asserts THAT honestly rather than faking a
+     raise.
+
 The runner is a pass-through stub that ACTUALLY invokes the client coroutine
 (so calls can be counted and the retry note captured), or returns a preset
 StepResult to force timed_out / not-ok. No real model or CLI is involved.
@@ -39,16 +54,27 @@ from harness.orchestrator import (
     ReviewerClient,
     _assemble_prompt,
     _bounded_payload,
+    _defect_kind,
     _noop_prompt_log,
     _parse_verdict,
     _parse_tiebreak,
     _retry_note,
     _schema_tail,
     _with_retry_note,
+    _MSG_TYPES,
     _REVIEW_VERDICT_SCHEMA,
     _DOER_RESPONSE_SCHEMA,
     _CLOSURE_SCHEMA,
     _tiebreak_schema,
+)
+from harness.reprompt_fixtures import (
+    SHAPE_1_DOER_WHERE_VERDICT,
+    SHAPE_1_RECONSTRUCTED_DEFECT,
+    SHAPE_1_REPRODUCES_TODAY,
+    SHAPE_2_THREE_TOP_LEVEL_VALUES,
+    SHAPE_2_RECONSTRUCTED_DEFECT,
+    SHAPE_2_EXPECTED_COUNT,
+    SHAPE_2_REPRODUCES_TODAY,
 )
 import harness_core.runner as core_runner
 from harness_core.runner import StepResult, ModelUnavailable
@@ -456,6 +482,144 @@ async def main():
           len(skips) == 1 and skips[0].get("reason") == "malformed")
     check("t7 closure: the retry happened (2 client calls)",
           len(rv.closure_notes) == 2)
+
+    # --- Test 8 (Item 1): a client lacking `retry_note` fails on the FIRST
+    # call, VISIBLY -- not deferred to the retry. `retry_note` now rides EVERY
+    # call unconditionally (the `_note_kw` hedge is deleted), so a stub whose
+    # method predates the param raises a loud TypeError on attempt one, before
+    # any parse or retry. Under the hedge, attempt one omitted the kwarg, so a
+    # legacy stub returning a VALID reply worked silently and the mismatch was
+    # deferred to the rare recovery path -- the exact latent failure obs 013
+    # names. This stub returns a VALID reply on purpose: proving the failure is
+    # the CALL, not the content.
+    class _LegacyDoer:
+        async def implement(self, spec, acceptance): return "implemented"
+        async def respond_to_review(self, spec, acceptance, diff, verdict):
+            return _Resp(_GOOD_DOER)  # valid -- but never reached
+        async def apply_fixes(self, issues, diff): return "applied"
+
+    orch = _make(doer=_LegacyDoer())
+    raised = None
+    try:
+        await _run_doer(orch)
+    except BaseException as e:  # noqa: BLE001 -- capture the exact escape
+        raised = e
+    check("t8 legacy client: raises TypeError immediately",
+          isinstance(raised, TypeError))
+    check("t8 legacy client: the TypeError names retry_note",
+          raised is not None and "retry_note" in str(raised))
+    check("t8 legacy client: failed on the FIRST call (1 call), not the retry",
+          orch.runner.calls.count("doer:respond") == 1)
+    check("t8 legacy client: did NOT reach the escalation/recovery path",
+          not isinstance(raised, ModelUnavailable))
+
+    # --- Test 9 (Item 3): per-message-type counters + the one reprompt event --
+    # (a) review, validation defect, cured on the retry.
+    rv = ScriptedReviewer(review=[_BAD, _GOOD_VERDICT])
+    orch = _make(reviewer=rv)
+    v = await _run_review(orch)
+    m = orch._reprompt_metrics["review"]
+    check("t9a review: control flow unchanged -- still returns the verdict",
+          isinstance(v, ReviewVerdict) and [i.id for i in v.issues] == ["I1"])
+    check("t9a review: reprompts_issued==1, cured==1, recurred==0",
+          m["reprompts_issued"] == 1 and m["cured"] == 1 and m["recurred"] == 0)
+    check("t9a review: malformed_seen validation==1, ambiguity==0",
+          m["malformed_seen"]["validation"] == 1
+          and m["malformed_seen"]["ambiguity"] == 0)
+    ev = [e for e in orch.log if e["event"] == "reprompt"]
+    check("t9a review: exactly one reprompt event", len(ev) == 1)
+    check("t9a review: event carries msg_type/defect/outcome",
+          ev[0].get("msg_type") == "review" and ev[0].get("defect") == "validation"
+          and ev[0].get("outcome") == "cured")
+    check("t9a review: event has the established _pack_event envelope",
+          all(k in ev[0] for k in ("event", "event_version", "ts")))
+
+    # (b) doer, always-malformed -> recurred; BOTH replies are malformed-seen.
+    dr = ScriptedDoer([_BAD])
+    orch = _make(doer=dr)
+    try:
+        await _run_doer(orch)
+    except ModelUnavailable:
+        pass
+    m = orch._reprompt_metrics["doer_response"]
+    check("t9b doer: reprompts_issued==1, recurred==1, cured==0",
+          m["reprompts_issued"] == 1 and m["recurred"] == 1 and m["cured"] == 0)
+    check("t9b doer: malformed_seen validation==2 (both attempts counted)",
+          m["malformed_seen"]["validation"] == 2)
+    ev = [e for e in orch.log if e["event"] == "reprompt"]
+    check("t9b doer: one reprompt event, outcome=recurred, type=doer_response",
+          len(ev) == 1 and ev[0].get("outcome") == "recurred"
+          and ev[0].get("msg_type") == "doer_response")
+
+    # (c) ambiguity defect: an ambiguous first reply, cured on the retry.
+    amb = _GOOD_EMPTY_VERDICT + "\n" + _GOOD_EMPTY_VERDICT
+    rv = ScriptedReviewer(review=[amb, _GOOD_VERDICT])
+    orch = _make(reviewer=rv)
+    await _run_review(orch)
+    m = orch._reprompt_metrics["review"]
+    check("t9c ambiguity: malformed_seen ambiguity==1, validation==0",
+          m["malformed_seen"]["ambiguity"] == 1
+          and m["malformed_seen"]["validation"] == 0)
+    ev = [e for e in orch.log if e["event"] == "reprompt"][0]
+    check("t9c ambiguity: event defect=ambiguity, outcome=cured",
+          ev.get("defect") == "ambiguity" and ev.get("outcome") == "cured")
+
+    # (d) closure (the log-and-skip boundary) STILL emits a reprompt event.
+    rv = ScriptedReviewer(closure=[_BAD])
+    orch = _make(reviewer=rv)
+    result = await _run_closure(orch)
+    m = orch._reprompt_metrics["closure"]
+    check("t9d closure: control flow unchanged -- still returns None",
+          result is None)
+    check("t9d closure: reprompts_issued==1, recurred==1",
+          m["reprompts_issued"] == 1 and m["recurred"] == 1)
+    ev = [e for e in orch.log if e["event"] == "reprompt"]
+    check("t9d closure: reprompt event fired at the log-and-skip boundary",
+          len(ev) == 1 and ev[0].get("msg_type") == "closure"
+          and ev[0].get("outcome") == "recurred")
+
+    # (e) instrumentation changes no control flow: a clean first parse emits NO
+    # reprompt event and bumps NO counter.
+    rv = ScriptedReviewer(review=[_GOOD_VERDICT])
+    orch = _make(reviewer=rv)
+    await _run_review(orch)
+    check("t9e clean: no reprompt event, no counter bump on a good first reply",
+          not any(e["event"] == "reprompt" for e in orch.log)
+          and orch._reprompt_metrics["review"]["reprompts_issued"] == 0)
+
+    # (f) the counter structure is dense: every message type keyed, both defect
+    # kinds pre-seeded -- a measured zero is never a missing key (scope-of-claim).
+    orch = _make()
+    check("t9f structure: all five message types keyed, defect kinds pre-seeded",
+          set(orch._reprompt_metrics) == set(_MSG_TYPES)
+          and all(set(mv["malformed_seen"]) == {"ambiguity", "validation"}
+                  for mv in orch._reprompt_metrics.values()))
+
+    # --- Test 10 (Item 4): the RECONSTRUCTED fixtures classify to the defect
+    # kinds they were reconstructed as -- honestly, including where one no
+    # longer reproduces against today's tree.
+    # shape 2: three top-level values -> ambiguity; still reproduces.
+    amb_exc = None
+    try:
+        _parse_verdict(SHAPE_2_THREE_TOP_LEVEL_VALUES)
+    except (ValueError, RecursionError) as e:
+        amb_exc = e
+    check("t10 shape2: reproduces as AmbiguousJSON with count==3",
+          isinstance(amb_exc, jsonx.AmbiguousJSON)
+          and amb_exc.count == SHAPE_2_EXPECTED_COUNT)
+    check("t10 shape2: classifies to its reconstructed defect kind (ambiguity)",
+          _defect_kind(amb_exc) == SHAPE_2_RECONSTRUCTED_DEFECT == "ambiguity")
+    check("t10 shape2: fixture self-labels as reproducing today",
+          SHAPE_2_REPRODUCES_TODAY is True)
+    # shape 1: doer-shaped where a verdict was required. Reconstructed as a
+    # validation defect, but it NO LONGER raises -- assert the honest behaviour
+    # the fixture documents, not a pretend raise.
+    verdict1 = _parse_verdict(SHAPE_1_DOER_WHERE_VERDICT)
+    check("t10 shape1: does NOT raise today (extra keys ignored, issues=[])",
+          isinstance(verdict1, ReviewVerdict) and verdict1.issues == [])
+    check("t10 shape1: fixture self-labels reconstructed=validation, not reproducing",
+          SHAPE_1_REPRODUCES_TODAY is False
+          and SHAPE_1_RECONSTRUCTED_DEFECT == "validation")
 
     print("\nALL PASS" if ok else "\nSOME FAILED")
     return ok

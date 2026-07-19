@@ -29,7 +29,7 @@ class StubDoer(DoerClient):
         self.decisions = decisions
         self.apply_fixes_calls: list[dict] = []
     async def implement(self, spec, acceptance): return "implemented"
-    async def respond_to_review(self, spec, acceptance, diff, verdict):
+    async def respond_to_review(self, spec, acceptance, diff, verdict, retry_note=None):
         return DoerResponse(responses=[
             IssueResponse(id=i.id, decision=self.decisions.get(i.id, "accept"),
                           reasoning="stub")
@@ -45,14 +45,14 @@ class EmptyResponseDoer(StubDoer):
     """Doer that returns an empty DoerResponse regardless of the verdict --
     emitting no signal on any reviewer issue. The loop must escalate rather
     than treat this as blanket acceptance (drift-11a)."""
-    async def respond_to_review(self, spec, acceptance, diff, verdict):
+    async def respond_to_review(self, spec, acceptance, diff, verdict, retry_note=None):
         return DoerResponse(responses=[])
 
 
 class PartialResponseDoer(StubDoer):
     """Doer that responds to only the FIRST verdict issue, omitting the rest --
     a strict-subset (partial) protocol violation."""
-    async def respond_to_review(self, spec, acceptance, diff, verdict):
+    async def respond_to_review(self, spec, acceptance, diff, verdict, retry_note=None):
         first = verdict.issues[:1]
         return DoerResponse(responses=[
             IssueResponse(id=i.id, decision=self.decisions.get(i.id, "reject"),
@@ -84,7 +84,7 @@ class RawFollowupReviewer(StubReviewer):
     """Followup reviewer that returns its followup entries as raw model output
     (verbatim strings, not json.dumps'd) so tests can feed a literal top-level
     array like "[]" straight through respond() -> _parse_verdict."""
-    async def respond(self, spec, acceptance, diff, rejections):
+    async def respond(self, spec, acceptance, diff, rejections, retry_note=None):
         out = self.followups[self._n] if self._n < len(self.followups) else "[]"
         self._n += 1
         return out
@@ -94,7 +94,7 @@ class StubTiebreaker(TiebreakerClient):
     def __init__(self, cfg, sides):  # sides: {issue_id: "a"|"b"|"unclear"}
         super().__init__(cfg)
         self.sides = sides
-    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
+    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b, retry_note=None):
         return json.dumps({"id": issue_id,
                            "sides_with": self.sides.get(issue_id, "unclear"),
                            "reasoning": "stub"})
@@ -108,7 +108,7 @@ class RecordingTiebreaker(TiebreakerClient):
         super().__init__(cfg)
         self.sides = sides
         self.calls: list[dict] = []
-    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
+    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b, retry_note=None):
         self.calls.append({"id": issue_id, "a": a, "b": b,
                            "spec": spec, "acceptance": acceptance, "diff": diff})
         return json.dumps({"id": issue_id,
@@ -119,14 +119,14 @@ class RecordingTiebreaker(TiebreakerClient):
 class ErrorReviewer(ReviewerClient):
     """Reviewer whose CLI errors (e.g. unauthenticated) -- must escalate as
     'no signal', never be treated as approval."""
-    async def review(self, spec, acceptance, diff):
+    async def review(self, spec, acceptance, diff, retry_note=None):
         raise RuntimeError("codex exited 1: not logged in")
 
 
 class ErrorTiebreaker(TiebreakerClient):
     """Tiebreaker whose CLI errors -- must escalate as 'no signal', distinct
     from a genuine disagreement (F1)."""
-    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
+    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b, retry_note=None):
         raise RuntimeError("kimi exited 1: not authenticated")
 
 
@@ -369,7 +369,7 @@ async def main():
     # empty prompts. If this ever regresses, the tiebreaker silently loses its
     # inputs while the loop keeps "working".
     class RejectingDoer(StubDoer):
-        async def respond_to_review(self, spec, acceptance, diff, verdict):
+        async def respond_to_review(self, spec, acceptance, diff, verdict, retry_note=None):
             return DoerResponse(responses=[
                 IssueResponse(id="I1", decision="reject",
                               reasoning="doer-rejection-text")
@@ -434,7 +434,7 @@ async def main():
     # re-running. Also enforces the v2 dropped-field discipline: accepted/
     # rejected/still_blocking must NOT appear on their respective v2 events.
     class DoerWithDistinctiveText(StubDoer):
-        async def respond_to_review(self, spec, acceptance, diff, verdict):
+        async def respond_to_review(self, spec, acceptance, diff, verdict, retry_note=None):
             return DoerResponse(responses=[
                 IssueResponse(id="I1", decision="reject",
                               reasoning="DOER_REASONING_MARKER")
@@ -451,7 +451,7 @@ async def main():
     # produce a literal "a" in the emitted event. sides_with="unclear" is a
     # blind spot -- it survives even the buggy "leak slots" behavior.
     class StubTiebreakerWithReasoning(TiebreakerClient):
-        async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
+        async def adjudicate(self, spec, acceptance, diff, issue_id, a, b, retry_note=None):
             return json.dumps({"id": issue_id, "sides_with": "a",
                                "reasoning": "TB_REASONING_MARKER"})
     tb = StubTiebreakerWithReasoning(cfg)

@@ -324,3 +324,41 @@ been found by the first test run.
 The sibling sweep (the tenth) greps for the shape, not the symbol: optional
 kwargs threaded only on a fallback path, `**kwargs` spreads that vary by
 branch, `getattr(x, "f", None)` guards that only cover the happy call.
+
+## 014 — the hedge closed; the sweep swept clean; two divergences reported
+
+**Occurred:** 2026-07-19, slice B3.
+
+`_note_kw` is deleted; `retry_note` rides all five call sites unconditionally.
+The proof that this was the right shape is a test (`test_reprompt` t8): a client
+whose method predates the param now fails with a loud `TypeError` on the FIRST
+call — even when it would have returned a valid reply — instead of the silent
+success or deferred retry-path crash the hedge produced. The failure moved from
+the hardest place to debug (error recovery) to the easiest (call one).
+
+The tenth sibling sweep (`TASK-deferred-failure-hedge-sweep`) ran the four
+shapes across all three repos and found **no other instance**. `_note_kw` was
+the only conditional-kwarg-dict spread anywhere; no try/except interface-narrow
+exists at all. Per scope-of-claim, a sweep that finds nothing must say it
+looked — it did, and the record says so.
+
+**Two divergences surfaced, reported not edited (observation 009):**
+
+  1. The spec said "no in-repo client changes." True of the PRODUCTION clients
+     (all six base-class methods declare `retry_note`), but the test STUBS did
+     not — several mock methods predated the param and, once the kwarg rode
+     every call, failed on call one exactly as t8 predicts. The fix was to make
+     the mocks conform to the interface they mock, not to weaken the change.
+     The spec's claim was scoped too narrowly; the tree corrected it.
+  2. The Item 4 fixture "a doer-shaped object where a ReviewVerdict is required"
+     was reconstructed as a VALIDATION defect, but does not reproduce against
+     today's tree: `ReviewVerdict` ignores extra keys and defaults `issues=[]`,
+     so the reply validates to an empty verdict — a clean pass, not an error.
+     The fixture is labelled with this caveat rather than faked into raising.
+     The silent-empty behaviour is an adjacent latent finding, filed not fixed.
+
+**What this adds:** the measuring device now exists. Per-message-type counters
+(malformed-seen split by defect kind, re-prompts issued, cured vs recurred) and
+one `reprompt` log event per retry — routed through the established
+`_pack_event`/`_truncate_walk` envelope, changing no control flow. The next
+malformed-reply decision can be shown from the log, not argued.
