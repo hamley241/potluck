@@ -93,3 +93,54 @@ adversarial pass returns nothing above "whitelist gap," hardening is
 done. Each round is judged by its own catch: if a round still surfaces
 a real security bypass (as this one did with merge headers), the round
 was worth running.
+
+## 005 — After history rewrites, verify by content, not by SHA
+
+Merging a four-PR stack, the final verification asked `git branch --contains
+<sha> | grep main` for four commit hashes and got MISSING for all four. Read
+naively that says the merge silently failed — the exact alarm the check
+exists to raise.
+
+Nothing had failed. The branch had been rebased earlier in the session, so
+every one of those commits had been rewritten with a new hash. The check was
+asking whether four objects that no longer exist were reachable from main,
+and answering correctly. Re-verified by CONTENT — `git grep` for
+`_begin_scan`, `run_across_regions`, `class ScanError`, `NoApplicableRegions`,
+`NON_REGIONAL` in main — all present.
+
+**Commit identity is not survivable evidence; code presence is.** After any
+history rewrite (rebase, squash, cherry-pick, amend) a SHA-based reachability
+check reports on an object graph that no longer describes the work. Verify
+the CLAIM ("this change is in main"), not the PROXY ("this hash is in main").
+
+This is the same disease as observation 004's near-miss, mirrored: there, a
+probe silently exercised the wrong tree and reported green; here, a probe
+correctly examined objects that had ceased to exist and reported red. Both
+are a check whose answer could not mean what the reader took it to mean. The
+general defence is the same in both directions — make the check state what it
+actually examined, and prefer evidence of the property over evidence of a
+stand-in for the property.
+
+## 006 — The human's prediction was falsified by the machinery being right
+
+Recorded against the prediction, not the guard.
+
+The coverage-mechanism change carried a test asserting an exact set: every
+pattern is migrated, on the temporary-debt list, or non-regional. Merging a
+main that had advanced independently, I predicted the guard would "loudly
+catch" the debt list as stale, because main's p004 had gained an extracted
+`_scan_region`.
+
+The guard stayed green. It was right and the prediction was wrong: p004 has
+`_scan_region` extracted but still hand-rolls its own region loop, so it is
+genuinely not migrated to `run_across_regions` and belongs exactly where the
+list puts it. Extraction made p004 EASIER to migrate; it did not migrate it.
+
+Two things worth keeping. First, the distinction the guard drew and the human
+did not — *has the shape* versus *uses the mechanism* — is the same
+distinction that makes the `_is_migrated` check ast-based rather than a
+substring grep, and it held here without being asked. Second, the direction
+of the correction: a prediction of alarm, falsified by the machinery being
+correct, is the cheap kind of wrong. Writing it down against the prediction
+rather than quietly revising the story is what keeps the record usable as
+evidence later.
