@@ -7,11 +7,16 @@
 #
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")" && pwd)"
+CORE="${CORE_REPO:-$REPO/../harness_core}"
+[ -d "$CORE/harness_core" ] || { echo "./test: harness_core not found at $CORE" >&2; exit 2; }
 cd "$REPO"
 
 run() {
+  # harness_core is a PATH dependency (engine extraction, step 1). The
+  # priced C25 risk is that this does not survive a second machine; the
+  # published-package migration is named but unbuilt.
   uv run --no-project --python 3.11 --with pydantic \
-    env PYTHONPATH="$REPO" python3.11 -m "$1"
+    env PYTHONPATH="$REPO:$CORE" python3.11 -m "$1"
 }
 
 # Discover suites from disk so a new harness/test_*.py file is picked up

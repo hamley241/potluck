@@ -11,7 +11,9 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Goutham Patley" }]
 keywords = ["claude", "codex", "kimi", "code-review", "agent", "harness"]
-dependencies = ["pydantic>=2"]
+dependencies = ["pydantic>=2",
+    "harness-core",
+]
 
 [project.scripts]
 potluck = "harness.cli:main"
@@ -28,3 +30,9 @@ packages = ["harness"]
 [tool.hatch.build.targets.wheel.force-include]
 "profiles" = "harness/_data/profiles"
 "base" = "harness/_data/base"
+
+# harness_core is a PATH dependency (engine extraction, step 1).
+# Priced risk C25: this does not survive a second machine; the
+# published-package migration is named but unbuilt.
+[tool.uv.sources]
+harness-core = { path = "../harness_core", editable = true }

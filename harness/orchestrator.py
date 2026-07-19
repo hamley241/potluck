@@ -53,7 +53,13 @@ from datetime import datetime, timezone
 from typing import NamedTuple
 
 from .config import HarnessConfig
-from .runner import StepRunner, TimeoutEscalation, ModelUnavailable, run_subprocess
+# PORTED to harness_core 2026-07-18 (engine extraction, step 1).
+# The local harness/runner.py and its test_runner.py remain until
+# step 4 per the HC1 copy-then-delete ruling — a module and its
+# tests are deleted together, in the commit that switches this
+# profile off them, never before and never separately.
+from harness_core.runner import (
+    StepRunner, TimeoutEscalation, ModelUnavailable, run_subprocess)
 from .schemas import (
     DoerResponse,
     Outcome,
