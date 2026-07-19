@@ -115,7 +115,7 @@ class ClosureReviewer(ReviewerClient):
     async def respond(self, spec, acceptance, diff, rejections):
         return json.dumps({"issues": []})
 
-    async def closure_scan(self, spec, diff):
+    async def closure_scan(self, spec, diff, retry_note=None):
         self.closure_calls += 1
         r = self.closure_reply
         if isinstance(r, BaseException):

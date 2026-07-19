@@ -67,12 +67,13 @@ class StubReviewer(ReviewerClient):
         self.first = first
         self.followups = followups or []
         self._n = 0
-    async def review(self, spec, acceptance, diff): return json.dumps(self.first)
-    async def respond(self, spec, acceptance, diff, rejections):
+    async def review(self, spec, acceptance, diff, retry_note=None):
+        return json.dumps(self.first)
+    async def respond(self, spec, acceptance, diff, rejections, retry_note=None):
         out = self.followups[self._n] if self._n < len(self.followups) else {"issues": []}
         self._n += 1
         return json.dumps(out)
-    async def closure_scan(self, spec, diff):
+    async def closure_scan(self, spec, diff, retry_note=None):
         # Default: report no closable class, so PASSED runs in this suite do not
         # invoke the real `claude` backend the base ReviewerClient would shell
         # out to. Tests that exercise the sweep live in test_closure.py.
@@ -133,9 +134,9 @@ class ProseReviewer(ReviewerClient):
     """Reviewer that answers with prose containing no JSON at all. The parse
     raises ValueError, which run_feature does not catch -- must convert to a
     clean no-signal escalation, not an uncaught traceback."""
-    async def review(self, spec, acceptance, diff):
+    async def review(self, spec, acceptance, diff, retry_note=None):
         return "The diff looks fine, nothing to report."
-    async def respond(self, spec, acceptance, diff, rejections):
+    async def respond(self, spec, acceptance, diff, rejections, retry_note=None):
         return "Still fine."
 
 
@@ -144,7 +145,8 @@ class MalformedTiebreaker(TiebreakerClient):
     ErrorTiebreaker (whose CLI raises): here the call succeeds but the OUTPUT
     is unparseable, so the parse -- not the runner -- would crash. Must escalate
     the whole run, like the errored case, not leave the issue contested."""
-    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
+    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b,
+                         retry_note=None):
         return "I think the doer is probably right here."
 
 
@@ -857,7 +859,8 @@ async def main():
     # error boundary, so ValidationError previously propagated to run_feature
     # which doesn't know about pydantic -> uncaught traceback.
     class MalformedDoer(StubDoer):
-        async def respond_to_review(self, spec, acceptance, diff, verdict):
+        async def respond_to_review(self, spec, acceptance, diff, verdict,
+                                    retry_note=None):
             class FakeResp:
                 def model_dump_json(self):
                     return "this is not valid json"
@@ -2056,7 +2059,7 @@ async def main():
     # proves the actual failure mode: the reviewer returns `'['*N + ']'*N`,
     # which blows json.loads's recursion limit inside _parse_verdict.
     class DeepNestedReviewer(ReviewerClient):
-        async def review(self, spec, acceptance, diff):
+        async def review(self, spec, acceptance, diff, retry_note=None):
             return "[" * 200000 + "]" * 200000
     cfg = HarnessConfig()
     orch = make(cfg, StubDoer({}), DeepNestedReviewer(cfg), None,

@@ -237,13 +237,14 @@ async def test_payload_captured_and_bounded(check) -> None:
     #     ModelUnavailable): the payload must reach FeatureResult.escalation_reason,
     #     and the [reviewer] tag / NO_SIGNAL outcome must be UNCHANGED.
     class _OversizeReviewer(ReviewerClient):
-        async def review(self, spec, acceptance, diff):
+        async def review(self, spec, acceptance, diff, retry_note=None):
             return payload
 
-        async def respond(self, spec, acceptance, diff, rejections):
+        async def respond(self, spec, acceptance, diff, rejections,
+                          retry_note=None):
             return json.dumps({"issues": []})
 
-        async def closure_scan(self, spec, diff):
+        async def closure_scan(self, spec, diff, retry_note=None):
             return json.dumps({"bug_class": "none", "patterns": []})
 
     cfg = HarnessConfig()

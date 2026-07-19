@@ -97,6 +97,7 @@ from harness_core.runner import (
 # (ambiguity is never a verdict); AmbiguousJSON subclasses ValueError so it
 # flows the existing (ValueError, RecursionError) parse boundaries unchanged.
 from harness_core import jsonx
+from pydantic import ValidationError
 from .schemas import (
     ClosureCandidate,
     ClosurePattern,
@@ -188,6 +189,13 @@ _DOER_RESPONSE_SCHEMA = (
     '{"responses": [{"id": "I1", "decision": "accept|reject", '
     '"reasoning": "..."}]}'
 )
+# The closure sweep is the ONE boundary with no tail restatement (it is not one
+# of slice A's four tail-carrying message types), but its body schema is still
+# named ONCE here so `_closure_framing` states it and the bounded re-prompt
+# names the SAME contract -- reuse, never a hand-copied second literal.
+_CLOSURE_SCHEMA = (
+    '{"bug_class": "...", "patterns": [{"regex": "...", "rationale": "..."}]}'
+)
 
 
 def _tiebreak_schema(issue_id: str) -> str:
@@ -205,6 +213,53 @@ def _schema_tail(schema: str) -> str:
     contract at the TAIL, where instruction recency is highest. Takes the SAME
     schema string the prompt body already carries -- never a second copy."""
     return f"Return exactly ONE JSON value matching: {schema}"
+
+
+def _note_kw(retry_note: str | None) -> dict:
+    """Thread the bounded re-prompt's correction note to a client as a kwarg --
+    but ONLY when there is one. On the first attempt (`None`) the client is
+    called with no `retry_note` at all, so the prompt it builds is BYTE-IDENTICAL
+    to today's and stubs that predate this param keep working; only the single
+    recovery call carries the note."""
+    return {"retry_note": retry_note} if retry_note is not None else {}
+
+
+def _with_retry_note(tail: str, retry_note: str | None) -> str:
+    """Append the correction note AFTER slice A's schema tail so the concrete
+    defect is the LAST thing the model reads. `None` (the first attempt) returns
+    the tail untouched -- the prompt is unchanged from today. The closure sweep
+    has no tail (`""`); there the note simply becomes the final line."""
+    if not retry_note:
+        return tail
+    return f"{tail}\n\n{retry_note}" if tail else retry_note
+
+
+def _retry_note(e: Exception, schema: str) -> str:
+    """Name the EXACT parse defect for a single bounded re-prompt -- never a bare
+    "try again". Each shape reads its structure from the exception itself and
+    restates the SAME `schema` the prompt already carries:
+
+      * jsonx.AmbiguousJSON carries `count`/`offsets` as ATTRIBUTES (set in its
+        __init__); read them, never re-parse the message.
+      * a pydantic ValidationError names the offending fields exactly as it
+        reports them (dotted `loc` paths).
+      * any other ValueError/RecursionError (no JSON found, non-object,
+        nested-to-death) states its own message; still concrete, never "retry"."""
+    if isinstance(e, jsonx.AmbiguousJSON):
+        offsets = ", ".join(str(o) for o in e.offsets)
+        return (f"you returned {e.count} JSON values at offsets {offsets}; "
+                f"return exactly one object matching this schema: {schema}")
+    if isinstance(e, ValidationError):
+        locs: list[str] = []
+        for err in e.errors():
+            loc = err.get("loc") or ()
+            name = ".".join(str(p) for p in loc) if loc else "(root)"
+            if name not in locs:
+                locs.append(name)
+        return (f"your reply failed schema validation on: {', '.join(locs)}; "
+                f"return exactly one object matching this schema: {schema}")
+    return (f"your reply could not be parsed: {e}; "
+            f"return exactly one object matching this schema: {schema}")
 
 
 def _now_iso() -> str:
@@ -938,7 +993,8 @@ class DoerClient:
 
     async def implement(self, spec: str, acceptance: str) -> str: ...
     async def respond_to_review(self, spec: str, acceptance: str, diff: str,
-                                verdict: ReviewVerdict) -> DoerResponse: ...
+                                verdict: ReviewVerdict,
+                                retry_note: str | None = None) -> DoerResponse: ...
     async def apply_fixes(self, accepted_issues: "list[ReviewIssue]",
                           diff: str) -> str: ...
 
@@ -975,7 +1031,8 @@ class RealDoerClient(DoerClient):
         )
 
     async def respond_to_review(self, spec: str, acceptance: str, diff: str,
-                                verdict: ReviewVerdict) -> DoerResponse:
+                                verdict: ReviewVerdict,
+                                retry_note: str | None = None) -> DoerResponse:
         issues_json = json.dumps([i.model_dump() for i in verdict.issues], indent=2)
         prompt = (
             f"A reviewer found issues with your implementation. For each issue, decide "
@@ -988,7 +1045,10 @@ class RealDoerClient(DoerClient):
             f"REVIEWER ISSUES:\n{issues_json}\n\n"
             f"Return ONLY a JSON object matching this schema, no prose:\n"
             f"{_DOER_RESPONSE_SCHEMA}\n\n"
-            f"{_schema_tail(_DOER_RESPONSE_SCHEMA)}"
+            # The bounded re-prompt's correction note (slice B2) rides AFTER the
+            # schema tail so the concrete defect is the last thing the model
+            # reads; None on the first attempt leaves this prompt unchanged.
+            f"{_with_retry_note(_schema_tail(_DOER_RESPONSE_SCHEMA), retry_note)}"
         )
         raw = await run_subprocess(
             [self._cmd] + self._JUDGE_FLAGS, stdin_text=prompt
@@ -1081,23 +1141,28 @@ class ReviewerClient:
         # then for standalone construction.
         self._prompt_log = _noop_prompt_log
 
-    async def review(self, spec: str, acceptance: str, diff: str) -> str:
+    async def review(self, spec: str, acceptance: str, diff: str,
+                     retry_note: str | None = None) -> str:
         return await call_backend(
             self.backend, _review_framing(spec, acceptance), diff,
             step="reviewer:review", prompt_cfg=self.cfg.prompt,
             log=self._prompt_log,
-            tail=_schema_tail(_REVIEW_VERDICT_SCHEMA))
+            tail=_with_retry_note(
+                _schema_tail(_REVIEW_VERDICT_SCHEMA), retry_note))
 
     async def respond(self, spec: str, acceptance: str, diff: str,
-                      rejections: DoerResponse) -> str:
+                      rejections: DoerResponse,
+                      retry_note: str | None = None) -> str:
         return await call_backend(
             self.backend,
             _review_followup_framing(spec, acceptance, rejections), diff,
             step="reviewer:followup", prompt_cfg=self.cfg.prompt,
             log=self._prompt_log,
-            tail=_schema_tail(_REVIEW_VERDICT_SCHEMA))
+            tail=_with_retry_note(
+                _schema_tail(_REVIEW_VERDICT_SCHEMA), retry_note))
 
-    async def closure_scan(self, spec: str, diff: str) -> str:
+    async def closure_scan(self, spec: str, diff: str,
+                           retry_note: str | None = None) -> str:
         """Class-closure sweep: ask the reviewer backend to name the bug class
         this diff closed and emit grep patterns for siblings elsewhere. Returns
         the raw model output; the harness parses it and runs the patterns
@@ -1105,7 +1170,10 @@ class ReviewerClient:
         return await call_backend(
             self.backend, _closure_framing(spec), diff,
             step="reviewer:closure", prompt_cfg=self.cfg.prompt,
-            log=self._prompt_log)
+            log=self._prompt_log,
+            # Closure has no schema tail; the re-prompt note (when present)
+            # simply becomes the final line.
+            tail=_with_retry_note("", retry_note))
 
 
 class TiebreakerClient:
@@ -1119,13 +1187,15 @@ class TiebreakerClient:
         self._prompt_log = _noop_prompt_log
 
     async def adjudicate(self, spec: str, acceptance: str, diff: str,
-                         issue_id: str, arg_a: str, arg_b: str) -> str:
+                         issue_id: str, arg_a: str, arg_b: str,
+                         retry_note: str | None = None) -> str:
         return await call_backend(
             self.backend,
             _tiebreak_framing(spec, acceptance, issue_id, arg_a, arg_b), diff,
             step="tiebreaker:adjudicate", prompt_cfg=self.cfg.prompt,
             log=self._prompt_log,
-            tail=_schema_tail(_tiebreak_schema(issue_id)))
+            tail=_with_retry_note(
+                _schema_tail(_tiebreak_schema(issue_id)), retry_note))
 
 
 async def _noop_restore_tree() -> None:
@@ -1713,15 +1783,16 @@ class Orchestrator:
         self._log("tree_restored", reason=reason)
 
     async def _call_and_parse(self, *, step, role, call, parse, timeout,
-                              on_timeout, malformed_prefix=None,
+                              on_timeout, schema, malformed_prefix=None,
                               not_ok_detail=None,
                               on_not_ok=None, on_malformed=None):
         """The ONE shared model-call-and-parse boundary. Does exactly what each
         of the five wrappers (_review, _review_followup, _doer_respond_to_review,
         _tiebreak, _closure_sweep) used to do inline: run the model call through
         the StepRunner, escalate on timeout, escalate on a non-ok call, then
-        parse the output and escalate a malformed reply -- one place so the
-        bounded re-prompt (landing next) has one place to live, not five.
+        parse the output and escalate a malformed reply -- and, when a parse
+        fails, perform the ONE bounded re-prompt (slice B2) HERE and nowhere
+        else, so the retry has exactly one home.
 
         The malformed catch is the load-bearing part: a bad MODEL REPLY raises
         only ValueError (json.loads' JSONDecodeError and pydantic's
@@ -1731,12 +1802,27 @@ class Orchestrator:
         and MUST crash loudly, not be mislabelled a bad reply -- so the caught
         set stays exactly (ValueError, RecursionError).
 
+        The bounded re-prompt (slice B2): when the FIRST parse raises, name the
+        exact defect (`_retry_note`) and ask the SAME model ONCE more, through the
+        SAME self.runner.run with the SAME timeout -- so the retry counts toward
+        budgets and is logged like any other step. `call(retry_note)` carries the
+        note; `call(None)` is the first attempt. Exactly ONE retry, ever -- there
+        is deliberately NO knob to raise it: one retry is recovery, a loop is a
+        model-pressure machine this project refuses. A timeout or a not-ok call
+        is NOT a parse failure and never reaches the retry -- those are not
+        retried. If the SECOND reply also fails to parse, escalate EXACTLY as
+        this boundary did before B2 -- same type, role, message, _bounded_payload
+        treatment, and `from` chaining -- so a twice-failed run looks IDENTICAL
+        to today's once-failed run.
+
         Where the boundaries genuinely differ, the difference is a parameter:
           * on_timeout -- REQUIRED zero-arg callable owning the timeout outcome,
             which diverges structurally: three boundaries raise a
             TimeoutEscalation (distinct pattern/detail each -- pass a `_raises`
             thunk), the tiebreaker returns a sentinel to leave the issue
             contested, the closure sweep logs a skip and returns None.
+          * schema -- the SAME contract string the client's prompt already
+            carries; the retry note restates it, never rebuilds it.
           * role + malformed_prefix + not_ok_detail -- the per-boundary strings
             the shared raises use; each preserved verbatim, none unified.
           * on_not_ok / on_malformed -- optional overrides for the sole boundary
@@ -1744,7 +1830,7 @@ class Orchestrator:
             of raising; when unset the shared ModelUnavailable raise runs. The
             timeout/not-ok/parse skeleton and the caught set stay identical for
             all five either way."""
-        res = await self.runner.run(step, call, timeout)
+        res = await self.runner.run(step, lambda: call(None), timeout)
         if res.timed_out:
             return on_timeout()
         if not res.ok:
@@ -1754,15 +1840,33 @@ class Orchestrator:
         try:
             return parse(res.output)
         except (ValueError, RecursionError) as e:
-            if on_malformed is not None:
-                return on_malformed(e, res.output)
-            # Member B: carry the offending reply (truncated + length) into the
-            # escalation detail so the failure can be replayed, not just counted.
-            body, plen = _bounded_payload(res.output)
-            raise ModelUnavailable(
-                role,
-                f"{malformed_prefix}{e} "
-                f"| payload ({plen} chars): {body}") from e
+            # ONE bounded re-prompt: state the exact defect and ask again ONCE.
+            note = _retry_note(e, schema)
+            retry = await self.runner.run(step, lambda: call(note), timeout)
+            # The retry is a fresh model call: its own timeout / not-ok are
+            # handled like the first attempt's and are NOT themselves retried
+            # (only a PARSE failure triggers the single retry, and it has now
+            # been spent).
+            if retry.timed_out:
+                return on_timeout()
+            if not retry.ok:
+                if on_not_ok is not None:
+                    return on_not_ok(retry)
+                raise ModelUnavailable(role, retry.error or not_ok_detail)
+            try:
+                return parse(retry.output)
+            except (ValueError, RecursionError) as e2:
+                if on_malformed is not None:
+                    return on_malformed(e2, retry.output)
+                # Member B: carry the offending reply (truncated + length) into
+                # the escalation detail so the failure can be replayed, not just
+                # counted. Identical to the pre-B2 raise -- the recurrence path
+                # is unchanged.
+                body, plen = _bounded_payload(retry.output)
+                raise ModelUnavailable(
+                    role,
+                    f"{malformed_prefix}{e2} "
+                    f"| payload ({plen} chars): {body}") from e2
 
     async def _doer_respond_to_review(self, spec: str, acceptance: str,
                                       diff: str,
@@ -1772,9 +1876,9 @@ class Orchestrator:
         # bytes/dict get rejected at the boundary rather than crashing in
         # _parse_verdict). Serialize to JSON at the runner boundary; the
         # extra round-trip is trivial compared to the model call itself.
-        async def _call() -> str:
+        async def _call(retry_note) -> str:
             resp = await self.doer.respond_to_review(
-                spec, acceptance, diff, verdict)
+                spec, acceptance, diff, verdict, **_note_kw(retry_note))
             return resp.model_dump_json()
 
         # A malformed doer JSON must NOT propagate as an uncaught traceback --
@@ -1789,6 +1893,7 @@ class Orchestrator:
             timeout=self.cfg.timeouts.model_call_seconds,
             on_timeout=_raises(TimeoutEscalation(
                 "doer_no_signal", "doer timed out during respond_to_review")),
+            schema=_DOER_RESPONSE_SCHEMA,
             not_ok_detail="doer respond errored",
             malformed_prefix="doer returned malformed response: ")
 
@@ -1817,12 +1922,14 @@ class Orchestrator:
         # the narrow (ValueError, RecursionError) catch it applies.
         return await self._call_and_parse(
             step="reviewer:review", role="reviewer",
-            call=lambda: self.reviewer.review(spec, acceptance, diff),
+            call=lambda note: self.reviewer.review(
+                spec, acceptance, diff, **_note_kw(note)),
             parse=_parse_verdict,
             timeout=self.cfg.timeouts.model_call_seconds,
             on_timeout=_raises(TimeoutEscalation(
                 "reviewer_no_signal",
                 "reviewer timed out; refusing to proceed without review")),
+            schema=_REVIEW_VERDICT_SCHEMA,
             not_ok_detail="reviewer call errored",
             malformed_prefix="reviewer returned malformed response: ")
 
@@ -1834,11 +1941,13 @@ class Orchestrator:
         # narrow (ValueError, RecursionError) catch.
         return await self._call_and_parse(
             step="reviewer:followup", role="reviewer",
-            call=lambda: self.reviewer.respond(spec, acceptance, diff, response),
+            call=lambda note: self.reviewer.respond(
+                spec, acceptance, diff, response, **_note_kw(note)),
             parse=_parse_verdict,
             timeout=self.cfg.timeouts.model_call_seconds,
             on_timeout=_raises(TimeoutEscalation(
                 "reviewer_no_signal", "reviewer follow-up timed out")),
+            schema=_REVIEW_VERDICT_SCHEMA,
             not_ok_detail="reviewer follow-up errored",
             malformed_prefix="reviewer returned malformed response: ")
 
@@ -1893,11 +2002,13 @@ class Orchestrator:
             # for the narrow (ValueError, RecursionError) parse catch.
             tb = await self._call_and_parse(
                 step="tiebreaker:adjudicate", role="tiebreaker",
-                call=lambda: self.tiebreaker.adjudicate(
-                    spec, acceptance, diff, issue_id, arg_a, arg_b),
+                call=lambda note: self.tiebreaker.adjudicate(
+                    spec, acceptance, diff, issue_id, arg_a, arg_b,
+                    **_note_kw(note)),
                 parse=_parse_tiebreak,
                 timeout=self.cfg.timeouts.model_call_seconds,
                 on_timeout=lambda: _TIEBREAK_TIMED_OUT,
+                schema=_tiebreak_schema(issue_id),
                 not_ok_detail="tiebreaker call errored",
                 malformed_prefix="tiebreaker returned malformed response: ")
             if tb is _TIEBREAK_TIMED_OUT:
@@ -2039,10 +2150,12 @@ class Orchestrator:
         #     closure_patterns_capped log stays honest.
         parsed = await self._call_and_parse(
             step="closure", role="reviewer",
-            call=lambda: self.reviewer.closure_scan(spec, diff),
+            call=lambda note: self.reviewer.closure_scan(
+                spec, diff, **_note_kw(note)),
             parse=lambda out: _parse_closure(out, self._CLOSURE_MAX_PATTERNS),
             timeout=self.cfg.timeouts.model_call_seconds,
             on_timeout=_on_timeout,
+            schema=_CLOSURE_SCHEMA,
             on_not_ok=_on_not_ok,
             on_malformed=_on_malformed)
         if parsed is None:
@@ -2384,7 +2497,7 @@ Rules for the patterns:
   * At most 5 patterns.
 
 Return ONLY JSON, no prose:
-{{"bug_class": "...", "patterns": [{{"regex": "...", "rationale": "..."}}]}}
+{_CLOSURE_SCHEMA}
 
 If this change fixed no generalizable class -- pure docs, config, or a
 one-of-a-kind bug with no siblings -- return {{"bug_class": "none",
