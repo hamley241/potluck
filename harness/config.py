@@ -47,8 +47,6 @@ class Timeouts:
     # Per verification-gate run. Build/test can legitimately take a while;
     # tune per project -- this default is deliberately generous.
     gate_seconds: int = 300
-    # Per debate round (a round may involve several calls).
-    round_seconds: int = 400
     # Outer bound on a single feature across all rounds/retries.
     feature_seconds: int = 1800  # 30 min
 
@@ -108,10 +106,48 @@ class DiffConfig:
 
 
 @dataclass
+class PromptConfig:
+    """Knobs for prompt packing and prompt-size instrumentation.
+
+    Two DIFFERENT problems live under "large prompts" and get opposite
+    treatments (see README's argv seam and docs/observations.md 001):
+
+      * The HARD limit -- argv-delivered backends (Backend.stdin=False, e.g.
+        Kimi `-p <prompt>`) pass the whole prompt as a command argument, so a
+        large diff can exceed the OS ARG_MAX. `argv_safety_margin_bytes` is the
+        headroom subtracted from the derived ARG_MAX budget so we pack BELOW the
+        real limit, not right at it. Read in orchestrator._derive_argv_budget.
+
+      * The SOFT drift -- codex loses repo grounding as stdin grows. That gets
+        MEASURED, never truncated. `large_prompt_warn_bytes` is the threshold
+        above which a `prompt_large` event is logged. Read in
+        orchestrator._assemble_prompt. This is instrumentation, not mitigation:
+        crossing it changes no behavior, it just records the drift zone.
+
+    Both knobs MUST actually be read (this project has a history of knobs that
+    govern nothing); the tests assert the derivation and the threshold use them.
+    """
+    # Headroom under the derived ARG_MAX budget. ARG_MAX bounds argv+envp
+    # together and the exact overhead (alignment, pointer array) is
+    # platform-specific, so we keep a margin rather than pack to the byte.
+    argv_safety_margin_bytes: int = 8 * 1024
+    # Prompt byte size above which `prompt_large` fires. Sized at the low end of
+    # observation 001's drift zone (codex drifted at ~19 KB, stayed accurate at
+    # ~4 KB) so the warning brackets where grounding starts to slip.
+    large_prompt_warn_bytes: int = 16 * 1024
+
+
+@dataclass
 class HarnessConfig:
     profile: str = "personal"
-    interactive: bool = True          # CI sets this False -> no human escalation target
     debate_enabled: bool = True       # CI disables -> deterministic gate only
+    # After a PASSED run whose change a reviewer actually judged, ask the
+    # reviewer backend to name the bug CLASS this fix closed and emit grep
+    # patterns for siblings of it elsewhere; the harness runs them and surfaces
+    # only real matches. Advisory: it never changes the outcome. Read in
+    # Orchestrator._closure_sweep (step a) -- a profile may set it False to keep
+    # a run model-free, and the debate-disabled path never invokes it.
+    closure_enabled: bool = True
     # Path-based routing: diffs touching these paths skip external review and
     # go human-only. Empty by default; flip on after checking with security.
     human_only_paths: list[str] = field(default_factory=list)
@@ -121,6 +157,7 @@ class HarnessConfig:
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
     models: Models = field(default_factory=Models)
     diff: DiffConfig = field(default_factory=DiffConfig)
+    prompt: PromptConfig = field(default_factory=PromptConfig)
 
     @classmethod
     def load(cls, profile_path: Path | None = None,
@@ -158,14 +195,13 @@ class HarnessConfig:
            load beats mysterious immediate-fire escalations later.
         """
         t = self.timeouts
-        for name in ("model_call_seconds", "gate_seconds", "round_seconds",
-                     "feature_seconds"):
+        for name in ("model_call_seconds", "gate_seconds", "feature_seconds"):
             v = getattr(t, name)
             if not isinstance(v, int) or v < 0:
                 raise ValueError(
                     f"timeouts.{name} must be a non-negative int, got {v!r}"
                 )
-        step_bounds = (t.model_call_seconds, t.gate_seconds, t.round_seconds)
+        step_bounds = (t.model_call_seconds, t.gate_seconds)
         max_step = max(step_bounds)
         # feature_seconds == 0 is a special case: it fires immediately, but
         # so does the step timeout, so the invariant is vacuously satisfied
@@ -183,15 +219,21 @@ class HarnessConfig:
 
     def _apply(self, data: dict) -> None:
         # The KEYS and the SECTION names are potluck's vocabulary and stay
-        # here; the moves that consume them are the core's.
+        # here; the moves that consume them are the core's. This merge is the
+        # split's first unplanned test and it held: upstream's config-drift
+        # work (`interactive` deleted, `closure_enabled` and the `prompt`
+        # section added, `round_seconds` deleted as phantom) changed only the
+        # vocabulary — every edit landed in the argument lists below, none in
+        # the machinery. Recorded as evidence in AMENDMENTS A-3.
         overlay_keys(self, data,
-                     ("profile", "interactive", "debate_enabled",
+                     ("profile", "debate_enabled", "closure_enabled",
                       "human_only_paths"))
         overlay_sections(data, {
             "timeouts": self.timeouts,
             "debate": self.debate,
             "escalation": self.escalation,
             "diff": self.diff,
+            "prompt": self.prompt,
         })
         if "models" in data:
             self._apply_models(data["models"])
@@ -209,9 +251,7 @@ class HarnessConfig:
                         overlay_backend(getattr(self.models, role), m[role]))
 
     def _apply_env(self) -> None:
-        # A couple of high-value env overrides for CI.
-        if os.environ.get("HARNESS_NONINTERACTIVE") == "1":
-            self.interactive = False
+        # One high-value env override for CI: HARNESS_NO_DEBATE.
         if os.environ.get("HARNESS_NO_DEBATE") == "1":
             self.debate_enabled = False
 

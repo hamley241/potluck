@@ -16,7 +16,7 @@ import json
 from harness.config import HarnessConfig
 from harness.orchestrator import (
     Orchestrator, DoerClient, ReviewerClient, TiebreakerClient, GateResult,
-    DoerProtocolViolation, _parse_verdict,
+    DoerProtocolViolation, _parse_verdict, _extract_verdict_json,
 )
 from harness.schemas import DoerResponse, IssueResponse, Outcome
 
@@ -71,6 +71,11 @@ class StubReviewer(ReviewerClient):
         out = self.followups[self._n] if self._n < len(self.followups) else {"issues": []}
         self._n += 1
         return json.dumps(out)
+    async def closure_scan(self, spec, diff):
+        # Default: report no closable class, so PASSED runs in this suite do not
+        # invoke the real `claude` backend the base ReviewerClient would shell
+        # out to. Tests that exercise the sweep live in test_closure.py.
+        return json.dumps({"bug_class": "none", "patterns": []})
 
 
 class RawFollowupReviewer(StubReviewer):
@@ -78,10 +83,6 @@ class RawFollowupReviewer(StubReviewer):
     (verbatim strings, not json.dumps'd) so tests can feed a literal top-level
     array like "[]" straight through respond() -> _parse_verdict."""
     async def respond(self, spec, acceptance, diff, rejections):
-        # Signature was 3-arg (spec, diff, rejections) when drift-12 landed; upstream
-        # 5805f48 threaded `acceptance` through every reviewer / tiebreaker method.
-        # Rebase-aligned: RawFollowupReviewer accepts it and ignores it (the raw
-        # output is what the whole class exists to inject).
         out = self.followups[self._n] if self._n < len(self.followups) else "[]"
         self._n += 1
         return out
@@ -127,6 +128,25 @@ class ErrorTiebreaker(TiebreakerClient):
         raise RuntimeError("kimi exited 1: not authenticated")
 
 
+class ProseReviewer(ReviewerClient):
+    """Reviewer that answers with prose containing no JSON at all. The parse
+    raises ValueError, which run_feature does not catch -- must convert to a
+    clean no-signal escalation, not an uncaught traceback."""
+    async def review(self, spec, acceptance, diff):
+        return "The diff looks fine, nothing to report."
+    async def respond(self, spec, acceptance, diff, rejections):
+        return "Still fine."
+
+
+class MalformedTiebreaker(TiebreakerClient):
+    """Tiebreaker that answers with prose (no JSON). Distinct from
+    ErrorTiebreaker (whose CLI raises): here the call succeeds but the OUTPUT
+    is unparseable, so the parse -- not the runner -- would crash. Must escalate
+    the whole run, like the errored case, not leave the issue contested."""
+    async def adjudicate(self, spec, acceptance, diff, issue_id, a, b):
+        return "I think the doer is probably right here."
+
+
 async def gate_pass(): return (True, "all green")
 async def gate_pass_silent(): return (True, "")  # exit 0 but no stdout
 async def gate_fail(): return (False, "")
@@ -160,7 +180,7 @@ async def diff_rename_out_of_sensitive():
             "rename to src/util/legacy.py\n")
 
 
-def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None):
+def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None, restore_tree=None):
     # Adapt the test gate fixtures into the real orchestrator contract:
     # () -> GateResult.to_json_str(). Fixtures return either (ok, out) -- which
     # relies on GateResult's default exit_code (0 on pass, 1 on fail) -- or
@@ -176,9 +196,23 @@ def make(cfg, doer, reviewer, tb, gate, diff, ab_swap=None):
         return GateResult(ok=ok, output=out, exit_code=exit_code).to_json_str()
     # Default: no swap -> A=doer, B=reviewer. Deterministic so tests can encode
     # "kimi sides with doer" as sides_with="a" without also asserting on the
-    # (real-run) random A/B position.
+    # (real-run) random A/B position. restore_tree defaults to None -> the
+    # Orchestrator's no-op, keeping every existing construction unchanged.
     return Orchestrator(cfg, doer, reviewer, tb, run_gate, diff,
+                        restore_tree=restore_tree,
                         ab_swap=ab_swap or (lambda _id: False))
+
+
+class RecordingRestore:
+    """Records each restore_tree() call and the interleaving with doer attempts
+    via a shared `order` list, so tests can assert the per-attempt hook fired
+    before every implement attempt."""
+    def __init__(self, order=None):
+        self.calls = 0
+        self.order = order if order is not None else []
+    async def __call__(self):
+        self.calls += 1
+        self.order.append("restore")
 
 
 async def main():
@@ -785,6 +819,69 @@ async def main():
     r = await orch.run_feature("spec", "acc")
     results["invariant_doer_malformed_response"] = (r.outcome, r.rounds_used)
 
+    # 15h-real. INVARIANT: the REAL RealDoerClient.respond_to_review parses
+    # live model output INSIDE StepRunner's coroutine. A prose reply (no JSON)
+    # or a schema mismatch must surface as RuntimeError -- the same "this call
+    # failed" contract run_subprocess uses for CLI failures -- so StepRunner's
+    # narrow (RuntimeError, OSError) catch turns it into a non-ok StepResult
+    # -> ModelUnavailable -> ESCALATED_NO_SIGNAL, NOT an uncaught ValueError /
+    # pydantic ValidationError that crashes the orchestrator mid-debate. We
+    # drive the real subprocess path (not a stub) via a tiny executable helper
+    # pointed at by claude_cmd; the appended `-p` flag is ignored by the helper.
+    import os  # noqa: E402
+    import stat  # noqa: E402
+    import sys  # noqa: E402
+    import tempfile  # noqa: E402
+    from pydantic import ValidationError  # noqa: E402
+    from harness.orchestrator import RealDoerClient  # noqa: E402
+    from harness.schemas import ReviewVerdict, ReviewIssue  # noqa: E402
+
+    verdict = ReviewVerdict(issues=[
+        ReviewIssue(id="I1", severity="blocking",
+                    issue="something is wrong", suggested_fix="fix it")])
+
+    def _write_helper(tmpdir, body):
+        # Executable python helper: ignores its args, prints `body` to stdout.
+        path = f"{tmpdir}/fake_claude.py"
+        with open(path, "w") as fp:
+            fp.write(f"#!{sys.executable}\n")
+            fp.write("import sys\n")
+            fp.write(f"sys.stdout.write({body!r})\n")
+        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP
+                 | stat.S_IXOTH)
+        return path
+
+    # (a) Prose reply -> RuntimeError mentioning "malformed", never ValueError
+    # or pydantic ValidationError.
+    with tempfile.TemporaryDirectory() as tmp:
+        helper = _write_helper(tmp, "I think these issues all look valid to me.")
+        doer = RealDoerClient(claude_cmd=helper)
+        raised = None
+        try:
+            await doer.respond_to_review("spec", "acc", "diff", verdict)
+        except BaseException as e:  # capture the exact type that escapes
+            raised = e
+        assert isinstance(raised, RuntimeError), \
+            f"prose reply must raise RuntimeError, got {type(raised).__name__}: {raised!r}"
+        assert not isinstance(raised, (ValueError, ValidationError)), \
+            f"must not leak ValueError/ValidationError: {type(raised).__name__}"
+        assert "malformed" in str(raised), \
+            f"RuntimeError message must mention 'malformed': {raised!r}"
+
+    # (b) Happy path: valid response JSON still parses to a DoerResponse with
+    # the expected decision -- the wrapper does not break normal parsing.
+    with tempfile.TemporaryDirectory() as tmp:
+        valid = json.dumps({"responses": [
+            {"id": "I1", "decision": "reject",
+             "reasoning": "the reviewer misread the diff"}]})
+        helper = _write_helper(tmp, valid)
+        doer = RealDoerClient(claude_cmd=helper)
+        resp = await doer.respond_to_review("spec", "acc", "diff", verdict)
+        assert isinstance(resp, DoerResponse), \
+            f"valid JSON must parse to DoerResponse, got {type(resp).__name__}"
+        assert resp.rejected_ids() == {"I1"}, \
+            f"expected I1 rejected, got responses={resp.responses!r}"
+
     # 15i. INVARIANT: HarnessConfig.validate() rejects feature_seconds smaller
     # than the largest step timeout. The "finer signal never overwritten"
     # guarantee only holds when steps can raise TimeoutEscalation before the
@@ -812,6 +909,140 @@ async def main():
         assert False, "validate() must reject negative timeouts"
     except ValueError:
         pass
+
+    # 15j. INVARIANT: DiffConfig knobs flow to behavior THROUGH the production
+    # callable. Pre-fix, cli passed bare `real_get_diff` and the Orchestrator
+    # invoked it zero-arg, so `cfg.diff.max_untracked_bytes` /
+    # `binary_probe_bytes` were dead. `bound_get_diff(cfg.diff)` is the exact
+    # object production wires, so exercising it proves config reaches behavior.
+    from harness.orchestrator import bound_get_diff  # noqa: E402
+    from harness.config import DiffConfig  # noqa: E402
+
+    def _init_repo(tmp):
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"],
+                       cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/README", "w")).write("hello\n")
+        subprocess.run(["git", "add", "README"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"],
+                       cwd=tmp, check=True)
+
+    async def _diff_via(tmp, get_diff):
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            return await get_diff()
+        finally:
+            os.chdir(prev_cwd)
+
+    # (a) Restrictive max_untracked_bytes skips; permissive default includes --
+    #     both through bound_get_diff, the production call shape.
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp)
+        (open(f"{tmp}/notes.txt", "w")).write("X" * 64 + "\n")  # > 16 bytes
+        restrictive = await _diff_via(
+            tmp, bound_get_diff(DiffConfig(max_untracked_bytes=16)))
+        permissive = await _diff_via(tmp, bound_get_diff(DiffConfig()))
+    assert "# skipped: notes.txt (size" in restrictive, \
+        f"tiny max_untracked_bytes must skip via factory: {restrictive!r}"
+    assert "# skipped: notes.txt (size" not in permissive, \
+        f"permissive default must NOT skip: {permissive!r}"
+    assert "XXXX" in permissive, \
+        f"permissive default must include file content: {permissive!r}"
+
+    # (b) binary_probe_bytes flows both directions. First NUL sits at offset
+    #     100: a probe smaller than that finds no NUL (treated as text, not
+    #     skipped); a probe larger than that finds it (skipped as binary).
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp)
+        with open(f"{tmp}/probe.bin", "wb") as fp:
+            fp.write(b"T" * 100 + b"\x00" + b"tail\n")
+        small_probe = await _diff_via(
+            tmp, bound_get_diff(DiffConfig(binary_probe_bytes=16)))
+        large_probe = await _diff_via(
+            tmp, bound_get_diff(DiffConfig(binary_probe_bytes=1024)))
+    assert "# skipped: probe.bin (binary)" not in small_probe, \
+        f"probe smaller than NUL offset must NOT skip as binary: {small_probe!r}"
+    assert "probe.bin" in small_probe, \
+        f"non-skipped file must appear in diff: {small_probe!r}"
+    assert "# skipped: probe.bin (binary)" in large_probe, \
+        f"probe larger than NUL offset must skip as binary: {large_probe!r}"
+
+    # 15k. INVARIANT: deleting the dead round_seconds field drops the phantom
+    # validation floor. feature_seconds=350 >= max(model_call=120, gate=300)
+    # now validates; under the old code the dead default round_seconds=400
+    # made max(step_bounds)=400 > 350 and raised for a knob that governed
+    # nothing.
+    floor = _HC()
+    floor.timeouts.model_call_seconds = 120
+    floor.timeouts.gate_seconds = 300
+    floor.timeouts.feature_seconds = 350
+    floor.validate()  # must not raise
+
+    # 15l. INVARIANT: round_seconds stays deleted from Timeouts. Trivially true
+    # today; guards against the field being reintroduced without being wired to
+    # a real per-round budget (dead config that constrains live config).
+    from harness.config import Timeouts as _TO  # noqa: E402
+    assert not hasattr(_TO(), "round_seconds"), \
+        "round_seconds must not be reintroduced without wiring"
+
+    # 15m. INVARIANT: old TOML setting timeouts.round_seconds still loads. The
+    # `_apply` hasattr guard silently ignores it (same contract as any unknown
+    # key) -- neither raises nor creates the attribute.
+    stale = _HC()
+    stale._apply({"timeouts": {"round_seconds": 999}})  # must not raise
+    assert not hasattr(stale.timeouts, "round_seconds"), \
+        "stale round_seconds key must NOT create the attribute"
+
+    # 15n. INVARIANT: the dead `interactive` knob stays deleted (config-drift 2b).
+    # Nothing in harness/ ever read it; guards against reintroduction without a
+    # reader, same rationale as round_seconds above.
+    assert not hasattr(_HC(), "interactive"), \
+        "interactive must not be reintroduced without a reader"
+
+    # 15o. INVARIANT: old profile TOML setting `interactive` still loads. The
+    # `_apply` top-level tuple no longer lists it, so the key is silently ignored
+    # (same contract as any unknown key) -- neither raises nor creates the
+    # attribute -- while a sibling live key like `profile` still applies.
+    stale_i = _HC()
+    stale_i._apply({"interactive": False, "profile": "ci"})  # must not raise
+    assert not hasattr(stale_i, "interactive"), \
+        "stale interactive key must NOT create the attribute"
+    assert stale_i.profile == "ci", \
+        "live sibling key `profile` must still apply alongside a dead one"
+
+    # 15p. INVARIANT: HARNESS_NONINTERACTIVE is a no-op. Setting it must not
+    # raise and must not create an `interactive` attribute (the env hook was
+    # deleted with the field, not kept as a dead compatibility shim).
+    _prev_ni = os.environ.get("HARNESS_NONINTERACTIVE")
+    os.environ["HARNESS_NONINTERACTIVE"] = "1"
+    try:
+        env_i = _HC()
+        env_i._apply_env()  # must not raise
+        assert not hasattr(env_i, "interactive"), \
+            "HARNESS_NONINTERACTIVE must not create an interactive attribute"
+    finally:
+        if _prev_ni is None:
+            os.environ.pop("HARNESS_NONINTERACTIVE", None)
+        else:
+            os.environ["HARNESS_NONINTERACTIVE"] = _prev_ni
+
+    # 15q. INVARIANT: the live env sibling HARNESS_NO_DEBATE still flips
+    # debate_enabled (guards against over-deleting in `_apply_env`).
+    _prev_nd = os.environ.get("HARNESS_NO_DEBATE")
+    os.environ["HARNESS_NO_DEBATE"] = "1"
+    try:
+        env_d = _HC()
+        env_d._apply_env()
+        assert env_d.debate_enabled is False, \
+            "HARNESS_NO_DEBATE=1 must still flip debate_enabled to False"
+    finally:
+        if _prev_nd is None:
+            os.environ.pop("HARNESS_NO_DEBATE", None)
+        else:
+            os.environ["HARNESS_NO_DEBATE"] = _prev_nd
 
     # 16. INVARIANT: rejected `major` issues reach the deadlock/tiebreak path
     # instead of being silently discarded. Pre-fix, `unresolved_blocking` was
@@ -1053,6 +1284,774 @@ async def main():
     assert dpv_exc.missing_ids == {"I2", "I3"}
     assert dpv_exc.round == 2
 
+    # 22. INVARIANT: an errored gate CALLABLE is no-signal, NOT a gate failure.
+    # run_gate raising (verify.sh missing, OSError, non-zero run_gate) produced
+    # NO verdict about the code, so the outcome must be ESCALATED_NO_SIGNAL with
+    # "[gate]" in the reason -- never ESCALATED_GATE ("the code failed the
+    # gate"). Covers the initial-gate site.
+    cfg = HarnessConfig()
+    async def gate_raises():
+        raise RuntimeError("verify.sh: not found")
+    orch = Orchestrator(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                        None, gate_raises, diff_plain,
+                        ab_swap=lambda _id: False)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"errored gate must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[gate]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [gate]: {r.escalation_reason!r}"
+    results["gate_error_no_signal"] = (r.outcome, r.rounds_used)
+
+    # 23. INVARIANT: a malformed GateResult (gate returns a non-JSON string,
+    # e.g. a stale caller on the old str contract) is the SAME no-signal
+    # bucket, not a gate failure.
+    cfg = HarnessConfig()
+    async def gate_malformed():
+        return "this is not json"
+    orch = Orchestrator(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                        None, gate_malformed, diff_plain,
+                        ab_swap=lambda _id: False)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"malformed gate must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[gate]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [gate]: {r.escalation_reason!r}"
+    results["gate_malformed_no_signal"] = (r.outcome, r.rounds_used)
+
+    # 24. INVARIANT (guards against over-rotating #22/#23): a gate that RAN and
+    # reported ok=False is still a real gate failure -> ESCALATED_GATE. This is
+    # case 6 above, re-asserted here alongside the no-signal cases to keep the
+    # ran-and-failed vs never-ran distinction pinned.
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_fail, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_GATE, \
+        f"a gate that ran and failed must stay ESCALATED_GATE, got {r.outcome}"
+    results["gate_ran_and_failed"] = (r.outcome, r.rounds_used)
+
+    # 25. INVARIANT: zero accepted issues after debate skips the apply_fixes
+    # model call. Reviewer raises one blocking issue, doer rejects with
+    # reasoning, reviewer follow-up concedes (nothing held) -> accepted set is
+    # empty. Step 7's doer call must be SKIPPED (the pointless no-op that could
+    # itself error and escalate a converged run), an apply_fixes_skipped event
+    # logged, and step 8 (post-fix gate) STILL run -> PASSED.
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]},
+        followups=[{"issues": []}])  # reviewer concedes, nothing held
+    doer = StubDoer({"I1": "reject"})
+    gate_calls = []
+    async def gate_pass_recording():
+        gate_calls.append(True)
+        return (True, "green")
+    orch = make(cfg, doer, reviewer, None, gate_pass_recording, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.PASSED, \
+        f"converged empty-accept must PASS, got {r.outcome}"
+    assert doer.apply_fixes_calls == [], \
+        f"apply_fixes must not run with zero accepted issues: {doer.apply_fixes_calls}"
+    events = [e["event"] for e in r.debate_log]
+    assert "apply_fixes_skipped" in events, \
+        f"expected apply_fixes_skipped event in log: {events}"
+    skipped = next(e for e in r.debate_log if e["event"] == "apply_fixes_skipped")
+    assert skipped["reason"] == "no_accepted_issues", \
+        f"apply_fixes_skipped must record its reason: {skipped}"
+    # Post-fix gate STILL ran: initial gate + post-fix gate == 2 invocations.
+    assert len(gate_calls) == 2, \
+        f"post-fix gate must still run when apply is skipped, saw {len(gate_calls)} gate calls"
+    results["empty_accept_skips_apply"] = (r.outcome, r.rounds_used)
+
+    # 26. INVARIANT: a reviewer that answers with prose (no JSON) on the initial
+    # review escalates cleanly as ESCALATED_NO_SIGNAL. The parse raises
+    # ValueError OUTSIDE StepRunner's error boundary, so it previously crashed
+    # run_feature with an uncaught traceback -- same class as the doer path.
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), ProseReviewer(cfg), None,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["invariant_reviewer_prose_escalates"] = (r.outcome, r.rounds_used)
+
+    # 27. INVARIANT: a tiebreaker that answers with malformed output on a
+    # deadlocked issue escalates the WHOLE run as ESCALATED_NO_SIGNAL -- matching
+    # the errored-tiebreaker branch, NOT the timeout branch (which merely leaves
+    # the issue contested). The parse would otherwise raise ValueError inside the
+    # per-issue loop and crash run_feature.
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg,
+        first={"issues": [{"id": "I1", "severity": "blocking",
+                           "issue": "x", "suggested_fix": "y"}]},
+        followups=[{"issues": [{"id": "I1", "severity": "blocking",
+                                "issue": "x", "suggested_fix": "y"}]}] * 3)
+    orch = make(cfg, StubDoer({"I1": "reject"}), reviewer,
+                MalformedTiebreaker(cfg), gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    results["invariant_tiebreaker_malformed_escalates"] = (
+        r.outcome, r.rounds_used)
+
+    # 28. INVARIANT: _extract_verdict_json tolerates the three array shapes.
+    # (a) bare empty array.
+    assert _extract_verdict_json("[]") == {"issues": []}, "bare [] must parse"
+    # (b) array followed by prose whose text contains `]` -- rfind lands on the
+    # `]` in "[the docs]", the widest slice is unparseable, and the array path
+    # must walk `]` candidates leftward until the real array parses.
+    trailing = "[]\n\nNote: see [the docs] for details."
+    assert _extract_verdict_json(trailing) == {"issues": []}, \
+        f"array + prose containing ] must parse, got {_extract_verdict_json(trailing)!r}"
+    # (b') POPULATED one-issue array followed by prose whose text contains `]`.
+    # The `[]`-only case above can't catch a regression that mishandles a
+    # non-empty array's rightmost real `]`: here the widest slice spans the
+    # trailing "[link]" and is unparseable, so the leftward `]` walk must land
+    # on the array's own closing bracket and recover the single issue.
+    populated_trailing = (
+        '[{"id": "I1", "severity": "blocking", "issue": "x", '
+        '"suggested_fix": "y"}]\n\nNote: see [the link] above.')
+    got_pt = _extract_verdict_json(populated_trailing)
+    assert [i["id"] for i in got_pt["issues"]] == ["I1"], \
+        f"populated array + prose containing ] must parse to the issue, got {got_pt!r}"
+    assert got_pt["issues"][0]["issue"] == "x", \
+        f"populated array + prose must preserve issue fields, got {got_pt!r}"
+    # (c) fenced ```json array.
+    fenced = ('```json\n'
+              '[{"id": "I1", "severity": "blocking", '
+              '"issue": "x", "suggested_fix": "y"}]\n'
+              '```')
+    got = _extract_verdict_json(fenced)
+    assert [i["id"] for i in got["issues"]] == ["I1"], \
+        f"fenced array must parse to one issue, got {got!r}"
+    results["invariant_verdict_array_shapes_parse"] = (Outcome.PASSED, 0)
+
+    # 29. INVARIANT (Member A): the parse-boundary catches are narrowed to
+    # ValueError, so a NON-ValueError from a parse path (a harness bug -- e.g.
+    # a TypeError from a refactored _extract_json) PROPAGATES and crashes the
+    # run rather than being mislabelled "malformed response" and buried as
+    # no-signal. We monkeypatch _extract_json to raise TypeError; the reviewer
+    # returns valid JSON so the parse actually reaches the extractor. The
+    # TypeError must escape run_feature entirely (its handlers cover
+    # Timeout/ModelUnavailable/DoerProtocolViolation only, never TypeError).
+    import harness.orchestrator as _orch_mod  # noqa: E402
+    _real_extract = _orch_mod._extract_json
+
+    def _boom_extract(text):
+        raise TypeError("simulated harness refactor bug")
+
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain)
+    _orch_mod._extract_json = _boom_extract
+    try:
+        crashed = None
+        try:
+            await orch.run_feature("spec", "acc")
+        except BaseException as e:  # capture exactly what escapes
+            crashed = e
+        assert isinstance(crashed, TypeError), (
+            "a TypeError from a parse path must propagate (narrow ValueError "
+            f"catch), got {type(crashed).__name__ if crashed else None}: "
+            f"{crashed!r}")
+    finally:
+        _orch_mod._extract_json = _real_extract
+
+    # 30. INVARIANT (Member B): get_diff runs under StepRunner, so a get_diff
+    # callable that ERRORS is no-signal -> ESCALATED_NO_SIGNAL tagged
+    # "[get_diff]", the same contract as an errored gate/reviewer. Bare
+    # `await self.get_diff()` would have let the RuntimeError crash the run.
+    cfg = HarnessConfig()
+    async def diff_raises():
+        raise RuntimeError("git index.lock held")
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_raises)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"erroring get_diff must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[get_diff]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [get_diff]: {r.escalation_reason!r}"
+
+    # 31. INVARIANT (Member B): a HANGING get_diff fires the step-level timeout
+    # under the gate_seconds bound and escalates ESCALATED_TIMEOUT -- BEFORE the
+    # coarse feature budget -- proving the finer step signal wins. The gate
+    # passes instantly; only get_diff hangs. gate_seconds=1 bounds get_diff;
+    # feature_seconds stays large so ABORTED_BUDGET can't fire first.
+    cfg = HarnessConfig()
+    cfg.timeouts.gate_seconds = 1        # bounds get_diff (local tooling)
+    cfg.timeouts.model_call_seconds = 1  # keep max_step small for validate()
+    cfg.timeouts.feature_seconds = 120   # >> the ~1s get_diff hang
+    cfg.escalation.retries_before_counting = 0  # single attempt -> fast
+    async def diff_hang():
+        await asyncio.sleep(30)
+        return "never"
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_hang)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_TIMEOUT, \
+        f"hanging get_diff must escalate TIMEOUT (not budget), got {r.outcome}"
+    assert r.escalation_reason and "get_diff_no_signal" in r.escalation_reason, \
+        f"escalation_reason must name the get_diff step: {r.escalation_reason!r}"
+
+    # 32. INVARIANT (Member D2a): RealDoerClient.respond_to_review fed valid
+    # JSON that FAILS schema validation (missing required IssueResponse fields)
+    # must raise RuntimeError("malformed"), NOT leak a pydantic ValidationError.
+    # Prior malformed tests only fed prose; this pins the valid-JSON-wrong-schema
+    # branch through the real subprocess path via the fake-CLI helper.
+    verdict_wrongschema = ReviewVerdict(issues=[
+        ReviewIssue(id="I1", severity="blocking",
+                    issue="something is wrong", suggested_fix="fix it")])
+    with tempfile.TemporaryDirectory() as tmp:
+        # Valid JSON, but each response is missing `decision` and `reasoning`.
+        helper = _write_helper(tmp, json.dumps({"responses": [{"id": "I1"}]}))
+        doer = RealDoerClient(claude_cmd=helper)
+        raised = None
+        try:
+            await doer.respond_to_review("spec", "acc", "diff",
+                                         verdict_wrongschema)
+        except BaseException as e:
+            raised = e
+        assert isinstance(raised, RuntimeError), \
+            f"wrong-schema JSON must raise RuntimeError, got {type(raised).__name__}: {raised!r}"
+        assert not isinstance(raised, (ValueError, ValidationError)), \
+            f"must not leak ValueError/ValidationError: {type(raised).__name__}"
+        assert "malformed" in str(raised), \
+            f"RuntimeError message must mention 'malformed': {raised!r}"
+
+    # 33. INVARIANT (Member D2b): a stub reviewer returning valid JSON that
+    # fails ReviewVerdict validation escalates ESCALATED_NO_SIGNAL, same bucket
+    # as prose. (A bare wrong key like {"wrong_key": []} is ACCEPTED -- `issues`
+    # defaults to [] -- so it can't exercise the failure path; we feed valid
+    # JSON whose issues entry violates the schema to actually trip validation.)
+    cfg = HarnessConfig()
+    reviewer = StubReviewer(cfg, {"issues": [{"id": "I1"}]})  # missing fields
+    orch = make(cfg, StubDoer({}), reviewer, None, gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"wrong-schema reviewer JSON must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[reviewer]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [reviewer]: {r.escalation_reason!r}"
+
+    # 34. INVARIANT (Member D4): cmd_fix's Orchestrator construction is factored
+    # into build_orchestrator(cfg), and the production get_diff callable carries
+    # its bound DiffConfig introspectably. Reverting cli to pass bare
+    # real_get_diff (defaults shadowing the config) would fail this: the wired
+    # callable's diff_cfg must be the very cfg.diff object.
+    from harness.cli import build_orchestrator, ensure_clean_tree  # noqa: E402
+    from harness.orchestrator import (  # noqa: E402
+        real_restore_tree, _noop_restore_tree)
+    cfg = HarnessConfig()
+    built = build_orchestrator(cfg)
+    assert built.get_diff.diff_cfg is cfg.diff, \
+        "build_orchestrator must wire the config-bound get_diff (diff_cfg is cfg.diff)"
+    # allow_dirty=False wires the REAL git restore; True wires the no-op (we
+    # can't safely reset a tree whose baseline we don't own).
+    assert built.restore_tree is real_restore_tree, \
+        "build_orchestrator(allow_dirty=False) must wire real_restore_tree"
+    built_dirty = build_orchestrator(cfg, allow_dirty=True)
+    assert built_dirty.restore_tree is _noop_restore_tree, \
+        "build_orchestrator(allow_dirty=True) must wire the no-op restore"
+    # --allow-dirty leaves a visible marker in the transcript.
+    assert any(e["event"] == "tree_hygiene_disabled"
+               for e in built_dirty.log), \
+        "build_orchestrator(allow_dirty=True) must log tree_hygiene_disabled"
+
+    # 35. INVARIANT (tree-hygiene): every implement attempt is preceded by a
+    # restore, and retries start clean. A doer whose implement always times out
+    # (positive step timeout + retry) drives two attempts; the recording
+    # restore must fire BEFORE each attempt, interleaved
+    # (restore, attempt, restore, attempt).
+    class TimingOutImplementDoer(StubDoer):
+        def __init__(self, order):
+            super().__init__({})
+            self.order = order
+        async def implement(self, spec, acceptance):
+            self.order.append("attempt")
+            await asyncio.sleep(30)  # exceeds the positive step timeout below
+            return "never"
+    cfg = HarnessConfig()
+    cfg.timeouts.model_call_seconds = 1   # positive: factory actually runs
+    cfg.escalation.retries_before_counting = 1  # -> 2 attempts (retry once)
+    cfg.escalation.consecutive_same_step_threshold = 5  # don't escalate early
+    cfg.escalation.timeout_count_threshold = 5
+    order: list = []
+    restore = RecordingRestore(order)
+    doer = TimingOutImplementDoer(order)
+    orch = make(cfg, doer, StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert restore.calls >= 2, \
+        f"restore must run before both attempts, saw {restore.calls} calls"
+    assert order[:4] == ["restore", "attempt", "restore", "attempt"], \
+        f"restore must interleave before each attempt, got {order!r}"
+    # A tree_restored event records the discarded partial work on the timeout.
+    tr = [e for e in r.debate_log if e["event"] == "tree_restored"]
+    assert tr and tr[0]["reason"] == "implement_timeout", \
+        f"implement timeout must log tree_restored(implement_timeout): {tr!r}"
+    assert r.outcome == Outcome.ESCALATED_TIMEOUT, \
+        f"repeated implement timeout must escalate TIMEOUT, got {r.outcome}"
+
+    # 36. INVARIANT (tree-hygiene): an implement ERROR restores the tree and
+    # logs tree_restored(implement_error); outcome is ESCALATED_NO_SIGNAL. The
+    # error is not retried, so the restore runs (once per-attempt, once on the
+    # failure branch) before the escalation propagates.
+    class ErroringImplementDoer(StubDoer):
+        async def implement(self, spec, acceptance):
+            raise RuntimeError("claude exited 1: implement crashed")
+    cfg = HarnessConfig()
+    restore = RecordingRestore()
+    orch = make(cfg, ErroringImplementDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert restore.calls >= 1, \
+        f"implement error must restore the tree, saw {restore.calls} calls"
+    tr = [e for e in r.debate_log if e["event"] == "tree_restored"]
+    assert tr and tr[0]["reason"] == "implement_error", \
+        f"implement error must log tree_restored(implement_error): {tr!r}"
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"implement error must escalate NO_SIGNAL, got {r.outcome}"
+
+    # 37. INVARIANT (tree-hygiene): the tree is NEVER restored after implement
+    # has succeeded. Both a full PASSED run and a post-implement escalation
+    # (gate failure) must show restore_tree call count == number of implement
+    # attempts (exactly 1 here, the per-attempt hook) -- no trailing restore
+    # that would destroy reviewable work the pipeline now owns.
+    cfg = HarnessConfig()
+    restore = RecordingRestore()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.PASSED, f"expected PASSED, got {r.outcome}"
+    assert restore.calls == 1, \
+        f"PASSED run must restore once (per-attempt only), saw {restore.calls}"
+    assert not any(e["event"] == "tree_restored" for e in r.debate_log), \
+        "a successful implement must not emit tree_restored"
+    # Post-implement escalation: implement succeeds, then the gate fails.
+    cfg = HarnessConfig()
+    restore = RecordingRestore()
+    orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
+                gate_fail, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_GATE, \
+        f"expected ESCALATED_GATE, got {r.outcome}"
+    assert restore.calls == 1, \
+        f"post-implement escalation must not add a trailing restore, saw {restore.calls}"
+    assert not any(e["event"] == "tree_restored" for e in r.debate_log), \
+        "a post-implement escalation must not emit tree_restored"
+
+    # 38. INVARIANT (tree-hygiene): the clean-tree precondition refuses a dirty
+    # tree and --allow-dirty opts out. Exercised on the extracted check function
+    # directly (not the full CLI) in a temp git repo with a dirty tracked file.
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"],
+                       cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/f.txt", "w")).write("v1\n")
+        subprocess.run(["git", "add", "f.txt"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/f.txt", "w")).write("v2 DIRTY\n")  # dirty the tree
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            err = ensure_clean_tree(allow_dirty=False)
+            err_allowed = ensure_clean_tree(allow_dirty=True)
+        finally:
+            os.chdir(prev_cwd)
+    assert err is not None and "allow-dirty" in err, \
+        f"dirty tree must refuse with an actionable message, got {err!r}"
+    assert err_allowed is None, \
+        f"--allow-dirty must bypass the precondition, got {err_allowed!r}"
+
+    # 39. INVARIANT (tree-hygiene): real_restore_tree resets tracked changes and
+    # removes untracked files, restoring the committed baseline exactly.
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"],
+                       cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("BASELINE\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"],
+                       cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("POISONED\n")  # dirty tracked
+        (open(f"{tmp}/untracked.py", "w")).write("partial edit\n")  # untracked
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            await real_restore_tree()
+            restored = open("tracked.txt").read()
+            untracked_gone = not os.path.exists("untracked.py")
+        finally:
+            os.chdir(prev_cwd)
+    assert restored == "BASELINE\n", \
+        f"real_restore_tree must reset tracked content, got {restored!r}"
+    assert untracked_gone, \
+        "real_restore_tree must remove untracked files"
+
+    # --- restore-boundary fix (follow-up to tree-hygiene) ---
+
+    class FailOnCallRestore:
+        """restore_tree stub that succeeds on the per-attempt call(s) and raises
+        RuntimeError from the post-failure call, so a test can drive the
+        _restore_after_failure guard without tripping the in-attempt path.
+        Raises on every call at or after `fail_from` (1-indexed), mimicking a
+        `git reset` that hit an index.lock collision."""
+        def __init__(self, fail_from):
+            self.calls = 0
+            self.fail_from = fail_from
+        async def __call__(self):
+            self.calls += 1
+            if self.calls >= self.fail_from:
+                raise RuntimeError(
+                    "fatal: Unable to create '.git/index.lock': File exists")
+
+    # 40. INVARIANT (Member A): a post-failure restore that ITSELF fails must not
+    # crash and must not mask the original escalation. Doer errors (per-attempt
+    # restore, call 1, succeeds; doer raises); the post-failure restore (call 2)
+    # raises RuntimeError. The run must still return a FeatureResult with the
+    # ORIGINAL outcome (ESCALATED_NO_SIGNAL from the doer error, reason tagged
+    # [doer]), and the debate log must carry a restore_failed event with the git
+    # error. It must NOT raise out of run_feature.
+    cfg = HarnessConfig()
+    cfg.escalation.retries_before_counting = 0   # exactly one attempt
+    restore = FailOnCallRestore(fail_from=2)     # post-failure call fails
+    orch = make(cfg, ErroringImplementDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"failing post-failure restore must preserve the doer escalation, got {r.outcome}"
+    assert r.escalation_reason and "[doer]" in r.escalation_reason, \
+        f"original escalation must win (tagged [doer]): {r.escalation_reason!r}"
+    rf = [e for e in r.debate_log if e["event"] == "restore_failed"]
+    assert rf and rf[0]["reason"] == "implement_error" \
+        and "index.lock" in rf[0]["error"], \
+        f"a failed post-failure restore must log restore_failed(git error): {rf!r}"
+    assert not any(e["event"] == "tree_restored" for e in r.debate_log), \
+        "a FAILED restore must not also log tree_restored"
+
+    # 41. INVARIANT (Member A): timeout variant of #40. Doer times out (one
+    # attempt), the post-failure restore raises -> ESCALATED_TIMEOUT preserved,
+    # restore_failed logged, no crash.
+    class SleepingImplementDoer(StubDoer):
+        async def implement(self, spec, acceptance):
+            await asyncio.sleep(30)  # exceeds the positive step timeout below
+            return "never"
+    cfg = HarnessConfig()
+    cfg.timeouts.model_call_seconds = 1          # positive: factory runs
+    cfg.escalation.retries_before_counting = 0   # exactly one attempt
+    cfg.escalation.consecutive_same_step_threshold = 5  # don't escalate early
+    cfg.escalation.timeout_count_threshold = 5
+    restore = FailOnCallRestore(fail_from=2)     # post-failure call fails
+    orch = make(cfg, SleepingImplementDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_TIMEOUT, \
+        f"failing post-failure restore must preserve the timeout escalation, got {r.outcome}"
+    rf = [e for e in r.debate_log if e["event"] == "restore_failed"]
+    assert rf and rf[0]["reason"] == "implement_timeout" \
+        and "index.lock" in rf[0]["error"], \
+        f"a failed post-failure restore must log restore_failed on timeout: {rf!r}"
+
+    # 42. INVARIANT (Member A/Kimi): an IN-ATTEMPT restore failure attributes to
+    # restore_tree, NOT the doer. The restore raises on the FIRST call (before
+    # any implement attempt), so the doer never runs. Outcome is
+    # ESCALATED_NO_SIGNAL tagged [restore_tree] -- blaming the doer for a git
+    # failure would send the operator to debug the wrong component.
+    cfg = HarnessConfig()
+    restore = FailOnCallRestore(fail_from=1)     # per-attempt call fails
+    orch = make(cfg, StubDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"in-attempt restore failure must escalate NO_SIGNAL, got {r.outcome}"
+    assert r.escalation_reason and "[restore_tree]" in r.escalation_reason, \
+        f"in-attempt restore failure must be tagged [restore_tree]: {r.escalation_reason!r}"
+    assert "[doer]" not in r.escalation_reason, \
+        f"a restore failure must never be blamed on the doer: {r.escalation_reason!r}"
+
+    # 43. INVARIANT (Member B): the clean-tree precondition REFUSES when the
+    # check itself cannot prove the tree is clean. In a non-repo directory git
+    # status exits non-zero with empty stdout; the old code read that empty
+    # stdout as "clean" and silently passed. It must now return an actionable
+    # message. Companion cases pin that the refusal is about PROVABILITY: a clean
+    # repo returns None, a dirty one returns a message.
+    with tempfile.TemporaryDirectory() as tmp:  # non-repo: refuse
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            non_repo_err = ensure_clean_tree(allow_dirty=False)
+        finally:
+            os.chdir(prev_cwd)
+    assert non_repo_err is not None, \
+        "a non-repo (failed git status) must refuse, not silently pass"
+    with tempfile.TemporaryDirectory() as tmp:  # clean repo: pass
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=tmp, check=True)
+        (open(f"{tmp}/f.txt", "w")).write("v1\n")
+        subprocess.run(["git", "add", "f.txt"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp, check=True)
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            clean_err = ensure_clean_tree(allow_dirty=False)
+            (open(f"{tmp}/f.txt", "w")).write("v2 DIRTY\n")  # now dirty
+            dirty_err = ensure_clean_tree(allow_dirty=False)
+        finally:
+            os.chdir(prev_cwd)
+    assert clean_err is None, \
+        f"a clean repo must pass the precondition, got {clean_err!r}"
+    assert dirty_err is not None and "allow-dirty" in dirty_err, \
+        f"a dirty repo must refuse with an actionable message, got {dirty_err!r}"
+
+    # --- cleanup-breadth fix (round-2): the restore guards must catch ANY
+    # Exception, not just (RuntimeError, OSError). restore_tree is INJECTED, so
+    # the orchestrator cannot assume its exception taxonomy; a ValueError from
+    # it must be handled exactly like a git RuntimeError. BaseException
+    # (CancelledError, KeyboardInterrupt) must still propagate. ---
+
+    class RaisingRestore:
+        """restore_tree stub that raises a GIVEN exception instance at or after
+        the `fail_from` call (1-indexed). Parameterizing the exception lets a
+        test prove the guard's BREADTH: a plain ValueError -- NOT a
+        RuntimeError/OSError -- is still caught, and a BaseException like
+        asyncio.CancelledError is NOT."""
+        def __init__(self, exc, fail_from):
+            self.exc = exc
+            self.fail_from = fail_from
+            self.calls = 0
+        async def __call__(self):
+            self.calls += 1
+            if self.calls >= self.fail_from:
+                raise self.exc
+
+    # 44. INVARIANT (cleanup breadth, post-failure): a post-failure restore that
+    # raises a plain ValueError (NOT RuntimeError/OSError -- outside the old
+    # narrow catch) must not crash and must not mask the original escalation.
+    # Doer errors (per-attempt restore, call 1, succeeds); the post-failure
+    # restore (call 2) raises ValueError. The run must still return the ORIGINAL
+    # ESCALATED_NO_SIGNAL tagged [doer], with a restore_failed event -- pre-fix
+    # this ValueError escaped run_feature and crashed the process.
+    cfg = HarnessConfig()
+    cfg.escalation.retries_before_counting = 0   # exactly one attempt
+    restore = RaisingRestore(
+        ValueError("neither RuntimeError nor OSError"), fail_from=2)
+    orch = make(cfg, ErroringImplementDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")  # must NOT raise
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"a ValueError post-failure restore must preserve the doer escalation, got {r.outcome}"
+    assert r.escalation_reason and "[doer]" in r.escalation_reason, \
+        f"original escalation must win (tagged [doer]): {r.escalation_reason!r}"
+    rf = [e for e in r.debate_log if e["event"] == "restore_failed"]
+    assert rf and rf[0]["reason"] == "implement_error" \
+        and "neither RuntimeError nor OSError" in rf[0]["error"], \
+        f"a ValueError post-failure restore must log restore_failed: {rf!r}"
+
+    # 45. INVARIANT (cleanup breadth, in-attempt): an in-attempt restore that
+    # raises a plain ValueError on the FIRST call escalates ESCALATED_NO_SIGNAL
+    # tagged [restore_tree], no crash. Pre-fix the ValueError escaped the narrow
+    # (RuntimeError, OSError) catch and crashed run_feature.
+    cfg = HarnessConfig()
+    restore = RaisingRestore(
+        ValueError("neither RuntimeError nor OSError"), fail_from=1)
+    orch = make(cfg, StubDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    r = await orch.run_feature("spec", "acc")  # must NOT raise
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"a ValueError in-attempt restore must escalate NO_SIGNAL, got {r.outcome}"
+    assert r.escalation_reason and "[restore_tree]" in r.escalation_reason, \
+        f"in-attempt restore failure must be tagged [restore_tree]: {r.escalation_reason!r}"
+
+    # 46. INVARIANT (cancellation still propagates): asyncio.CancelledError from
+    # restore_tree is a BaseException, NOT an Exception, so it must NOT be
+    # swallowed by either guard -- a cancelled feature or a Ctrl-C must tear down
+    # promptly. This pins the BaseException exclusion so a future refactor cannot
+    # widen `except Exception` to `except BaseException`.
+    cfg = HarnessConfig()
+    restore = RaisingRestore(asyncio.CancelledError(), fail_from=1)
+    orch = make(cfg, StubDoer({}),
+                StubReviewer(cfg, {"issues": []}), None,
+                gate_pass, diff_plain, restore_tree=restore)
+    cancelled_propagated = False
+    try:
+        await orch.run_feature("spec", "acc")
+    except asyncio.CancelledError:
+        cancelled_propagated = True
+    assert cancelled_propagated, \
+        "asyncio.CancelledError from restore_tree must propagate, not be swallowed"
+
+    # 47. INVARIANT (outcome, not output): ensure_clean_tree REFUSES when the
+    # check itself cannot LAUNCH. subprocess.run can raise not just
+    # FileNotFoundError (git absent) but other OSError subclasses at launch --
+    # notably PermissionError (git present but not executable). Pre-fix (catching
+    # only FileNotFoundError) that PermissionError propagated and crashed the
+    # CLI; it must now return the safe-default actionable refusal.
+    import subprocess as _subproc_mod  # noqa: E402
+    _real_run = _subproc_mod.run
+    def _boom_run(*a, **k):
+        raise PermissionError("[Errno 13] Permission denied: 'git'")
+    _subproc_mod.run = _boom_run
+    try:
+        perm_err = ensure_clean_tree(allow_dirty=False)
+    finally:
+        _subproc_mod.run = _real_run
+    assert perm_err is not None and "allow-dirty" in perm_err, \
+        f"a launch PermissionError must refuse with an actionable message, got {perm_err!r}"
+
+    # --- outcome-not-output fix (round-2): real_get_diff's two unchecked
+    # subprocesses now inspect returncode, not just stdout. We force each failure
+    # by monkeypatching create_subprocess_exec in the orchestrator namespace to
+    # override ONLY the target argv and delegate everything else to the real
+    # implementation (so `git diff HEAD` and a healthy ls-files still run). ---
+
+    class _StubProc:
+        def __init__(self, out, err, rc):
+            self._out, self._err, self.returncode = out, err, rc
+        async def communicate(self, input=None):
+            return self._out, self._err
+
+    def _patched_exec(match, out, err, rc):
+        real_exec = asyncio.create_subprocess_exec
+        async def fake(*a, **k):
+            if match(a):
+                return _StubProc(out, err, rc)
+            return await real_exec(*a, **k)
+        return real_exec, fake
+
+    # 48. INVARIANT (outcome, not output): a FAILING `git ls-files` must raise
+    # RuntimeError (with stderr), NOT silently yield a diff with no untracked
+    # files. A silent [] here reopens the exact hole real_get_diff exists to
+    # close (a new file invisible to the reviewer). It escalates via StepRunner
+    # as [get_diff].
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("v1\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp, check=True)
+        (open(f"{tmp}/new_file.py", "w")).write("def X(): pass\n")  # untracked
+        real_exec, fake = _patched_exec(
+            lambda a: len(a) >= 2 and a[0] == "git" and a[1] == "ls-files",
+            b"", b"fatal: ls-files exploded", 2)
+        prev_cwd = os.getcwd()
+        ls_raised = False
+        try:
+            os.chdir(tmp)
+            asyncio.create_subprocess_exec = fake
+            try:
+                await real_get_diff()
+            except RuntimeError as e:
+                ls_raised = "ls-files exploded" in str(e)
+        finally:
+            asyncio.create_subprocess_exec = real_exec
+            os.chdir(prev_cwd)
+    assert ls_raised, \
+        "a failing git ls-files must raise RuntimeError with stderr, not a diff missing untracked files"
+
+    # 49. INVARIANT (outcome, not output): a `git diff --no-index` that exits >1
+    # (a real error, distinct from 0=identical / 1=differs) must NOT silently
+    # drop the file's patch. Instead it emits a VISIBLE `# skipped: <path> (diff
+    # failed: ...)` marker (git-quotePath encoded) and the function still returns
+    # the rest of the diff -- one unrenderable file must not lose the whole
+    # review diff.
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=tmp, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("v1\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp, check=True)
+        (open(f"{tmp}/tracked.txt", "w")).write("v2 TRACKED_MARKER\n")  # tracked change survives
+        (open(f"{tmp}/new_file.py", "w")).write("def X(): pass\n")  # untracked
+        real_exec, fake = _patched_exec(
+            lambda a: (len(a) >= 3 and a[0] == "git" and a[1] == "diff"
+                       and "--no-index" in a),
+            b"", b"fatal: diff --no-index exploded", 2)
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            asyncio.create_subprocess_exec = fake
+            try:
+                marker_diff = await real_get_diff()
+            finally:
+                asyncio.create_subprocess_exec = real_exec
+        finally:
+            os.chdir(prev_cwd)
+    assert "# skipped: new_file.py (diff failed:" in marker_diff, \
+        f"a diff --no-index error must yield a VISIBLE skip marker: {marker_diff!r}"
+    assert "diff --no-index exploded" in marker_diff, \
+        f"the skip marker must carry the git stderr: {marker_diff!r}"
+    assert "TRACKED_MARKER" in marker_diff, \
+        f"one unrenderable untracked file must not lose the rest of the diff: {marker_diff!r}"
+
+    # 35. INVARIANT (Member A): deeply nested MODEL output escalates
+    # ESCALATED_NO_SIGNAL instead of crashing. `json.loads` on pathologically
+    # nested input raises RecursionError -- which is NOT a ValueError -- so the
+    # ValueError-only narrowing would have let it crash the harness. The
+    # boundary now catches (ValueError, RecursionError); a model emitting
+    # nested-to-death JSON is bad model output (the no-signal bucket), not a
+    # harness bug. We drive the REAL deep-input path (not a monkeypatch) so this
+    # proves the actual failure mode: the reviewer returns `'['*N + ']'*N`,
+    # which blows json.loads's recursion limit inside _parse_verdict.
+    class DeepNestedReviewer(ReviewerClient):
+        async def review(self, spec, acceptance, diff):
+            return "[" * 200000 + "]" * 200000
+    cfg = HarnessConfig()
+    orch = make(cfg, StubDoer({}), DeepNestedReviewer(cfg), None,
+                gate_pass, diff_plain)
+    r = await orch.run_feature("spec", "acc")
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"deeply nested reviewer output must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[reviewer]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [reviewer]: {r.escalation_reason!r}"
+
+    # 36. INVARIANT (Member A, class closure): a gate callable returning
+    # nested-to-death JSON escalates ESCALATED_NO_SIGNAL "[gate]" instead of
+    # crashing. GateResult.from_json_str calls json.loads, which raises
+    # RecursionError on pathologically nested input -- NOT a ValueError -- so
+    # before the tuple was widened this escaped run_feature and crashed the
+    # harness. We drive the REAL deep-input path (a gate callable actually
+    # returning `'['*N + ']'*N`), not a monkeypatch, so this pins the actual
+    # failure mode at the GateResult parse boundary.
+    cfg = HarnessConfig()
+    async def gate_deep_nested():
+        return "[" * 200000 + "]" * 200000
+    orch = Orchestrator(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}),
+                        None, gate_deep_nested, diff_plain,
+                        ab_swap=lambda _id: False)
+    crashed = None
+    try:
+        r = await orch.run_feature("spec", "acc")
+    except BaseException as e:  # must NOT raise
+        crashed = e
+    assert crashed is None, \
+        f"nested-to-death gate output must not crash the harness, got {crashed!r}"
+    assert r.outcome == Outcome.ESCALATED_NO_SIGNAL, \
+        f"nested-to-death gate output must be no-signal, got {r.outcome}"
+    assert r.escalation_reason and "[gate]" in r.escalation_reason, \
+        f"escalation_reason must be tagged [gate]: {r.escalation_reason!r}"
+
+    # 37. INVARIANT (Member B, class closure): _extract_codex_message skips a
+    # nested-to-death JSONL line instead of crashing. A pathologically nested
+    # line raises RecursionError inside json.loads; the per-line except now
+    # includes RecursionError so the line is skipped like any other unparseable
+    # line (continue semantics unchanged) and a LATER valid item.completed line
+    # still wins (last-wins). Called directly to pin the extractor boundary.
+    nested_line = "[" * 200000 + "]" * 200000
+    valid_line = json.dumps(
+        {"type": "item.completed", "item": {"text": "the real answer"}})
+    extracted = _orch_mod._extract_codex_message(nested_line + "\n" + valid_line)
+    assert extracted == "the real answer", \
+        f"nested-to-death line must be skipped and later valid line win, got {extracted!r}"
+
     # report
     expected = {
         "early_exit": (Outcome.PASSED, 0),
@@ -1089,6 +2088,18 @@ async def main():
         "invariant_gate_red_still_escalates_gate": (Outcome.ESCALATED_GATE, 0),
         "invariant_unknown_gate_exit_code_treated_as_red": (
             Outcome.ESCALATED_GATE, 0),
+        "gate_error_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
+        "gate_malformed_no_signal": (Outcome.ESCALATED_NO_SIGNAL, 0),
+        "gate_ran_and_failed": (Outcome.ESCALATED_GATE, 0),
+        "empty_accept_skips_apply": (Outcome.PASSED, 1),
+        # Reviewer prose fails mid-round-1 (like reviewer_no_signal); the
+        # round didn't complete, so rounds_used=0.
+        "invariant_reviewer_prose_escalates": (Outcome.ESCALATED_NO_SIGNAL, 0),
+        # Malformed tiebreaker escalates after two held followups, mirroring
+        # tiebreaker_no_signal's rounds_used=2.
+        "invariant_tiebreaker_malformed_escalates": (
+            Outcome.ESCALATED_NO_SIGNAL, 2),
+        "invariant_verdict_array_shapes_parse": (Outcome.PASSED, 0),
     }
     ok = True
     for name, got in results.items():

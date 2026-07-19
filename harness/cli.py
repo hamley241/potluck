@@ -33,7 +33,8 @@ from .orchestrator import (
     ReviewerClient,
     TiebreakerClient,
     real_run_gate,
-    real_get_diff,
+    real_restore_tree,
+    bound_get_diff,
 )
 from . import resolve as resolve_mod
 
@@ -69,6 +70,75 @@ def write_log(result: dict, args):
         print(f"\nFull log written to {args.log_file}")
 
 
+def build_orchestrator(cfg: HarnessConfig,
+                       allow_dirty: bool = False) -> Orchestrator:
+    """Wire a cfg into a production Orchestrator (real doer/reviewer/tiebreaker,
+    real gate, config-bound get_diff, real tree restore). Pure: cfg ->
+    Orchestrator, no argparse and no I/O, so a test can build the exact object
+    cmd_fix runs and assert on the wiring (e.g. `orch.get_diff.diff_cfg is
+    cfg.diff`).
+
+    restore_tree is the real `git reset --hard` + `git clean -fd` when
+    allow_dirty is False; when True (operator opted out of the clean-tree
+    precondition), it is a no-op -- we cannot safely reset a tree whose
+    baseline we don't own -- and we log a `tree_hygiene_disabled` event so the
+    transcript shows hygiene was turned off."""
+    doer = RealDoerClient()
+    reviewer = ReviewerClient(cfg)
+    tiebreaker = TiebreakerClient(cfg) if cfg.debate.use_tiebreaker else None
+    restore_tree = None if allow_dirty else real_restore_tree
+    orch = Orchestrator(cfg, doer, reviewer, tiebreaker, real_run_gate,
+                        bound_get_diff(cfg.diff), restore_tree=restore_tree)
+    if allow_dirty:
+        orch._log("tree_hygiene_disabled", allow_dirty=True)
+    return orch
+
+
+def ensure_clean_tree(allow_dirty: bool = False) -> str | None:
+    """Clean-tree precondition for `potluck fix`. Returns an actionable error
+    message when the working tree is dirty (`git status --porcelain` non-empty)
+    and --allow-dirty was NOT passed, else None. Extracted from cmd_fix so the
+    precondition is testable without driving the whole CLI.
+
+    A dead implement attempt leaves partial edits in the tree; starting from a
+    known-clean baseline is what lets restore_tree reset to it safely.
+
+    Safe-default rule: if we cannot PROVE the tree is clean, we refuse. ANY
+    failure to run the check refuses -- empty porcelain output is only
+    meaningful when the command actually SUCCEEDED. Outside a git repo, with
+    git missing from PATH, or when git exists but isn't executable, stdout is
+    empty too and `porcelain.strip()` is falsy, which would silently read as
+    "clean" (worse than a false failure: a failed check that passes). So we
+    check the OUTCOME, not just stdout -- the same lesson the gate learned
+    (green comes from exit status, not from empty output). Only an exit-0 status
+    with empty porcelain output may return None."""
+    if allow_dirty:
+        return None
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True,
+        )
+    except OSError as e:
+        # Outcome, not output: a launch failure is NOT a clean tree. OSError is
+        # the parent of both FileNotFoundError (git absent) and PermissionError
+        # (git present but not executable); catching the family keeps the
+        # safe-default refusal the docstring promises instead of letting a
+        # PermissionError crash the CLI.
+        return (f"could not run git: {e}. Install git (or fix its "
+                f"permissions), or pass --allow-dirty to skip the check.")
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        return (f"could not verify the working tree (git status exited "
+                f"{proc.returncode}): {stderr[:200]}. Run potluck inside a git "
+                f"repository, or pass --allow-dirty to skip the check.")
+    if proc.stdout.strip():
+        return ("working tree is not clean. Commit, stash, or pass "
+                "--allow-dirty to run against the current tree.")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # fix — the code-writing loop
 # ---------------------------------------------------------------------------
@@ -85,6 +155,9 @@ def add_fix_parser(subparsers):
     p.add_argument("--no-tiebreaker", action="store_true")
     p.add_argument("--max-rounds", type=int, default=None)
     p.add_argument("--gate-timeout", type=int, default=None)
+    p.add_argument("--allow-dirty", action="store_true",
+                   help="Run against a dirty working tree; skips the clean-tree "
+                        "precondition AND all tree-restore behavior")
     p.add_argument("--json-output", action="store_true")
     p.add_argument("--log-file", type=str, default=None)
     p.set_defaults(func=cmd_fix)
@@ -113,16 +186,22 @@ def cmd_fix(args):
               file=sys.stderr)
         sys.exit(1)
 
+    # Clean-tree precondition (before the banner): a dead implement attempt
+    # leaves partial edits behind, so we start from a known-clean baseline that
+    # restore_tree can reset to. --allow-dirty is the visible, committed opt-out.
+    allow_dirty = getattr(args, "allow_dirty", False)
+    dirty_err = ensure_clean_tree(allow_dirty)
+    if dirty_err:
+        print(f"Error: {dirty_err}", file=sys.stderr)
+        sys.exit(1)
+
     print(f"potluck: profile={cfg.profile}, debate={'on' if cfg.debate_enabled else 'off'}, "
           f"max_rounds={cfg.debate.max_rounds}")
     print(f"roles: reviewer={cfg.models.reviewer.name}, tiebreaker={cfg.models.tiebreaker.name}")
     print(f"spec: {spec[:80]}{'...' if len(spec) > 80 else ''}\n")
 
     async def _run():
-        doer = RealDoerClient()
-        reviewer = ReviewerClient(cfg)
-        tiebreaker = TiebreakerClient(cfg) if cfg.debate.use_tiebreaker else None
-        orch = Orchestrator(cfg, doer, reviewer, tiebreaker, real_run_gate, real_get_diff)
+        orch = build_orchestrator(cfg, allow_dirty=allow_dirty)
         return await orch.run_feature(spec, acceptance)
 
     result = asyncio.run(_run())
@@ -130,6 +209,11 @@ def cmd_fix(args):
         "outcome": result.outcome.value,
         "rounds_used": result.rounds_used,
         "escalation_reason": result.escalation_reason,
+        # Harness-verified class-closure sweep (None unless the run PASSED and
+        # the sweep found sibling candidates). JSON mode carries it here; the
+        # human-readable section below is printed only in non-JSON mode.
+        "closure_report": (result.closure_report.model_dump(mode="json")
+                           if result.closure_report else None),
         "debate_log": result.debate_log,
     }
 
@@ -141,6 +225,27 @@ def cmd_fix(args):
         if out["escalation_reason"]:
             print(f"  Reason: {out['escalation_reason']}")
         print(f"{'='*60}")
+        # Class-closure sweep: only on a PASSED run that found siblings. The
+        # presentation keeps the two kinds of text unmissably distinct so a
+        # path-shaped string the model wrote can't be mistaken for a finding:
+        #   * bug_class is the MODEL'S words -- unverified explanation, labelled
+        #     `model-supplied` and never rendered as a location;
+        #   * candidates are HARNESS-VERIFIED grep matches -- real file:line hits
+        #     the harness found, shown under a heading that says so. They are
+        #     still candidates to JUDGE, not confirmed bugs.
+        # `rationale` is deliberately NOT printed here (it adds no operator value
+        # next to the pattern and is one more unverified string on screen); it
+        # stays in --json-output for structured consumers that can tell the keys
+        # apart.
+        cr = out["closure_report"]
+        if out["outcome"] == "passed" and cr and cr["candidates"]:
+            print("\nCLASS-CLOSURE SWEEP")
+            print(f"  Bug class (model-supplied, unverified): {cr['bug_class']}")
+            print("  Harness-verified grep matches -- candidates for you to "
+                  "judge, NOT confirmed bugs:")
+            for c in cr["candidates"]:
+                print(f"    {c['file']}:{c['line']}: {c['text'].strip()}")
+                print(f"        (matched pattern: {c['pattern']})")
         if out["debate_log"]:
             print("\nDebate log:")
             for entry in out["debate_log"]:
@@ -251,15 +356,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-tiebreaker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--max-rounds", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--gate-timeout", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--allow-dirty", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--json-output", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--log-file", type=str, default=None, help=argparse.SUPPRESS)
     return p
 
 
 def main():
-    # Native-Windows fails ungracefully deep in run_subprocess because
-    # `preexec_fn=os.setsid` is POSIX-only. That's an obscure traceback for
-    # someone who just tried potluck on the wrong OS. Fail honestly at
+    # Native-Windows fails ungracefully deep in run_subprocess because its
+    # cancellation teardown uses POSIX process-group signalling (`os.killpg`),
+    # which is POSIX-only. That's an obscure traceback for someone who just
+    # tried potluck on the wrong OS. Fail honestly at
     # startup instead: potluck's docs say Windows via WSL, so tell the user
     # exactly that. Under WSL, sys.platform is `linux`, so this check
     # doesn't fire.

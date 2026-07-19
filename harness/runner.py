@@ -39,10 +39,19 @@ class TimeoutEscalation(Exception):
 
 
 class ModelUnavailable(Exception):
-    """Raised when a required model call ERRORS (not times out) -- e.g. the CLI
-    is missing, unauthenticated, or exits non-zero. Like a timeout, this is
-    *no signal*, never a verdict: we escalate rather than treat an errored
-    reviewer as approval."""
+    """Raised when a required external signal source ERRORS (not times out).
+    The archetype is a model call -- the CLI is missing, unauthenticated, or
+    exits non-zero -- but the same applies to the deterministic gate callable
+    (verify.sh missing, an OSError/RuntimeError out of run_gate, or a
+    malformed GateResult): an errored gate produced NO verdict about the code.
+    It also covers the restore_tree callable: if the working tree cannot be
+    reset to the pre-implement baseline before an attempt (git index lock,
+    permissions, mid-rebase), the attempt would run against poisoned state, so
+    that too is *no signal* and escalates -- tagged role "restore_tree" so the
+    operator debugs git, not the model.
+    Like a timeout, all of these are *no signal*, never a verdict: we escalate
+    rather than treat an errored reviewer as approval, an errored gate as a
+    gate failure, or an un-restorable tree as a clean baseline."""
 
     def __init__(self, role: str, detail: str):
         self.role = role
@@ -129,65 +138,221 @@ class StepRunner:
             )
 
 
-async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
-    """Run an external CLI, return stdout. Raises on non-zero exit.
+async def _drain(stream: asyncio.StreamReader) -> None:
+    """Read a stream to EOF, discarding everything. Used during the SIGTERM
+    grace window so a child flushing buffered output doesn't wedge on a full
+    pipe. Any error (the transport tearing down under us as the process dies)
+    is swallowed -- this is best-effort cleanup on an already-cancelled call.
 
-    No timeout here on purpose -- the StepRunner wraps the call and owns the
-    wall-clock bound, so timeout policy lives in exactly one place.
+    RuntimeError from `stream.read` is special-cased: communicate()'s cancelled
+    reader may still hold the stream when we start (StreamReader rejects a
+    concurrent reader with RuntimeError). The sleep(0) at the call site yields
+    once to let it unwind, but a single yield is not a guarantee under a loaded
+    loop, so we retry a few times here -- yielding again between attempts --
+    before giving up. Once a read succeeds we fall back into the normal
+    drain-to-EOF loop; a transient concurrent-reader error must not end the
+    drain permanently and re-open the wedge-on-full-pipe failure.
 
-    Spawns each child in its own POSIX process group (via `os.setsid`) so
-    cancellation can kill the WHOLE group. Model CLIs often fork helper
-    processes -- killing only the direct child would leak grandchildren
-    that continue running (burning tokens, holding locks), and a retry
-    would spawn a second copy of the work.
+    The retry bound (3 attempts) is a deliberate pragmatic choice, not an
+    oversight: an unbounded retry could spin here during teardown -- which is
+    exactly when we must not hang -- so a persistent concurrent-reader error
+    (one that outlasts the bound) ends the drain rather than looping forever."""
+    _MAX_RUNTIME_RETRIES = 3
+    attempts = 0
+    try:
+        while True:
+            try:
+                chunk = await stream.read(65536)
+            except RuntimeError:
+                attempts += 1
+                if attempts > _MAX_RUNTIME_RETRIES:
+                    return
+                # The concurrent reader hasn't released the stream yet; yield
+                # and retry rather than abandoning the drain.
+                await asyncio.sleep(0)
+                continue
+            if not chunk:
+                return  # EOF
+    except Exception:
+        pass
+
+
+async def _cancel_drainers(drainers: list) -> None:
+    """Cancel and await the background pipe-reader tasks so none leaks past
+    run_subprocess. Awaited on both the graceful-exit and SIGKILL paths."""
+    for d in drainers:
+        d.cancel()
+    for d in drainers:
+        try:
+            await d
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+async def _teardown_process_group(proc) -> None:
+    """Two-phase SIGTERM -> grace -> SIGKILL teardown of `proc`'s process group.
+
+    Called from the `except BaseException` path of the shared spawn helper: on
+    cancellation (the StepRunner's wait_for timing us out) the child would
+    otherwise keep running -- leaking a process and burning model tokens in the
+    background, and a retry would spawn a second one. SIGTERM the group first,
+    give it a grace window to flush logs and exit cleanly, then SIGKILL if still
+    alive. SIGKILL-only would guarantee lost final output; SIGTERM-only would
+    never end if a child ignores it.
+
+    Factored out so run_subprocess and run_subprocess_result share EXACTLY this
+    teardown and cannot drift apart -- a cancelled call in either path leaks
+    neither child nor grandchild.
+    """
+    if proc.returncode is not None:
+        return
+    pgid = None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pass
+    if pgid is None:
+        # Couldn't get pgid (child already exited between check and kill);
+        # fall through to plain wait.
+        await proc.wait()
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    # communicate() was cancelled, so nobody is reading the child's pipes
+    # anymore. A well-behaved child that flushes buffered output from its
+    # SIGTERM handler -- the exact case this grace window exists for -- blocks
+    # in write() the moment the ~64 KB pipe buffer fills, never reaches exit,
+    # and eats SIGKILL. Drain both pipes concurrently with the wait so the
+    # child can finish flushing and exit cleanly. The bytes are discarded: the
+    # call is already cancelled, there is no consumer. The readers are cleaned
+    # up on BOTH paths below so no task leaks past this function.
+    #
+    # Yield the loop once before spawning the drainers. communicate()'s
+    # internal per-stream reader tasks were cancelled when this coroutine was
+    # cancelled, but may not have unwound yet; StreamReader rejects a concurrent
+    # reader with RuntimeError, which _drain would otherwise hit on its first
+    # read. This sleep(0) yields so those cancelled readers can release the
+    # streams in the common case. A single yield is not a guarantee -- under a
+    # loaded loop the readers may need more than one turn to unwind -- so _drain
+    # itself retries on the concurrent-reader RuntimeError rather than giving
+    # up. Together the yield and _drain's bounded retry make the drain robust in
+    # practice. That retry is BOUNDED, though: if a cancelled reader holds the
+    # stream past the bound this narrows rather than eliminates the window -- no
+    # claim of ready-queue-ordering independence.
+    await asyncio.sleep(0)
+    drainers = [
+        asyncio.ensure_future(_drain(stream))
+        for stream in (proc.stdout, proc.stderr)
+        if stream is not None
+    ]
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_GRACE_SECONDS)
+    except asyncio.TimeoutError:
+        # Grace expired; child ignored SIGTERM or grandchildren kept the group
+        # alive. Force-kill the whole group.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+    finally:
+        await _cancel_drainers(drainers)
+
+
+async def _spawn_and_communicate(
+    cmd: list[str], stdin_text: str | None
+) -> tuple[int, bytes, bytes]:
+    """Spawn `cmd`, run it to completion, and return (returncode, stdout,
+    stderr) as raw bytes. The single spawn+teardown site shared by
+    run_subprocess (raises on non-zero) and run_subprocess_result (returns the
+    outcome). Neither exit-code policy nor decoding lives here -- callers own
+    both -- so the two public functions cannot drift on spawn/teardown.
+
+    Spawns each child in its own POSIX process group (via
+    `start_new_session=True`, i.e. setsid() in the child) so cancellation can
+    kill the WHOLE group. Model CLIs and git often fork helper processes --
+    killing only the direct child would leak grandchildren that continue
+    running (burning tokens, holding locks), and a retry would spawn a second
+    copy of the work.
     """
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE if stdin_text is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        preexec_fn=os.setsid,  # new session -> distinct process group
+        # New session -> distinct process group (so the killpg teardown in
+        # _teardown_process_group reaches the whole tree). start_new_session is
+        # the documented, thread-safe spelling of "run setsid() in the child"
+        # -- the older fork-hook form is unsafe in the presence of threads and
+        # deprecated for exactly this use.
+        start_new_session=True,
     )
     try:
         stdout, stderr = await proc.communicate(
             input=stdin_text.encode() if stdin_text is not None else None
         )
     except BaseException:
-        # On cancellation (the StepRunner's wait_for timing us out) the child
-        # would otherwise keep running -- leaking a process and burning model
-        # tokens in the background, and a retry would spawn a second one.
-        # Two-phase teardown: SIGTERM the group first, give it a grace window
-        # to flush logs and exit cleanly, then SIGKILL if still alive.
-        # SIGKILL-only would guarantee lost final output; SIGTERM-only would
-        # never end if a child ignores it.
-        if proc.returncode is None:
-            pgid = None
-            try:
-                pgid = os.getpgid(proc.pid)
-            except ProcessLookupError:
-                pass
-            if pgid is not None:
-                try:
-                    os.killpg(pgid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=_GRACE_SECONDS)
-                except asyncio.TimeoutError:
-                    # Grace expired; child ignored SIGTERM or grandchildren
-                    # kept the group alive. Force-kill the whole group.
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    await proc.wait()
-            else:
-                # Couldn't get pgid (child already exited between check and
-                # kill); fall through to plain wait.
-                await proc.wait()
+        # Teardown itself has several await points (proc.wait(), sleep(0), the
+        # grace wait_for, _cancel_drainers). A SECOND cancellation arriving
+        # while it runs -- the outer feature_seconds budget firing during a
+        # step-level teardown, or a Ctrl-C -- would otherwise abort cleanup
+        # before the SIGKILL fallback and the final reap, leaking the child,
+        # its grandchildren, or the drainer tasks. Run teardown as a shielded
+        # task so a further cancel of THIS coroutine doesn't interrupt it; if
+        # the shielded await is itself cancelled, the finally still awaits the
+        # teardown task to completion before we re-raise. This changes only
+        # whether cleanup FINISHES -- the original exception (CancelledError or
+        # KeyboardInterrupt included) always propagates unchanged to the caller.
+        teardown = asyncio.ensure_future(_teardown_process_group(proc))
+        try:
+            await asyncio.shield(teardown)
+        finally:
+            if not teardown.done():
+                await teardown
         raise
-    if proc.returncode != 0:
+    return proc.returncode, stdout, stderr
+
+
+async def run_subprocess(cmd: list[str], stdin_text: str | None = None) -> str:
+    """Run an external CLI, return stdout. Raises on non-zero exit.
+
+    No timeout here on purpose -- the StepRunner wraps the call and owns the
+    wall-clock bound, so timeout policy lives in exactly one place. Spawn and
+    cancellation teardown are shared with run_subprocess_result via
+    _spawn_and_communicate / _teardown_process_group.
+    """
+    returncode, stdout, stderr = await _spawn_and_communicate(cmd, stdin_text)
+    # Strict decode of arbitrary backend bytes raises UnicodeDecodeError (a
+    # ValueError), which slips through StepRunner's (RuntimeError, OSError)
+    # catch and crashes the run. errors="replace" keeps the boundary total.
+    if returncode != 0:
         raise RuntimeError(
-            f"command {cmd[0]} exited {proc.returncode}: {stderr.decode()[:500]}"
+            f"command {cmd[0]} exited {returncode}: "
+            f"{stderr.decode(errors='replace')[:500]}"
         )
-    return stdout.decode()
+    return stdout.decode(errors="replace")
+
+
+async def run_subprocess_result(
+    cmd: list[str], *, stdin_text: str | None = None
+) -> tuple[int, bytes, bytes]:
+    """Sibling of run_subprocess that returns the OUTCOME instead of raising on
+    a non-zero exit: (returncode, stdout, stderr) as raw bytes.
+
+    Exists for callers that must tolerate a legitimate non-zero exit -- `git
+    grep`'s 1 (no match), `git diff --no-index`'s 1 (files differ). Those
+    callers previously hand-rolled create_subprocess_exec and lost
+    run_subprocess's cancellation teardown with it, leaking the child on a
+    StepRunner timeout. This shares run_subprocess's EXACT spawn
+    (`start_new_session=True`) and two-phase group teardown via the same
+    _spawn_and_communicate / _teardown_process_group, so a cancelled call here
+    cannot leak either.
+
+    Returns bytes (not str): each call site owns its own exit-code policy AND
+    its own `decode(errors="replace")` -- the returncode may be NEGATIVE when
+    the child was killed by a signal, which callers must treat as a failure
+    (never as success), so this helper decodes nothing and judges nothing.
+    """
+    return await _spawn_and_communicate(cmd, stdin_text)

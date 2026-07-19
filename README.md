@@ -274,9 +274,20 @@ commit [`ad514f0`](https://github.com/hamley241/potluck/commit/ad514f0).
   a model is chosen as "API key" but no CLI is installed, that direct-API path is
   a documented seam, not yet wired — surfaced at resolve time rather than faked.
 - **Large prompts via argv** — the Kimi backend passes its prompt as a command
-  argument, so a very large diff can exceed the OS `ARG_MAX` limit. This surfaces
-  as a clean `escalated_no_signal` (the tiebreak is skipped, never a crash or a
-  false approval); Codex and Claude use stdin and aren't affected.
+  argument, so a very large diff can exceed the OS `ARG_MAX` limit. The diff is
+  now **packed to fit**: the fixed framing (instructions, spec, criteria) is kept
+  whole and the diff is trimmed at *file boundaries* — whole files only, never a
+  partial hunk — to a byte budget derived from `sysconf(SC_ARG_MAX)` minus the
+  environment and a safety margin. Every dropped file leaves a visible
+  `# omitted from this review (prompt budget): …` marker so absence is never
+  silent, and a `prompt_packed` event lists the complete set of omissions. The
+  seam is now the **residual**: if the framing *alone* exceeds `ARG_MAX` there is
+  nothing left to trim, so the call still surfaces as a clean
+  `escalated_no_signal` (the tiebreak is skipped, never a crash or a false
+  approval). Codex and Claude use stdin and are never packed — a pipe has no
+  `ARG_MAX` to respect, and (per `docs/observations.md` 001) their large-prompt
+  drift is *measured* via `prompt_size` / `prompt_large` events, never
+  "fixed" by dropping files.
 - **Divergent work** (architecture / research) is intentionally out of scope:
   potluck v1 writes code against a deterministic gate. Design review — where two
   models can agree a bad idea is good — needs a different shape and stays a human
