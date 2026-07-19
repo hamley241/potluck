@@ -16,8 +16,9 @@ import json
 from harness.config import HarnessConfig
 from harness.orchestrator import (
     Orchestrator, DoerClient, ReviewerClient, TiebreakerClient, GateResult,
-    DoerProtocolViolation, _parse_verdict, _extract_verdict_json,
+    DoerProtocolViolation, _parse_verdict,
 )
+from harness_core import jsonx
 from harness.schemas import DoerResponse, IssueResponse, Outcome
 
 
@@ -1442,15 +1443,15 @@ async def main():
     results["invariant_tiebreaker_malformed_escalates"] = (
         r.outcome, r.rounds_used)
 
-    # 28. INVARIANT: _extract_verdict_json tolerates the three array shapes.
+    # 28. INVARIANT: extract_list_payload tolerates the three array shapes.
     # (a) bare empty array.
-    assert _extract_verdict_json("[]") == {"issues": []}, "bare [] must parse"
+    assert jsonx.extract_list_payload("[]", "issues") == {"issues": []}, "bare [] must parse"
     # (b) array followed by prose whose text contains `]` -- rfind lands on the
     # `]` in "[the docs]", the widest slice is unparseable, and the array path
     # must walk `]` candidates leftward until the real array parses.
     trailing = "[]\n\nNote: see [the docs] for details."
-    assert _extract_verdict_json(trailing) == {"issues": []}, \
-        f"array + prose containing ] must parse, got {_extract_verdict_json(trailing)!r}"
+    assert jsonx.extract_list_payload(trailing, "issues") == {"issues": []}, \
+        f"array + prose containing ] must parse, got {jsonx.extract_list_payload(trailing, 'issues')!r}"
     # (b') POPULATED one-issue array followed by prose whose text contains `]`.
     # The `[]`-only case above can't catch a regression that mishandles a
     # non-empty array's rightmost real `]`: here the widest slice spans the
@@ -1459,7 +1460,7 @@ async def main():
     populated_trailing = (
         '[{"id": "I1", "severity": "blocking", "issue": "x", '
         '"suggested_fix": "y"}]\n\nNote: see [the link] above.')
-    got_pt = _extract_verdict_json(populated_trailing)
+    got_pt = jsonx.extract_list_payload(populated_trailing, "issues")
     assert [i["id"] for i in got_pt["issues"]] == ["I1"], \
         f"populated array + prose containing ] must parse to the issue, got {got_pt!r}"
     assert got_pt["issues"][0]["issue"] == "x", \
@@ -1469,29 +1470,30 @@ async def main():
               '[{"id": "I1", "severity": "blocking", '
               '"issue": "x", "suggested_fix": "y"}]\n'
               '```')
-    got = _extract_verdict_json(fenced)
+    got = jsonx.extract_list_payload(fenced, "issues")
     assert [i["id"] for i in got["issues"]] == ["I1"], \
         f"fenced array must parse to one issue, got {got!r}"
     results["invariant_verdict_array_shapes_parse"] = (Outcome.PASSED, 0)
 
     # 29. INVARIANT (Member A): the parse-boundary catches are narrowed to
     # ValueError, so a NON-ValueError from a parse path (a harness bug -- e.g.
-    # a TypeError from a refactored _extract_json) PROPAGATES and crashes the
-    # run rather than being mislabelled "malformed response" and buried as
-    # no-signal. We monkeypatch _extract_json to raise TypeError; the reviewer
+    # a TypeError from a refactored jsonx.extract_list_payload) PROPAGATES and
+    # crashes the run rather than being mislabelled "malformed response" and
+    # buried as no-signal. We monkeypatch the extractor the reviewer verdict
+    # path calls (jsonx.extract_list_payload) to raise TypeError; the reviewer
     # returns valid JSON so the parse actually reaches the extractor. The
     # TypeError must escape run_feature entirely (its handlers cover
     # Timeout/ModelUnavailable/DoerProtocolViolation only, never TypeError).
     import harness.orchestrator as _orch_mod  # noqa: E402
-    _real_extract = _orch_mod._extract_json
+    _real_extract = _orch_mod.jsonx.extract_list_payload
 
-    def _boom_extract(text):
+    def _boom_extract(text, key):
         raise TypeError("simulated harness refactor bug")
 
     cfg = HarnessConfig()
     orch = make(cfg, StubDoer({}), StubReviewer(cfg, {"issues": []}), None,
                 gate_pass, diff_plain)
-    _orch_mod._extract_json = _boom_extract
+    _orch_mod.jsonx.extract_list_payload = _boom_extract
     try:
         crashed = None
         try:
@@ -1503,7 +1505,7 @@ async def main():
             f"catch), got {type(crashed).__name__ if crashed else None}: "
             f"{crashed!r}")
     finally:
-        _orch_mod._extract_json = _real_extract
+        _orch_mod.jsonx.extract_list_payload = _real_extract
 
     # 30. INVARIANT (Member B): get_diff runs under StepRunner, so a get_diff
     # callable that ERRORS is no-signal -> ESCALATED_NO_SIGNAL tagged

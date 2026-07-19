@@ -90,6 +90,13 @@ from harness_core.runner import (
     run_subprocess,
     run_subprocess_result,
 )
+# PORTED to harness_core 2026-07-18 (jsonx carve-out). The local
+# _extract_json/_extract_verdict_json are DELETED in this commit per the
+# step-4 copy-then-delete ruling -- a module and its tests go together,
+# never a stale copy left importable. The core states a RULED contract
+# (ambiguity is never a verdict); AmbiguousJSON subclasses ValueError so it
+# flows the existing (ValueError, RecursionError) parse boundaries unchanged.
+from harness_core import jsonx
 from .schemas import (
     ClosureCandidate,
     ClosurePattern,
@@ -920,7 +927,7 @@ class RealDoerClient(DoerClient):
         # loudly rather than be mislabelled "malformed response" and buried as
         # no-signal.
         try:
-            return DoerResponse.model_validate(_extract_json(raw))
+            return DoerResponse.model_validate(jsonx.extract_object(raw))
         except (ValueError, RecursionError) as e:
             raise RuntimeError(
                 f"doer returned malformed response: {e}") from e
@@ -1903,8 +1910,19 @@ class Orchestrator:
         try:
             bug_class, patterns, returned = _parse_closure(
                 res.output, self._CLOSURE_MAX_PATTERNS)
-        except (ValueError, RecursionError):
-            self._log("closure_skipped", reason="malformed")
+        except (ValueError, RecursionError) as e:
+            # Member D: when the malformed reply was AMBIGUOUS (the core found
+            # >1 candidate value and refused to guess), fold its count/offsets
+            # into the existing closure_skipped event -- count them, per the
+            # prompt-packing precedent, so moving no-signal rates point at which
+            # prompt contract to tighten. AmbiguousJSON subclasses ValueError, so
+            # the catch is unchanged; we only read the extra structure when it's
+            # there.
+            fields = {"reason": "malformed"}
+            if isinstance(e, jsonx.AmbiguousJSON):
+                fields["ambiguous_count"] = e.count
+                fields["ambiguous_offsets"] = e.offsets
+            self._log("closure_skipped", **fields)
             return None
 
         if returned > self._CLOSURE_MAX_PATTERNS:
@@ -2080,7 +2098,7 @@ def extract_message(fmt: str, raw: str) -> str:
     """Pull the model's message out of its CLI stdout, per backend format.
 
     Codex --json emits JSONL wrapping the reply; Claude (-p) and Kimi (-p)
-    print the reply directly. Downstream _extract_json handles fences/prose.
+    print the reply directly. Downstream jsonx handles fences/prose.
     """
     if fmt == "codex_jsonl":
         return _extract_codex_message(raw)
@@ -2111,76 +2129,15 @@ def _extract_codex_message(jsonl_output: str) -> str:
     return last_text if last_text is not None else jsonl_output
 
 
-def _extract_json(text: str) -> dict:
-    text = text.strip()
-    if "```" in text:
-        # pull the fenced block
-        parts = text.split("```")
-        for p in parts:
-            p = p.lstrip("json").strip()
-            if p.startswith("{"):
-                text = p
-                break
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError(f"no JSON object found in model output: {text[:200]}")
-    # Try the widest slice (first { to last }). If it fails (e.g. multiple
-    # JSON objects in prose output from kimi), walk backwards to find the
-    # last complete top-level object.
-    candidate = text[start : end + 1]
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        # Find the last JSON object: search backwards for the opening {
-        pos = end
-        while pos >= 0:
-            pos = text.rfind("{", 0, pos)
-            if pos == -1:
-                break
-            try:
-                return json.loads(text[pos : end + 1])
-            except json.JSONDecodeError:
-                pos -= 1
-                continue
-        raise ValueError(f"no parseable JSON object in model output: {text[:200]}")
-
-
-def _extract_verdict_json(text: str) -> dict:
-    """Like _extract_json, but tolerates a top-level JSON array as shorthand
-    for {"issues": [...]}. A clean followup review returns bare `[]` ("no
-    remaining issues held"), which _extract_json (object-only) would reject.
-    Scoped to verdict parsing; _parse_tiebreak still demands an object."""
-    stripped = text.strip()
-    if "```" in stripped:
-        # pull the fenced block; accept either array- or object-leading payloads
-        parts = stripped.split("```")
-        for p in parts:
-            p = p.lstrip("json").strip()
-            if p.startswith("[") or p.startswith("{"):
-                stripped = p
-                break
-    if stripped.startswith("["):
-        end = stripped.rfind("]")
-        if end == -1:
-            raise ValueError(f"no JSON array found in model output: {stripped[:200]}")
-        # The widest slice can span trailing prose that itself contains `]`
-        # (e.g. "[]\n\nNote: see [the docs]"). Mirror _extract_json's object
-        # fallback: walk `]` candidates from the right until one parses.
-        while end != -1:
-            try:
-                return {"issues": json.loads(stripped[: end + 1])}
-            except json.JSONDecodeError:
-                end = stripped.rfind("]", 0, end)
-        raise ValueError(f"no parseable JSON array in model output: {stripped[:200]}")
-    return _extract_json(text)
-
-
 def _parse_verdict(text: str) -> ReviewVerdict:
-    return ReviewVerdict.model_validate(_extract_verdict_json(text))
+    # A bare top-level array is the clean-followup shorthand ("no remaining
+    # issues held" -> `[]`); "issues" is potluck's word for its verdict list,
+    # passed to the core's parameterised key -- the core never knows it.
+    return ReviewVerdict.model_validate(jsonx.extract_list_payload(text, "issues"))
 
 
 def _parse_tiebreak(text: str) -> TiebreakVerdict:
-    return TiebreakVerdict.model_validate(_extract_json(text))
+    return TiebreakVerdict.model_validate(jsonx.extract_object(text))
 
 
 def _parse_closure(
@@ -2204,7 +2161,7 @@ def _parse_closure(
     Every failure mode here is a ValueError so the caller's narrow
     (ValueError, RecursionError) parse-boundary catch treats a malformed reply
     as `closure_skipped`, while a surprise type still crashes as a harness bug:
-      * _extract_json raises ValueError when no JSON object is present;
+      * jsonx.extract_object raises ValueError when no JSON object is present;
       * a missing/non-string `bug_class` or non-list `patterns` -> ValueError;
       * ClosurePattern.model_validate raises pydantic ValidationError (a
         ValueError subclass) on a malformed pattern entry.
@@ -2215,7 +2172,7 @@ def _parse_closure(
     ride FeatureResult into --json-output. `regex` is left untouched on purpose:
     a truncated regex would search for something different; the over-long case
     is rejected in the sweep before any grep runs, never shortened."""
-    data = _extract_json(text)
+    data = jsonx.extract_object(text)
     if not isinstance(data, dict):
         raise ValueError("closure reply is not a JSON object")
     bug_class = data.get("bug_class")
