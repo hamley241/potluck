@@ -204,3 +204,71 @@ without a model, the testable PARTS still get executed (argv construction,
 output parsing, file I/O) and the untestable remainder gets NAMED in the
 test — scope-of-claim applied to the suite's own architecture. Tracked in
 `docs/proposals/TASK-stub-seam-sweep.md`.
+
+## 009 — a preservation spec is a pointer to the tree, not an authority over it
+
+**Occurred:** 2026-07-19, slice B1 of the re-prompt task.
+
+A spec required the tiebreak boundary to "preserve exactly" the prefix
+`"malformed tiebreak verdict: "`. That is **menu's** string. potluck's is
+`"tiebreaker returned malformed response: "`. The reviewer read the spec
+literally and raised a blocking finding that the code deviated from it. The
+doer preserved the tree's actual string and rejected the finding.
+
+The doer was right, and the rule it applied is now law:
+
+> **When a spec's preservation claim and the tree disagree, the tree wins
+> and the spec is the defect.**
+
+A preservation obligation *quotes nothing* — it delegates. "Preserve
+exactly" is a pointer to the tree; a spec author who writes a literal beside
+it has copied a value that the pointer already names, and a copy can be
+stale or, as here, from the wrong repo.
+
+**Operational rule, adopted:** preservation obligations are **read out of
+the tree at spec-writing time, never recalled.** Quoting from memory is
+transcription, which is the failure the handoff extractor exists to prevent;
+this is that lesson applied to specs rather than to rulings.
+
+**Filed as a candidate, NOT built (one occurrence):** a spec-lint. Any
+`preserve exactly: "<string>"` clause is mechanically checkable against the
+tree the moment the spec is written, before a reviewer ever sees it.
+*Trigger: a second occurrence of a spec literal diverging from the tree.*
+
+## 010 — the sibling-sweep habit is also a contamination vector
+
+**Occurred:** same incident as 009; this is its cause, not its shape.
+
+The wrong string was in mind because menu's orchestrator had been read an
+hour earlier, chasing a suspected `RecursionError` divergence. The repos are
+deliberately kept comparable so that a finding in one can be swept into the
+other — eight consecutive sibling confirmations came from exactly that
+habit.
+
+**The discipline's strength is the source of its characteristic error.** The
+same comparability that makes a sweep productive makes the two repos'
+strings interchangeable in an author's head. This belongs beside the
+author-blindness entries because it is the same genus: a property of the
+worker, not of the code.
+
+**It predicts where it recurs:** anywhere one sibling has recently been read
+and the other is being written about. That is a narrow, checkable window,
+which is what makes the mechanical mitigation (read, don't recall) cheap
+enough to always apply.
+
+## 011 — a reviewer assuming ecosystem convention over repo convention
+
+Same run. The reviewer raised a major finding that the new suite was a
+`main()` script rather than pytest-discovered cases, and so "contributes
+zero tests." potluck's `./test` states **"No pytest"** in its header, runs
+each `harness/test_*.py` as a module, and auto-discovers via `find`. The
+`__main__` guard IS the convention; every existing suite has it.
+
+The finding was rejected, and the adjudication method is the settled
+pattern: **the referee reads the evidence, not the arguments** — the suite
+was run directly (28 assertions, five boundaries) rather than either party
+being believed.
+
+**Cheap fix, when the review prompts are next touched:** include the repo's
+test-runner convention in the reviewer's context. One line prevents a whole
+class of discovery-assumption findings.
