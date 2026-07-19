@@ -323,6 +323,18 @@ def _extract_changed_paths(diff: str) -> list[str]:
 # environment we cannot measure against an unknown ARG_MAX.
 _ARGV_BUDGET_FALLBACK = 96 * 1024
 
+# Linux ALSO caps each INDIVIDUAL argv string at MAX_ARG_STRLEN (32 pages =
+# 131072 bytes on every mainstream page-size config), independently of the
+# ARG_MAX total: a single over-long argument dies with E2BIG even when the
+# whole block would fit. This is a kernel constant (linux/binfmts.h) that is
+# NOT exposed via sysconf, so we hard-code the conservative value. macOS has
+# NO per-argument limit at all, so this dev box would happily pack a prompt
+# that a Linux runner -- which is what potluck actually targets; its README
+# sends Windows users to WSL, i.e. Linux -- rejects. We therefore apply the
+# STRICTER of the two limits EVERYWHERE, so a budget that "fits" on one
+# platform cannot silently overflow on another.
+_MAX_ARG_STRLEN = 128 * 1024  # 131072
+
 # In-prompt omission markers. The block header states plainly that the listed
 # files ARE part of the change but were not included, so a reviewer can never
 # mistake an omitted file for an unchanged one. Each per-file line uses the same
@@ -349,13 +361,20 @@ class PromptTooLarge(RuntimeError):
     no-signal, and a mutilated framing (dropped instructions or a truncated
     hunk) would be strictly worse. We raise rather than send one."""
 
-    def __init__(self, framing_bytes: int, budget: int):
+    def __init__(self, framing_bytes: int, preamble_bytes: int, budget: int):
+        # The guard compares framing PLUS the un-droppable diff preamble against
+        # the budget, so the true fixed size is their sum -- reporting framing
+        # alone understated it. Name both components so telemetry is honest.
         self.framing_bytes = framing_bytes
+        self.preamble_bytes = preamble_bytes
+        self.fixed_bytes = framing_bytes + preamble_bytes
         self.budget = budget
         super().__init__(
-            f"prompt framing is {framing_bytes} bytes but the argv budget is "
-            f"only {budget} bytes; cannot attach the diff without mutilating "
-            f"the instructions -- escalating as no-signal"
+            f"prompt fixed size is {self.fixed_bytes} bytes (framing "
+            f"{framing_bytes} + un-droppable diff preamble {preamble_bytes}) "
+            f"but the argv budget is only {budget} bytes; cannot attach the "
+            f"diff without mutilating the instructions -- escalating as "
+            f"no-signal"
         )
 
 
@@ -383,21 +402,46 @@ def _serialized_env_bytes(environ) -> int:
 
 
 def _derive_argv_budget(cmd, margin_bytes: int, arg_max: int | None,
-                        environ) -> tuple[int, str]:
+                        environ) -> tuple[int, str, str]:
     """Byte budget for the prompt argument of an argv-delivered backend, plus
-    which path produced it ("sysconf" | "fallback").
+    which path produced the TOTAL ("sysconf" | "fallback") and which limit
+    actually BOUND it ("arg_max" | "per_arg").
 
-    Derived from the OS ARG_MAX (passed in as `arg_max`, None when sysconf was
-    unavailable) MINUS the serialized environment, MINUS the other argv elements
-    (`cmd`), MINUS a configured safety margin. When `arg_max` is None we fall
-    back to a conservative constant (still net of argv + margin, since those we
-    can measure) and report "fallback" so the caller can log which path ran."""
-    argv_bytes = sum(len(str(a).encode("utf-8")) + 1 for a in cmd)
+    The budget is the MINIMUM of two independent limits:
+      * an ARG_MAX-derived total: the OS ARG_MAX (passed in as `arg_max`, None
+        when sysconf was unavailable) MINUS the serialized environment, MINUS
+        the other argv elements (`cmd`), MINUS the pointer arrays the kernel
+        also stores, MINUS a configured safety margin; and
+      * a per-argument cap: _MAX_ARG_STRLEN minus the same margin, because Linux
+        limits each single argv string regardless of the total.
+
+    When `arg_max` is None we fall back to a conservative constant. The env is
+    EQUALLY measurable on that path, so it is subtracted there too -- an
+    env-heavy CI shell would otherwise overflow the "conservative" fallback."""
+    # Each existing argv entry serializes NUL-terminated; the prompt argument we
+    # are about to add needs its OWN NUL too (the trailing `+ 1`), which the
+    # old accounting omitted.
+    argv_bytes = sum(len(str(a).encode("utf-8")) + 1 for a in cmd) + 1
+    env_bytes = _serialized_env_bytes(environ)
+    # The kernel also stores the argv[] and envp[] POINTER arrays in the same
+    # block: sizeof(char*) (8 on LP64) per entry, plus the two NULL terminators
+    # of the argv and envp arrays. argc counts `cmd` plus the prompt argument.
+    argc = len(cmd) + 1
+    envc = len(environ)
+    pointer_bytes = 8 * (argc + envc + 2)
+    overhead = env_bytes + argv_bytes + pointer_bytes + margin_bytes
+
     if arg_max is None or arg_max <= 0:
-        return _ARGV_BUDGET_FALLBACK - argv_bytes - margin_bytes, "fallback"
-    budget = (arg_max - _serialized_env_bytes(environ)
-              - argv_bytes - margin_bytes)
-    return budget, "sysconf"
+        total, source = _ARGV_BUDGET_FALLBACK - overhead, "fallback"
+    else:
+        total, source = arg_max - overhead, "sysconf"
+
+    # Apply the stricter of the total limit and Linux's per-argument cap, and
+    # report which one bound so the transcript explains the budget.
+    per_arg = _MAX_ARG_STRLEN - margin_bytes
+    if per_arg < total:
+        return per_arg, source, "per_arg"
+    return total, source, "arg_max"
 
 
 def _diff_header_path(line: str) -> str | None:
@@ -405,9 +449,14 @@ def _diff_header_path(line: str) -> str | None:
     file header. Uses the EXISTING header parsers (_parse_diff_git_header /
     _parse_diff_cc_header) -- no hand-rolled path extraction. For `diff --git`
     the b-side (new) path is returned; for merge/combined headers the single
-    merged path. The trailing newline is stripped first so it never leaks into
-    the parsed path."""
-    stripped = line.rstrip("\n")
+    merged path. Both line-ending characters are stripped first -- a CRLF diff
+    would otherwise leave a trailing `\r` on the path, which then mangles the
+    omission MARKER shown to the reviewer AND fails to match the clean
+    `git grep` paths in the class-closure `touched` exclusion set (a
+    `\r`-suffixed entry silently misses, so a just-fixed file gets re-reported).
+    Strip `\r\n`, not just `\n`; do not "simplify" this back to a bare newline
+    strip."""
+    stripped = line.rstrip("\r\n")
     parsed = _parse_diff_git_header(stripped)
     if parsed is not None:
         return parsed[1]
@@ -479,7 +528,7 @@ def _pack_diff_prompt(framing: str, diff: str, budget: int) -> _PackedPrompt:
     # (fixed == budget) as long as there is no diff content that forces an
     # omission manifest -- that residual case is caught below.
     if fixed > budget:
-        raise PromptTooLarge(framing_bytes, budget)
+        raise PromptTooLarge(framing_bytes, preamble_bytes, budget)
 
     # Precompute each file's text size and its (marker, marker size). The marker
     # is charged only if the file is omitted.
@@ -515,7 +564,7 @@ def _pack_diff_prompt(framing: str, diff: str, budget: int) -> _PackedPrompt:
         # Even framing + the full omission manifest (every file dropped, markers
         # only) won't fit: we cannot emit a bounded prompt that honestly lists
         # everything it dropped. Same no-signal contract as framing-too-large.
-        raise PromptTooLarge(framing_bytes, budget)
+        raise PromptTooLarge(framing_bytes, preamble_bytes, budget)
 
     # Greedy in original order. Suffix marker sums let each keep decision reserve
     # just enough for every remaining file to at least be OMITTED (marker cost),
@@ -573,15 +622,19 @@ def _assemble_prompt(backend, framing: str, diff: str, *, step: str,
     behavior and never alters the prompt or the outcome."""
     delivery = "stdin" if backend.stdin else "argv"
     if backend.stdin:
-        prompt = framing + diff
+        # A stdin backend is byte-for-byte what the legacy `_*_prompt` builders
+        # sent: framing + diff + a single trailing newline. No packing.
+        prompt = framing + diff + "\n"
     else:
         arg_max = _os_arg_max()
-        budget, source = _derive_argv_budget(
+        budget, source, bound = _derive_argv_budget(
             backend.cmd, prompt_cfg.argv_safety_margin_bytes, arg_max, os.environ)
-        # Log which budget path was taken (sysconf vs conservative fallback) so
-        # a fallback is visible in the transcript, not silent.
+        # Log which budget path was taken (sysconf vs conservative fallback) and
+        # which limit actually bound (arg_max total vs per-argument cap) so a
+        # fallback -- and the reason a budget is what it is -- is visible in the
+        # transcript, not silent.
         log("prompt_budget", step=step, backend=backend.name, delivery=delivery,
-            source=source, budget=budget,
+            source=source, bound=bound, budget=budget,
             margin=prompt_cfg.argv_safety_margin_bytes)
         packed = _pack_diff_prompt(framing, diff, budget)
         prompt = packed.prompt
@@ -2023,12 +2076,14 @@ def _parse_git_grep(output: str) -> list[tuple[str, int, str]]:
 
 # --- prompt builders (kept here so the contract with each model is explicit) ---
 #
-# Every diff-carrying prompt is built in two parts: a `_*_framing` function that
-# returns the fixed text ending at `DIFF:\n`, and a `_*_prompt` function that
-# appends the diff. call_backend takes the framing and the diff SEPARATELY so it
-# can pack the elastic diff for argv backends without ever touching the framing
-# (instructions/spec/criteria/tiebreak arguments are never dropped). The full
-# `_*_prompt` builders remain the canonical end-to-end shape.
+# Every diff-carrying prompt is built as a `_*_framing` function returning the
+# fixed text ending at `DIFF:\n`. call_backend (via _assemble_prompt) takes the
+# framing and the diff SEPARATELY so it can pack the elastic diff for argv
+# backends without ever touching the framing (instructions/spec/criteria/
+# tiebreak arguments are never dropped). There are deliberately NO monolithic
+# `_*_prompt` builders that pre-concatenate framing + diff: such a helper would
+# bypass BOTH packing and the _assemble_prompt instrumentation choke point with
+# nothing failing to warn a caller, so the four legacy ones were removed.
 
 def _review_framing(spec: str, acceptance: str) -> str:
     return f"""You are an INDEPENDENT code reviewer. You did not write this code and
@@ -2049,10 +2104,6 @@ ACCEPTANCE CRITERIA:
 
 DIFF:
 """
-
-
-def _review_prompt(spec: str, acceptance: str, diff: str) -> str:
-    return _review_framing(spec, acceptance) + diff + "\n"
 
 
 def _closure_framing(spec: str) -> str:
@@ -2090,10 +2141,6 @@ DIFF:
 """
 
 
-def _closure_prompt(spec: str, diff: str) -> str:
-    return _closure_framing(spec) + diff + "\n"
-
-
 def _review_followup_framing(spec: str, acceptance: str, rejections) -> str:
     rej = json.dumps([r.model_dump() for r in rejections.responses], indent=2)
     return f"""The author responded to your review. For each issue they REJECTED,
@@ -2112,11 +2159,6 @@ AUTHOR RESPONSES:
 
 DIFF:
 """
-
-
-def _review_followup_prompt(spec: str, acceptance: str, diff: str,
-                            rejections) -> str:
-    return _review_followup_framing(spec, acceptance, rejections) + diff + "\n"
 
 
 def _tiebreak_framing(spec, acceptance, issue_id, arg_a, arg_b) -> str:
@@ -2144,11 +2186,6 @@ ARGUMENT B:
 
 DIFF:
 """
-
-
-def _tiebreak_prompt(spec, acceptance, diff, issue_id, arg_a, arg_b) -> str:
-    return (_tiebreak_framing(spec, acceptance, issue_id, arg_a, arg_b)
-            + diff + "\n")
 
 
 # --- real gate / diff implementations (Seam 3) ---

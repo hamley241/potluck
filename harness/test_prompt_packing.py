@@ -24,6 +24,7 @@ from harness.orchestrator import (
     _derive_argv_budget, _serialized_env_bytes, _git_quote_path,
     _review_framing, _review_followup_framing, _closure_framing,
     _tiebreak_framing, _OMIT_MARKER_PREFIX, _ARGV_BUDGET_FALLBACK,
+    _MAX_ARG_STRLEN,
 )
 from harness import orchestrator as orch
 from harness.schemas import DoerResponse, IssueResponse, Outcome
@@ -282,7 +283,8 @@ def test_stdin_never_packed() -> bool:
     prompt = _assemble_prompt(
         STDIN_BACKEND, framing, diff, step="reviewer:review",
         prompt_cfg=HarnessConfig().prompt, log=log)
-    complete = diff in prompt and prompt == framing + diff
+    # stdin is byte-identical to the legacy builders: framing + diff + "\n".
+    complete = diff in prompt and prompt == framing + diff + "\n"
     no_markers = _OMIT_MARKER_PREFIX not in prompt
     no_pack_events = not log.by("prompt_packed") and not log.by("prompt_budget")
     delivery_stdin = all(f.get("delivery") == "stdin"
@@ -318,7 +320,8 @@ def test_markers_complete_and_quoted() -> bool:
     diff_many = "".join(_file_chunk(f"g{i}.py", 800) for i in range(12))
     target = _b(_review_framing(SPEC, ACC)) + 5000
     orig = orch._derive_argv_budget
-    orch._derive_argv_budget = lambda cmd, margin, arg_max, environ: (target, "sysconf")
+    orch._derive_argv_budget = (
+        lambda cmd, margin, arg_max, environ: (target, "sysconf", "arg_max"))
     try:
         log = _CollectLog()
         _assemble_prompt(ARGV_BACKEND, _review_framing(SPEC, ACC), diff_many,
@@ -372,7 +375,7 @@ def test_instrumentation() -> bool:
     large_ok = (len(large_events) == 1
                 and large_events[0]["threshold"] == 10
                 and large_events[0]["bytes"] == _b(big_prompt)
-                and big_prompt == framing + diff)  # unchanged prompt
+                and big_prompt == framing + diff + "\n")  # unpacked stdin
     ok = ok and large_ok
     print(f"  [{'PASS' if large_ok else 'FAIL'}] instrumentation: large fires "
           f"above threshold, prompt unchanged")
@@ -389,38 +392,85 @@ def test_instrumentation() -> bool:
 
 # --- Test 8: budget derivation from sysconf, env, margin; logged fallback ---
 
+def _overhead(cmd, environ, margin) -> int:
+    """The non-prompt bytes the derivation reserves, mirroring the impl exactly:
+    serialized env + argv (each NUL-terminated, PLUS the prompt arg's own NUL) +
+    the argv/envp pointer arrays (8 bytes each, +2 NULLs) + the safety margin."""
+    argv_bytes = sum(_b(a) + 1 for a in cmd) + 1
+    env_bytes = _serialized_env_bytes(environ)
+    pointer_bytes = 8 * ((len(cmd) + 1) + len(environ) + 2)
+    return env_bytes + argv_bytes + pointer_bytes + margin
+
+
 def test_budget_derivation() -> bool:
     ok = True
     cmd = ["kimi", "-p"]
     margin = 4096
     environ = {"HOME": "/home/x", "PATH": "/usr/bin:/bin"}
-    argv_bytes = sum(_b(a) + 1 for a in cmd)
-    env_bytes = _serialized_env_bytes(environ)
 
-    # sysconf path subtracts environment, argv, and margin.
-    budget, source = _derive_argv_budget(cmd, margin, 200_000, environ)
-    expected = 200_000 - env_bytes - argv_bytes - margin
-    sysconf_ok = source == "sysconf" and budget == expected
+    # sysconf path (arg_max small enough that the TOTAL binds, not the per-arg
+    # cap): subtracts env, argv (incl. the prompt NUL), pointer arrays, margin.
+    budget, source, bound = _derive_argv_budget(cmd, margin, 100_000, environ)
+    expected = 100_000 - _overhead(cmd, environ, margin)
+    sysconf_ok = source == "sysconf" and bound == "arg_max" and budget == expected
     ok = ok and sysconf_ok
     print(f"  [{'PASS' if sysconf_ok else 'FAIL'}] budget: sysconf subtracts "
-          f"env+argv+margin ({budget} == {expected})")
+          f"env+argv+ptr+margin ({budget} == {expected}) bound={bound}")
 
     # A bigger environment (and bigger margin) shrink the budget -- proving both
-    # are actually read.
-    budget2, _ = _derive_argv_budget(
-        cmd, margin, 200_000, {**environ, "EXTRA": "z" * 1000})
-    budget3, _ = _derive_argv_budget(cmd, margin + 5000, 200_000, environ)
+    # are actually read. (Still small enough that the total binds.)
+    budget2, _, _ = _derive_argv_budget(
+        cmd, margin, 100_000, {**environ, "EXTRA": "z" * 1000})
+    budget3, _, _ = _derive_argv_budget(cmd, margin + 5000, 100_000, environ)
     reads_env_margin = budget2 < budget and budget3 == budget - 5000
     ok = ok and reads_env_margin
     print(f"  [{'PASS' if reads_env_margin else 'FAIL'}] budget: env & margin "
           f"both reduce budget")
 
-    # Fallback path (sysconf unavailable) uses the conservative constant.
-    fb_budget, fb_source = _derive_argv_budget(cmd, margin, None, environ)
+    # PER-ARG CAP BINDS. With a huge ARG_MAX the ARG_MAX-derived total is far
+    # bigger than Linux's per-argument limit, so the per-arg cap (minus margin)
+    # must win -- NOT the ~5 MB total. Pre-fix (no per-arg cap) this returned the
+    # multi-megabyte figure and this assertion fails.
+    pa_budget, pa_source, pa_bound = _derive_argv_budget(
+        cmd, margin, 5_000_000, environ)
+    arg_max_total = 5_000_000 - _overhead(cmd, environ, margin)
+    per_arg_binds = (pa_bound == "per_arg"
+                     and pa_budget == _MAX_ARG_STRLEN - margin
+                     and pa_budget != arg_max_total
+                     and pa_source == "sysconf")
+    ok = ok and per_arg_binds
+    print(f"  [{'PASS' if per_arg_binds else 'FAIL'}] budget: per-arg cap binds "
+          f"({pa_budget} == {_MAX_ARG_STRLEN - margin}, not {arg_max_total})")
+
+    # ...and the bound is LOGGED in prompt_budget so the transcript explains it.
+    orig_am = orch._os_arg_max
+    orch._os_arg_max = lambda: 5_000_000
+    try:
+        log = _CollectLog()
+        _assemble_prompt(ARGV_BACKEND, _review_framing(SPEC, ACC), "d\n",
+                         step="reviewer:review",
+                         prompt_cfg=HarnessConfig().prompt, log=log)
+    finally:
+        orch._os_arg_max = orig_am
+    ev = log.by("prompt_budget")
+    bound_logged = len(ev) == 1 and ev[0]["bound"] == "per_arg"
+    ok = ok and bound_logged
+    print(f"  [{'PASS' if bound_logged else 'FAIL'}] budget: bound logged "
+          f"({ev and ev[0].get('bound')})")
+
+    # Fallback path (sysconf unavailable) uses the conservative constant AND --
+    # per Member B -- subtracts the SERIALIZED ENVIRONMENT too (equally
+    # measurable on this path). A large stubbed env must reduce the budget.
+    fb_budget, fb_source, _ = _derive_argv_budget(cmd, margin, None, environ)
     fallback_ok = (fb_source == "fallback"
-                   and fb_budget == _ARGV_BUDGET_FALLBACK - argv_bytes - margin)
-    ok = ok and fallback_ok
-    print(f"  [{'PASS' if fallback_ok else 'FAIL'}] budget: fallback constant")
+                   and fb_budget == _ARGV_BUDGET_FALLBACK
+                       - _overhead(cmd, environ, margin))
+    big_env = {**environ, "EXTRA": "z" * 1000}
+    fb_big, _, _ = _derive_argv_budget(cmd, margin, None, big_env)
+    env_subtracted = fb_big < fb_budget
+    ok = ok and fallback_ok and env_subtracted
+    print(f"  [{'PASS' if fallback_ok and env_subtracted else 'FAIL'}] budget: "
+          f"fallback subtracts env ({fb_big} < {fb_budget})")
 
     # The fallback path is LOGGED (source=fallback) when sysconf returns nothing.
     orig = orch._os_arg_max
@@ -440,6 +490,97 @@ def test_budget_derivation() -> bool:
     return ok
 
 
+# --- Test 9: CRLF diffs parse to CLEAN paths (no trailing \r) ---
+
+def test_crlf_paths_clean() -> bool:
+    ok = True
+    # A CRLF-terminated single-file diff. rstrip("\n") would leave "x.py\r";
+    # rstrip("\r\n") must yield "x.py".
+    crlf = ("diff --git a/x.py b/x.py\r\n"
+            "index 0000000..1111111 100644\r\n"
+            "--- a/x.py\r\n+++ b/x.py\r\n"
+            "@@ -0,0 +1 @@\r\n"
+            "+" + "z" * 2000 + "\r\n")
+    _, parsed = _split_diff_into_files(crlf)
+    clean_split = (len(parsed) == 1 and parsed[0][0] == "x.py"
+                   and "\r" not in parsed[0][0])
+    ok = ok and clean_split
+    print(f"  [{'PASS' if clean_split else 'FAIL'}] crlf_paths: split path "
+          f"{parsed and parsed[0][0]!r}")
+
+    # And the omission marker renders the CLEAN path -- force omission with a
+    # tiny budget and check the marker names "x.py", never "x.py\r".
+    framing = _review_framing(SPEC, ACC)
+    packed = _pack_diff_prompt(framing, crlf, budget=_b(framing) + 400)
+    marker_clean = (len(packed.omitted) == 1 and packed.omitted[0][0] == "x.py"
+                    and f"{_OMIT_MARKER_PREFIX}x.py (" in packed.prompt
+                    and "x.py\r" not in packed.prompt)
+    ok = ok and marker_clean
+    print(f"  [{'PASS' if marker_clean else 'FAIL'}] crlf_paths: marker clean")
+    return ok
+
+
+# --- Test 10: a diff-of-a-diff does NOT mid-file split (regression pin) ---
+#
+# Hunk body lines are always prefixed with `+`, `-`, or a space, so a
+# `diff --git` string INSIDE a hunk body never matches the header parser. Pin
+# this: a diff whose single hunk contains BOTH an added and a context line that
+# read like headers must still split into exactly ONE file.
+
+def test_diff_of_a_diff_single_split() -> bool:
+    nested = (
+        "diff --git a/patch.txt b/patch.txt\n"
+        "index 0000000..1111111 100644\n"
+        "--- a/patch.txt\n+++ b/patch.txt\n"
+        "@@ -1,3 +1,3 @@\n"
+        " diff --git a/ctx.py b/ctx.py\n"      # context line, leading space
+        "-old\n"
+        "+diff --git a/added.py b/added.py\n"  # added line, leading '+'
+    )
+    _, parsed = _split_diff_into_files(nested)
+    single = len(parsed) == 1 and parsed[0][0] == "patch.txt"
+    print(f"  [{'PASS' if single else 'FAIL'}] diff_of_a_diff: files="
+          f"{[p for p, _ in parsed]}")
+    return single
+
+
+# --- Test 11: the four legacy prompt builders are GONE (no defs, no attrs) ---
+#
+# A trivially-true invariant that fails the moment someone reintroduces a
+# monolithic prompt path that would bypass packing AND instrumentation.
+
+def test_dead_builders_gone() -> bool:
+    dead = ["_review_prompt", "_review_followup_prompt",
+            "_tiebreak_prompt", "_closure_prompt"]
+    present = [n for n in dead if hasattr(orch, n)]
+    ok = not present
+    print(f"  [{'PASS' if ok else 'FAIL'}] dead_builders_gone present={present}")
+    return ok
+
+
+# --- Test 12: stdin prompts are byte-identical to framing + diff + "\n" ---
+
+def test_stdin_byte_identity() -> bool:
+    ok = True
+    rejections = DoerResponse(responses=[
+        IssueResponse(id="I1", decision="reject", reasoning="no")])
+    framings = {
+        "review": _review_framing(SPEC, ACC),
+        "followup": _review_followup_framing(SPEC, ACC, rejections),
+        "closure": _closure_framing(SPEC),
+        "tiebreak": _tiebreak_framing(SPEC, ACC, "I1", "arg a", "arg b"),
+    }
+    diff = _file_chunk("app.py", 300)
+    for name, framing in framings.items():
+        prompt = _assemble_prompt(
+            STDIN_BACKEND, framing, diff, step="reviewer:review",
+            prompt_cfg=HarnessConfig().prompt, log=_CollectLog())
+        identical = prompt == framing + diff + "\n"
+        ok = ok and identical
+        print(f"  [{'PASS' if identical else 'FAIL'}] stdin_byte_identity:{name}")
+    return ok
+
+
 async def main() -> bool:
     print("=== prompt packing (argv hard limit) ===")
     results = [
@@ -453,6 +594,10 @@ async def main() -> bool:
         test_markers_complete_and_quoted(),
         test_instrumentation(),
         test_budget_derivation(),
+        test_crlf_paths_clean(),
+        test_diff_of_a_diff_single_split(),
+        test_dead_builders_gone(),
+        test_stdin_byte_identity(),
     ]
     ok = all(results)
     print("\nALL PASS" if ok else "\nSOME FAILED")
