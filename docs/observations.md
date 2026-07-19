@@ -144,3 +144,63 @@ of the correction: a prediction of alarm, falsified by the machinery being
 correct, is the cheap kind of wrong. Writing it down against the prediction
 rather than quietly revising the story is what keeps the record usable as
 evidence later.
+
+## 007 — A union that keeps both sides can still be inconsistent
+
+Sibling to menu's DRIFT #21, and its complement. #21's lesson was that a
+more general-LOOKING fix is not a superset, so a merge that takes one side
+wholesale can silently delete the other's coverage. This is the same seam
+from the other direction: a merge that keeps BOTH sides can still produce
+code that cannot run.
+
+`real_run_gate` was migrated to `run_subprocess_result`, which returns
+`(returncode, stdout, stderr)` and has no `proc`. Independently, drift #13's
+fix added `exit_code=proc.returncode` back when the function still spawned a
+bare `proc`. The merge preserved the new call AND the old reference. Git had
+nothing to complain about — the two edits touch different lines — so the
+conflict resolution was clean and the result raised `NameError` on every
+call.
+
+**Conflict resolution proves TEXTUAL compatibility. Only EXECUTION proves
+SEMANTIC compatibility.** The variable one side named is the variable the
+other side deleted, and no amount of reading the diff surfaces that as
+reliably as running the function once does.
+
+**Operational rule: after any merge that touches a function's BODY, execute
+that function at least once before the merge is trusted.** Not the suite —
+the function. Here the suite was green and stayed green, because of
+observation 008.
+
+## 008 — The stub seam is a structural blind spot, not an oversight
+
+`real_run_gate` shipped broken to origin with a fully green suite because it
+had ZERO executions across the entire test suite. Every orchestrator test
+injects a stub gate callable — which is the project's core quality bet, the
+thing that makes the whole control loop testable with no model calls and no
+network, and it is correct.
+
+But it has a complement nobody had named: **every `real_*` boundary function
+sits on the far side of the stub seam, and the architecture guarantees the
+suite never runs it.** The blind spot is not an oversight in any one test; it
+is the shape of the strategy. Stubs prove the ORCHESTRATOR's branching.
+Nothing was proving the functions that touch the real world.
+
+That is observation 004's disease — a green wider than its evidence — in the
+live system rather than in a check, sitting exactly where the architecture
+put it.
+
+The fix is not fewer stubs. It is a second, smaller family of tests that runs
+the real boundary with no mocks: `harness/test_real_gate.py` drives actual
+bash scripts through the actual subprocess path across all four outcome
+classes (pass, ran-and-failed, could-not-run at exit 2, signal-killed with a
+negative code). Nine assertions, no mocks, and it fails against the broken
+form with the production error.
+
+**Generalised as a standing requirement (ruling, 2026-07-19): enumerate the
+stub seam across all three repos — every `real_*` function and every real
+client — and require each to carry at least one no-mock execution test
+covering its outcome classes.** Where a boundary genuinely cannot run
+without a model, the testable PARTS still get executed (argv construction,
+output parsing, file I/O) and the untestable remainder gets NAMED in the
+test — scope-of-claim applied to the suite's own architecture. Tracked in
+`docs/proposals/TASK-stub-seam-sweep.md`.
