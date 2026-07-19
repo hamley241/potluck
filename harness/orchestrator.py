@@ -151,6 +151,25 @@ def _bounded_payload(payload: str) -> tuple[str, int]:
     return payload[:_MAX_STR], len(payload)
 
 
+def _raises(exc: Exception):
+    """Return a zero-arg thunk that raises `exc`. Lets a caller hand
+    `_call_and_parse` an 'on timeout, raise THIS' policy as a CALLABLE -- the
+    same callable shape the tiebreaker (return a sentinel to stay contested) and
+    the closure sweep (log a skip and return None) use for that same hook. The
+    timeout outcome is the one that diverges structurally across the boundaries
+    -- raise here, continue there, skip elsewhere -- so it travels as a thunk
+    rather than as a pattern/detail pair the helper would raise for everyone."""
+    def _thunk():
+        raise exc
+    return _thunk
+
+
+# Sentinel the tiebreaker's on_timeout thunk returns so its caller can tell a
+# timed-out adjudication (issue stays contested, escalates to human) apart from
+# a parsed verdict. A distinct object -- never a value _parse_tiebreak yields.
+_TIEBREAK_TIMED_OUT = object()
+
+
 # --- output-contract schemas: stated ONCE, reused at the tail ---------------
 #
 # Each message type's required JSON schema is held here as a single named value
@@ -1693,6 +1712,58 @@ class Orchestrator:
             return
         self._log("tree_restored", reason=reason)
 
+    async def _call_and_parse(self, *, step, role, call, parse, timeout,
+                              on_timeout, malformed_prefix=None,
+                              not_ok_detail=None,
+                              on_not_ok=None, on_malformed=None):
+        """The ONE shared model-call-and-parse boundary. Does exactly what each
+        of the five wrappers (_review, _review_followup, _doer_respond_to_review,
+        _tiebreak, _closure_sweep) used to do inline: run the model call through
+        the StepRunner, escalate on timeout, escalate on a non-ok call, then
+        parse the output and escalate a malformed reply -- one place so the
+        bounded re-prompt (landing next) has one place to live, not five.
+
+        The malformed catch is the load-bearing part: a bad MODEL REPLY raises
+        only ValueError (json.loads' JSONDecodeError and pydantic's
+        ValidationError are both subclasses; AmbiguousJSON subclasses it too) or
+        RecursionError (nested-to-death JSON blows json.loads' stack, and
+        RecursionError is NOT a ValueError). Any OTHER exception is a harness bug
+        and MUST crash loudly, not be mislabelled a bad reply -- so the caught
+        set stays exactly (ValueError, RecursionError).
+
+        Where the boundaries genuinely differ, the difference is a parameter:
+          * on_timeout -- REQUIRED zero-arg callable owning the timeout outcome,
+            which diverges structurally: three boundaries raise a
+            TimeoutEscalation (distinct pattern/detail each -- pass a `_raises`
+            thunk), the tiebreaker returns a sentinel to leave the issue
+            contested, the closure sweep logs a skip and returns None.
+          * role + malformed_prefix + not_ok_detail -- the per-boundary strings
+            the shared raises use; each preserved verbatim, none unified.
+          * on_not_ok / on_malformed -- optional overrides for the sole boundary
+            (closure) whose not-ok and malformed outcomes LOG-and-skip instead
+            of raising; when unset the shared ModelUnavailable raise runs. The
+            timeout/not-ok/parse skeleton and the caught set stay identical for
+            all five either way."""
+        res = await self.runner.run(step, call, timeout)
+        if res.timed_out:
+            return on_timeout()
+        if not res.ok:
+            if on_not_ok is not None:
+                return on_not_ok(res)
+            raise ModelUnavailable(role, res.error or not_ok_detail)
+        try:
+            return parse(res.output)
+        except (ValueError, RecursionError) as e:
+            if on_malformed is not None:
+                return on_malformed(e, res.output)
+            # Member B: carry the offending reply (truncated + length) into the
+            # escalation detail so the failure can be replayed, not just counted.
+            body, plen = _bounded_payload(res.output)
+            raise ModelUnavailable(
+                role,
+                f"{malformed_prefix}{e} "
+                f"| payload ({plen} chars): {body}") from e
+
     async def _doer_respond_to_review(self, spec: str, acceptance: str,
                                       diff: str,
                                       verdict: ReviewVerdict) -> DoerResponse:
@@ -1706,34 +1777,20 @@ class Orchestrator:
                 spec, acceptance, diff, verdict)
             return resp.model_dump_json()
 
-        res = await self.runner.run(
-            "doer:respond", _call, self.cfg.timeouts.model_call_seconds)
-        if res.timed_out:
-            raise TimeoutEscalation("doer_no_signal",
-                                    "doer timed out during respond_to_review")
-        if not res.ok:
-            raise ModelUnavailable(
-                "doer", res.error or "doer respond errored")
         # A malformed doer JSON must NOT propagate as an uncaught traceback --
-        # run_feature's escalation handlers don't know about pydantic. Convert
-        # to ModelUnavailable so the outcome is a clean ESCALATED_NO_SIGNAL,
-        # same as any other unusable doer response. The caught set is exactly
-        # what a malformed MODEL RESPONSE can raise out of json.loads +
-        # pydantic: ValueError (covering json.JSONDecodeError and pydantic
-        # ValidationError, both subclasses) plus RecursionError (json.loads on
-        # pathologically nested input exceeds the recursion limit, and
-        # RecursionError is NOT a ValueError). Anything else is a harness bug --
-        # not a bad doer reply -- and MUST crash loudly rather than hide behind
-        # the model-quality bucket.
-        try:
-            return DoerResponse.model_validate_json(res.output)
-        except (ValueError, RecursionError) as e:
-            # Member B: carry the offending reply (truncated + length) into the
-            # escalation detail so the failure can be replayed, not just counted.
-            body, plen = _bounded_payload(res.output)
-            raise ModelUnavailable(
-                "doer", f"doer returned malformed response: {e} "
-                f"| payload ({plen} chars): {body}") from e
+        # run_feature's escalation handlers don't know about pydantic. The shared
+        # boundary converts it to ModelUnavailable so the outcome is a clean
+        # ESCALATED_NO_SIGNAL, same as any other unusable doer response, using
+        # the same narrow (ValueError, RecursionError) catch -- see
+        # _call_and_parse for why that set and not a broader one.
+        return await self._call_and_parse(
+            step="doer:respond", role="doer", call=_call,
+            parse=DoerResponse.model_validate_json,
+            timeout=self.cfg.timeouts.model_call_seconds,
+            on_timeout=_raises(TimeoutEscalation(
+                "doer_no_signal", "doer timed out during respond_to_review")),
+            not_ok_detail="doer respond errored",
+            malformed_prefix="doer returned malformed response: ")
 
     async def _doer_apply_fixes(self, issues: list[ReviewIssue],
                                 diff: str) -> str:
@@ -1752,66 +1809,38 @@ class Orchestrator:
 
     async def _review(self, spec: str, acceptance: str,
                       diff: str) -> ReviewVerdict:
-        res = await self.runner.run(
-            "reviewer:review",
-            lambda: self.reviewer.review(spec, acceptance, diff),
-            self.cfg.timeouts.model_call_seconds,
-        )
-        if res.timed_out:
-            # No signal from the reviewer is NOT approval. Force escalation by
-            # treating it as an unresolvable blocking state.
-            raise TimeoutEscalation("reviewer_no_signal",
-                                    "reviewer timed out; refusing to proceed without review")
-        if not res.ok:
-            raise ModelUnavailable("reviewer", res.error or "reviewer call errored")
-        # A reviewer answering with prose (no JSON) or a schema mismatch raises
-        # out of the parse, which run_feature does not catch. Convert to
-        # ModelUnavailable so it escalates cleanly, same as the doer path in
-        # _doer_respond_to_review. The caught set is exactly what a malformed
-        # MODEL RESPONSE can raise out of json.loads + pydantic: ValueError
-        # (covering json.JSONDecodeError and pydantic ValidationError, both
-        # subclasses) plus RecursionError (json.loads on pathologically nested
-        # input exceeds the recursion limit, and RecursionError is NOT a
-        # ValueError). Any other exception type is a harness bug and MUST crash
-        # loudly, not be mislabelled as a bad reviewer reply.
-        try:
-            return _parse_verdict(res.output)
-        except (ValueError, RecursionError) as e:
-            # Member B: attach the offending reply (truncated + length) so the
-            # escalation detail carries the evidence to replay it.
-            body, plen = _bounded_payload(res.output)
-            raise ModelUnavailable(
-                "reviewer", f"reviewer returned malformed response: {e} "
-                f"| payload ({plen} chars): {body}") from e
+        # No signal from the reviewer is NOT approval: a timeout forces
+        # escalation (treated as an unresolvable blocking state), and a reviewer
+        # answering with prose or a schema mismatch escalates cleanly as
+        # ModelUnavailable rather than crashing run_feature -- see
+        # _call_and_parse for the shared timeout/not-ok/malformed handling and
+        # the narrow (ValueError, RecursionError) catch it applies.
+        return await self._call_and_parse(
+            step="reviewer:review", role="reviewer",
+            call=lambda: self.reviewer.review(spec, acceptance, diff),
+            parse=_parse_verdict,
+            timeout=self.cfg.timeouts.model_call_seconds,
+            on_timeout=_raises(TimeoutEscalation(
+                "reviewer_no_signal",
+                "reviewer timed out; refusing to proceed without review")),
+            not_ok_detail="reviewer call errored",
+            malformed_prefix="reviewer returned malformed response: ")
 
     async def _review_followup(self, spec, acceptance, diff,
                                response) -> ReviewVerdict:
-        res = await self.runner.run(
-            "reviewer:followup",
-            lambda: self.reviewer.respond(spec, acceptance, diff, response),
-            self.cfg.timeouts.model_call_seconds,
-        )
-        if res.timed_out:
-            raise TimeoutEscalation("reviewer_no_signal",
-                                    "reviewer follow-up timed out")
-        if not res.ok:
-            raise ModelUnavailable("reviewer", res.error or "reviewer follow-up errored")
-        # See _review: malformed reviewer output must escalate, not crash. The
-        # caught set is exactly what a malformed MODEL RESPONSE can raise out of
-        # json.loads + pydantic: ValueError (covering json.JSONDecodeError and
-        # pydantic ValidationError, both subclasses) plus RecursionError
-        # (json.loads on pathologically nested input exceeds the recursion
-        # limit, and RecursionError is NOT a ValueError). Any other exception
-        # type is a harness bug that MUST crash loudly.
-        try:
-            return _parse_verdict(res.output)
-        except (ValueError, RecursionError) as e:
-            # Member B: attach the offending reply (truncated + length) so the
-            # escalation detail carries the evidence to replay it.
-            body, plen = _bounded_payload(res.output)
-            raise ModelUnavailable(
-                "reviewer", f"reviewer returned malformed response: {e} "
-                f"| payload ({plen} chars): {body}") from e
+        # See _review: a follow-up timeout escalates (distinct detail, same
+        # reviewer_no_signal pattern), and malformed reviewer output escalates
+        # cleanly rather than crashing. _call_and_parse applies the shared
+        # narrow (ValueError, RecursionError) catch.
+        return await self._call_and_parse(
+            step="reviewer:followup", role="reviewer",
+            call=lambda: self.reviewer.respond(spec, acceptance, diff, response),
+            parse=_parse_verdict,
+            timeout=self.cfg.timeouts.model_call_seconds,
+            on_timeout=_raises(TimeoutEscalation(
+                "reviewer_no_signal", "reviewer follow-up timed out")),
+            not_ok_detail="reviewer follow-up errored",
+            malformed_prefix="reviewer returned malformed response: ")
 
     async def _tiebreak(self, spec, acceptance, diff, blocking: set[str],
                         verdict: ReviewVerdict,
@@ -1851,42 +1880,29 @@ class Orchestrator:
             else:
                 arg_a, arg_b = doer_arg, reviewer_arg
                 role_of_a, role_of_b = "doer", "reviewer"
-            res = await self.runner.run(
-                "tiebreaker:adjudicate",
-                lambda: self.tiebreaker.adjudicate(
+            # A timeout is no signal on THIS issue: it stays contested and
+            # escalates to human (ESCALATED_DISAGREEMENT) -- the human is the
+            # correct fallback for a specific unadjudicated dispute -- so the
+            # timeout hook returns a sentinel to continue the loop rather than
+            # raising like the reviewer/doer boundaries do. An ERRORED tiebreaker
+            # (unauthenticated / missing binary) is a DIFFERENT signal: the
+            # adjudicator itself is unavailable, so not-ok escalates as
+            # no-signal, and a malformed reply (prose / schema mismatch)
+            # escalates the whole run the same way -- both via the shared
+            # ModelUnavailable raise, NOT the timeout branch. See _call_and_parse
+            # for the narrow (ValueError, RecursionError) parse catch.
+            tb = await self._call_and_parse(
+                step="tiebreaker:adjudicate", role="tiebreaker",
+                call=lambda: self.tiebreaker.adjudicate(
                     spec, acceptance, diff, issue_id, arg_a, arg_b),
-                self.cfg.timeouts.model_call_seconds,
-            )
-            if res.timed_out:
-                # A timeout is no signal on THIS issue: it stays contested and
-                # escalates to human (ESCALATED_DISAGREEMENT) -- the human is the
-                # correct fallback for a specific unadjudicated dispute.
+                parse=_parse_tiebreak,
+                timeout=self.cfg.timeouts.model_call_seconds,
+                on_timeout=lambda: _TIEBREAK_TIMED_OUT,
+                not_ok_detail="tiebreaker call errored",
+                malformed_prefix="tiebreaker returned malformed response: ")
+            if tb is _TIEBREAK_TIMED_OUT:
                 still_blocking.add(issue_id)
                 continue
-            if not res.ok:
-                # An ERRORED tiebreaker (unauthenticated / missing binary) is a
-                # different signal: the adjudicator itself is unavailable, so we
-                # escalate as no-signal rather than mislabel it as disagreement.
-                raise ModelUnavailable("tiebreaker", res.error or "tiebreaker call errored")
-            # A malformed tiebreaker response (prose / schema mismatch) escalates
-            # the whole run, matching the ERRORED branch above -- NOT the timeout
-            # branch, which merely leaves this issue contested. The caught set is
-            # exactly what a malformed MODEL RESPONSE can raise out of json.loads
-            # + pydantic: ValueError (covering json.JSONDecodeError and pydantic
-            # ValidationError, both subclasses) plus RecursionError (json.loads on
-            # pathologically nested input exceeds the recursion limit, and
-            # RecursionError is NOT a ValueError). Any other exception type is a
-            # harness bug and MUST crash loudly instead of being buried here.
-            try:
-                tb = _parse_tiebreak(res.output)
-            except (ValueError, RecursionError) as e:
-                # Member B: attach the offending reply (truncated + length) so
-                # the escalation detail carries the evidence to replay it.
-                body, plen = _bounded_payload(res.output)
-                raise ModelUnavailable(
-                    "tiebreaker",
-                    f"tiebreaker returned malformed response: {e} "
-                    f"| payload ({plen} chars): {body}") from e
             if tb.sides_with == "a":
                 winning_role = role_of_a
             elif tb.sides_with == "b":
@@ -1972,44 +1988,30 @@ class Orchestrator:
             return None
 
         # (b) Reviewer backend under StepRunner, bounded by model_call_seconds.
-        #     A timeout or non-ok call is skipped, never raised.
-        res = await self.runner.run(
-            "closure",
-            lambda: self.reviewer.closure_scan(spec, diff),
-            self.cfg.timeouts.model_call_seconds,
-        )
-        if res.timed_out:
+        #     This is the ONE boundary whose timeout / non-ok / malformed
+        #     outcomes LOG a `closure_skipped` and return None instead of
+        #     raising -- an advisory add-on must never turn a good run into an
+        #     escalation (finding #9). So it routes through the shared
+        #     _call_and_parse but supplies its own on_timeout/on_not_ok/
+        #     on_malformed handlers; the run + narrow (ValueError, RecursionError)
+        #     parse catch stay shared with the four escalating boundaries.
+        def _on_timeout():
             self._log("closure_skipped", reason="model_timeout")
             return None
-        if not res.ok:
+
+        def _on_not_ok(res):
             self._log("closure_skipped",
                       reason=res.error or "closure model call errored")
             return None
 
-        # (c) Parse at the established narrow parse-boundary contract: a
-        #     malformed MODEL REPLY raises only ValueError (json.loads +
-        #     pydantic ValidationError, both ValueError subclasses) or
-        #     RecursionError (nested-to-death JSON blows json.loads's stack, and
-        #     RecursionError is NOT a ValueError). Any OTHER exception type is a
-        #     harness bug -- it must crash, not be buried as "malformed".
-        # (d) Cap patterns BEFORE per-pattern validation. _parse_closure caps
-        #     the RAW reply list to _CLOSURE_MAX_PATTERNS before it validates or
-        #     bounds any entry, so a reply with thousands of patterns can't make
-        #     the harness validate thousands of them -- the validation work is
-        #     bounded too, not just the final list. `returned` is the true count
-        #     the model actually sent (measured before the cut), so the
-        #     closure_patterns_capped log stays honest.
-        try:
-            bug_class, patterns, returned = _parse_closure(
-                res.output, self._CLOSURE_MAX_PATTERNS)
-        except (ValueError, RecursionError) as e:
+        def _on_malformed(e, output):
             # Member D: when the malformed reply was AMBIGUOUS (the core found
             # >1 candidate value and refused to guess), fold its count/offsets
             # into the existing closure_skipped event -- count them, per the
             # prompt-packing precedent, so moving no-signal rates point at which
             # prompt contract to tighten. AmbiguousJSON subclasses ValueError, so
-            # the catch is unchanged; we only read the extra structure when it's
-            # there.
+            # the shared catch is unchanged; we only read the extra structure
+            # when it's there.
             fields = {"reason": "malformed"}
             # Member B: this is the ONE boundary that logs instead of raising,
             # so the evidence must reach the transcript here. Hand the FULL
@@ -2020,12 +2022,32 @@ class Orchestrator:
             # payload_len field, no pre-truncation: a malformed closure reply
             # can be replayed, not just counted, using the convention that's
             # already in place.
-            fields["payload"] = res.output
+            fields["payload"] = output
             if isinstance(e, jsonx.AmbiguousJSON):
                 fields["ambiguous_count"] = e.count
                 fields["ambiguous_offsets"] = e.offsets
             self._log("closure_skipped", **fields)
             return None
+
+        # (c) Parse via _call_and_parse's narrow contract (see _on_malformed).
+        # (d) Cap patterns BEFORE per-pattern validation. _parse_closure caps
+        #     the RAW reply list to _CLOSURE_MAX_PATTERNS before it validates or
+        #     bounds any entry, so a reply with thousands of patterns can't make
+        #     the harness validate thousands of them -- the validation work is
+        #     bounded too, not just the final list. `returned` is the true count
+        #     the model actually sent (measured before the cut), so the
+        #     closure_patterns_capped log stays honest.
+        parsed = await self._call_and_parse(
+            step="closure", role="reviewer",
+            call=lambda: self.reviewer.closure_scan(spec, diff),
+            parse=lambda out: _parse_closure(out, self._CLOSURE_MAX_PATTERNS),
+            timeout=self.cfg.timeouts.model_call_seconds,
+            on_timeout=_on_timeout,
+            on_not_ok=_on_not_ok,
+            on_malformed=_on_malformed)
+        if parsed is None:
+            return None  # skipped -- one of the handlers above already logged.
+        bug_class, patterns, returned = parsed
 
         if returned > self._CLOSURE_MAX_PATTERNS:
             self._log("closure_patterns_capped",
