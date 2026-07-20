@@ -413,3 +413,86 @@ most error-adjacent path. The worst possible place for a gap.
 purpose was measurement shipped the unaccountable path, and it was caught by
 MEASURING THE MEASUREMENT — running the counters against the stream on a
 path the tests did not cover.
+
+## 016 — the sweep reflex applied to a FEATURE (a ruling reversed)
+
+**Occurred:** 2026-07-20. A ruling ordered menu's re-prompt port next. It
+was reversed the same session, on evidence, by the brief owner.
+
+**The distinction that was missed:**
+
+> **Sibling sweeps are for DEFECT CLASSES.** The same architectural decision
+> made in three places means the blind spot exists everywhere *by
+> construction* — so the sweep is justified before any evidence arrives in
+> the sibling. **A FEATURE follows evidence.** Its trigger must fire in the
+> repo that receives it.
+
+potluck's re-prompt earned its place with four banked occurrences across two
+models. menu's boundary **already escalates cleanly** (DRIFT.md #14 records
+malformed-JSON handling closed upstream) and has two log hits against an
+unmet threshold. The port was symmetry-driven.
+
+**The cause is observation 010 operating one level up.** The comparability
+that makes menu and potluck sweepable is the same comparability that makes a
+feature look like a class. Named at the code level two slices earlier, it
+recurred at the PLANNING level, in the ruling seat — which is the evidence
+that 010 is a property of the work, not of any one worker.
+
+**Sequence corrected:** `propose` now; menu's port deferred until its
+trigger fires.
+
+## 017 — "you may be overinvesting in the easiest failure to count"
+
+Codex's standing caution, recorded in its own words because future
+prioritization will trip over exactly this.
+
+Reviewing the four-layer parse hardening, codex's central charge was that it
+**hardens syntax while under-protecting semantics**: no layer catches a
+well-formed reply that is wrong in a way the schema permits — wrong paths,
+stale tree assumptions, inverted conditions, fabricated evidence summaries.
+*"Your bigger risk is valid-looking wrongness."*
+
+**Accepted as description; it redirects nothing.** Valid-looking wrongness
+is not catchable at a parse boundary. It is caught by adversarial structure
+and verification-by-execution — the debate, the fresh-context pass,
+evidence-precedes-rejection, step-0 spec-vs-tree reconciliation, and a human
+reading. That is where every instance has in fact been caught, including
+this week's. The next three rungs (`propose`'s diverse sketches, the
+criteria red-team, the conductor) are semantic hardening by construction.
+
+**Why it is filed anyway:** counted failures are seductive because they
+produce satisfying graphs. A malformed-reply rate is measurable; "the plan
+was plausible and wrong" is not. The pull toward the countable is a
+prioritization hazard, and this file is where it should be tripped over.
+
+## 018 — evidence-precedes-rejection, NARROWED (amends 014)
+
+014's burden is **scoped to falsifiable claims about the current tree or
+runtime behavior**. It does not apply to conceptual disagreement.
+
+**Why narrowing strengthens it:** an unscoped burden teaches the loop to
+relabel empirical objections as conceptual ones to dodge the cost, or to
+flood the thread with low-value command/output spam to satisfy the form.
+Either way: process compliance without epistemic improvement. **A rule that
+incentivizes evasion of itself is worse than a narrower rule that holds.**
+
+This is the representable-window lesson applied to a review contract. The
+narrowing came from codex — the reviewer role whose colleague's wrong
+concessions produced 014 in the first place.
+
+## 019 — the one-retry bound is a WAGER, with its revisit condition attached
+
+Codex: *"`exactly one retry, ever` is not a principle. It is a wager."*
+Accepted, with the wager's terms recorded rather than the claim softened:
+
+  * **Kept structural** — straight-line code, no loop, no counter, no knob.
+    Revisiting is a deliberate rewrite, never a drift or a config change.
+  * **The tribunal is the instrumentation.** cured / recurred / timed_out /
+    not_ok per message type, under the conservation invariant.
+  * **Revisit condition:** if `recurred` is a large share of issued
+    re-prompts, one retry is under-powered and the wager loses. If `cured`
+    is near zero, the retry is buying nothing and 0 is correct.
+
+A wager that is cheap to revisit, expensive to change accidentally, and
+measured continuously is what a principle looks like before its evidence
+arrives.
