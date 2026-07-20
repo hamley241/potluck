@@ -496,3 +496,49 @@ Accepted, with the wager's terms recorded rather than the claim softened:
 A wager that is cheap to revisit, expensive to change accidentally, and
 measured continuously is what a principle looks like before its evidence
 arrives.
+
+## 020 — a ruling can be correct for the tree it was written against, and stale an hour later
+
+**Occurred:** 2026-07-20. A ruling on human-pick recording was refuted by
+codex on four tree-verified claims and AMENDED — the first ruling in this
+campaign to be attacked deliberately and lose.
+
+**What failed was the PREDICATE, not the principle.** The ruling held that
+*the record attributes a human pick's win to its actual cause* and that
+*concurrence is cheap, deviation is articulate*. Both survived; the
+amendment is built on them. What broke was the boundary condition: the
+ruling required a stated reason on a **split**, when the harness's authority
+line had since grown to **three** guards — `split ∨ degraded ∨
+¬provider_independent`. An unsplit-but-same-provider panel would have had
+its human pick auto-labeled as cheap ratification, when that is precisely
+the correlated-evidence case ruled too weak for autonomous authority ONE
+SLICE EARLIER.
+
+**The lesson generalises the spec-vs-tree rule upward:**
+
+> **Rulings go stale exactly like specs do.** A ruling that names a
+> condition (`split`) rather than a concept (*any authority guard fired*)
+> is pinned to the tree at its moment of writing, and the tree moves.
+
+Step-0 reconciliation was adopted for specs after three wording defects. The
+same defect class reached a ruling, from the decider's seat, within a day —
+which says the hazard is structural, not a property of who is writing.
+
+**Where it recurred is the finding inside the finding:** this is the
+independence gap ONE LAYER UP. Slice 2b stopped the selection record from
+collapsing correlated agreement into independent agreement; the ruling would
+have re-collapsed the same distinction at the RATIONALE layer. A class
+closed at one layer reappears at the next unless the closure is stated as a
+concept.
+
+**And the fatal counterargument was flagged in advance.** The decider named
+the independence-gap parallel as joint (1)'s strongest objection when
+commissioning the refutation — then it proved fatal. Arming a refuter with
+the best weapon against your own position is how a ruling gets tested rather
+than confirmed.
+
+**Provenance of the amendment (recorded because rulings are artifacts too):**
+refuted by codex on four tree-verified claims; predicate corrected from
+split-only to the three-guard disjunction; "corroboration, never cause"
+promoted from labeling convention to schema with typed fields, after codex
+showed no typed home for it existed.
