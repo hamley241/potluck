@@ -46,12 +46,17 @@ EVIDENCED by which files were loaded, not assumed.
 
 import asyncio
 import json
+import subprocess
+import sys
+import textwrap
 
 import harness.orchestrator as orchestrator
 from harness.config import HarnessConfig, Backend
 from harness.orchestrator import (
     Orchestrator,
     ReviewerClient,
+    RealDoerClient,
+    RepromptConservationError,
     _assemble_prompt,
     _bounded_payload,
     _defect_kind,
@@ -59,9 +64,11 @@ from harness.orchestrator import (
     _parse_verdict,
     _parse_tiebreak,
     _retry_note,
+    _review_followup_framing,
     _schema_tail,
     _with_retry_note,
     _MSG_TYPES,
+    _REPROMPT_OUTCOMES,
     _REVIEW_VERDICT_SCHEMA,
     _DOER_RESPONSE_SCHEMA,
     _CLOSURE_SCHEMA,
@@ -77,7 +84,7 @@ from harness.reprompt_fixtures import (
     SHAPE_2_REPRODUCES_TODAY,
 )
 import harness_core.runner as core_runner
-from harness_core.runner import StepResult, ModelUnavailable
+from harness_core.runner import StepResult, ModelUnavailable, TimeoutEscalation
 from harness_core import jsonx
 from harness.schemas import (
     ReviewVerdict, ReviewIssue, DoerResponse, IssueResponse, ClosureReport,
@@ -100,6 +107,25 @@ class PassRunner:
         self.calls.append(step_name)
         if step_name in self.injected:
             return self.injected[step_name]
+        return StepResult(ok=True, output=await coro_factory())
+
+
+class RetryInjectRunner:
+    """Runs the client on the FIRST call to `step` (so the scripted first reply
+    drives the parse failure that spends the single re-prompt), then returns a
+    preset StepResult on the SECOND call to that step -- forcing the RETRY
+    ITSELF to time out / come back not-ok, the exact B3b gap path. Any other
+    step runs the client normally. `injected` keyed on the step name can't do
+    this: it would force the FIRST call too and no retry would ever issue."""
+    def __init__(self, step, retry_result):
+        self.step = step
+        self.retry_result = retry_result
+        self.calls: list[str] = []
+
+    async def run(self, step_name, coro_factory, timeout_seconds):
+        self.calls.append(step_name)
+        if step_name == self.step and self.calls.count(step_name) == 2:
+            return self.retry_result
         return StepResult(ok=True, output=await coro_factory())
 
 
@@ -620,6 +646,176 @@ async def main():
     check("t10 shape1: fixture self-labels reconstructed=validation, not reproducing",
           SHAPE_1_REPRODUCES_TODAY is False
           and SHAPE_1_RECONSTRUCTED_DEFECT == "validation")
+
+    # --- Test 11 (B3b Item 1 + Items 5/6): every issued re-prompt terminates in
+    # a COUNTED outcome. First reply malformed -> retry issued -> the retry
+    # itself times out / comes back not-ok. Before B3b this route left through
+    # on_timeout()/on_not_ok() with NO event and NO terminal counter, so
+    # reprompts_issued could exceed cured+recurred. Now the outcome is recorded
+    # and the reprompt event fires -- for ALL five message types, both new
+    # outcomes -- while control flow is untouched: the exact same
+    # raise/sentinel/None the caller saw before still happens.
+    #   mode ('raise', ExcType) | ('return', value): the caller-visible
+    #   behaviour that must be BYTE-IDENTICAL to today for this outcome.
+    _TIMEOUT_RES = StepResult(ok=False, timed_out=True, error="hung")
+    _NOTOK_RES = StepResult(ok=False, error="backend down")
+    boundaries = [
+        ("review", "reviewer:review", _run_review,
+         lambda: _make(reviewer=ScriptedReviewer(review=[_BAD])), "review",
+         ("raise", TimeoutEscalation), ("raise", ModelUnavailable)),
+        ("followup", "reviewer:followup", _run_followup,
+         lambda: _make(reviewer=ScriptedReviewer(respond=[_BAD])), "followup",
+         ("raise", TimeoutEscalation), ("raise", ModelUnavailable)),
+        ("doer", "doer:respond", _run_doer,
+         lambda: _make(doer=ScriptedDoer([_BAD])), "doer_response",
+         ("raise", TimeoutEscalation), ("raise", ModelUnavailable)),
+        # tiebreak: timeout leaves the issue CONTESTED (sentinel -> {"I1"});
+        # not-ok has no override, so it escalates via the shared raise.
+        ("tiebreak", "tiebreaker:adjudicate", _run_tiebreak,
+         lambda: _make(tiebreaker=ScriptedTiebreaker([_BAD])), "tiebreak",
+         ("return", {"I1"}), ("raise", ModelUnavailable)),
+        # closure: BOTH timeout and not-ok log-and-skip, returning None.
+        ("closure", "closure", _run_closure,
+         lambda: _make(reviewer=ScriptedReviewer(closure=[_BAD])), "closure",
+         ("return", None), ("return", None)),
+    ]
+    for name, step, invoke, mk, mt, tmode, nmode in boundaries:
+        for outcome, res, mode in (
+            ("timed_out", _TIMEOUT_RES, tmode),
+            ("not_ok", _NOTOK_RES, nmode),
+        ):
+            orch = mk()
+            orch.runner = RetryInjectRunner(step, res)
+            raised = None
+            result = None
+            try:
+                result = await invoke(orch)
+            except BaseException as e:  # noqa: BLE001 -- some boundaries raise
+                raised = e
+            m = orch._reprompt_metrics[mt]
+            check(f"t11 {name}/{outcome}: outcome counted once, issued==1",
+                  m[outcome] == 1 and m["reprompts_issued"] == 1)
+            # The conservation invariant HOLDS on the honest path.
+            check(f"t11 {name}/{outcome}: conservation invariant holds",
+                  m["reprompts_issued"] ==
+                  sum(m[o] for o in _REPROMPT_OUTCOMES))
+            ev = [e for e in orch.log if e["event"] == "reprompt"]
+            check(f"t11 {name}/{outcome}: one reprompt event via _log, envelope intact",
+                  len(ev) == 1 and ev[0].get("outcome") == outcome
+                  and ev[0].get("msg_type") == mt
+                  and ev[0].get("defect") == "validation"
+                  and all(k in ev[0] for k in ("event", "event_version", "ts")))
+            if mode[0] == "raise":
+                check(f"t11 {name}/{outcome}: control flow unchanged -- "
+                      f"raises {mode[1].__name__}",
+                      isinstance(raised, mode[1]))
+            else:
+                check(f"t11 {name}/{outcome}: control flow unchanged -- "
+                      f"returns {mode[1]!r}",
+                      raised is None and result == mode[1])
+            check(f"t11 {name}/{outcome}: exactly one retry (2 calls to {step})",
+                  orch.runner.calls.count(step) == 2)
+
+    # --- Test 12 (B3b Item 6): a DESYNCHRONISED counter RAISES -- the guard is
+    # observed FAILING for every message type, not merely present. Bump
+    # reprompts_issued out of band (an issued retry with no matching outcome),
+    # then drive one outcome: accounted lags issued, so the invariant fires.
+    for mt in _MSG_TYPES:
+        o = _make()
+        o._reprompt_metrics[mt]["reprompts_issued"] = 2  # one issued unaccounted
+        raised = None
+        try:
+            o._reprompt_outcome(mt, "validation", "cured")  # accounts for 1 of 2
+        except RepromptConservationError as e:
+            raised = e
+        check(f"t12 {mt}: desynchronised counter RAISES RepromptConservationError",
+              isinstance(raised, RepromptConservationError))
+        check(f"t12 {mt}: error names the message type",
+              raised is not None and mt in str(raised))
+        check(f"t12 {mt}: error names BOTH sides of the imbalance (2 != 1)",
+              raised is not None
+              and "reprompts_issued=2" in str(raised)
+              and str(raised).endswith("=1"))
+
+    # --- Test 13 (B3b Item 4): the invariant uses `raise`, not `assert`, so it
+    # STILL fires under `python -O` (which strips asserts). Run the guard in a
+    # fresh -O interpreter and confirm it raises; the subprocess also prints the
+    # orchestrator it loaded (SA-7 evidence: the guard under test is THIS file).
+    prog = textwrap.dedent(
+        """
+        import sys
+        import harness.orchestrator as o
+        from harness.orchestrator import RepromptConservationError
+        from harness.test_reprompt import _make
+        print("probe:" + o.__file__)
+        orch = _make()
+        orch._reprompt_metrics["review"]["reprompts_issued"] = 2
+        try:
+            orch._reprompt_outcome("review", "validation", "cured")
+        except RepromptConservationError as e:
+            print("RAISED:" + str(e))
+            sys.exit(0)
+        print("NO-RAISE")
+        sys.exit(3)
+        """
+    )
+    proc = subprocess.run([sys.executable, "-O", "-c", prog],
+                          capture_output=True, text=True)
+    probe = [ln for ln in proc.stdout.splitlines() if ln.startswith("probe:")]
+    print(f"[probe] python -O subprocess loaded: "
+          f"{probe[0][len('probe:'):] if probe else '<none>'}")
+    check("t13 python -O: invariant STILL raises (raise, not stripped assert)",
+          proc.returncode == 0 and "RAISED:" in proc.stdout)
+    check("t13 python -O: the -O run names the message type and both sides",
+          "'review'" in proc.stdout and "reprompts_issued=2" in proc.stdout
+          and "=1" in proc.stdout)
+    check("t13 python -O: subprocess loaded the SAME orchestrator under test",
+          bool(probe) and probe[0] == "probe:" + orchestrator.__file__)
+
+    # --- Test 14 (B3b Item 2): both prompt surfaces carry their new evidence
+    # rule, and slice A's schema tail is STILL the last thing each prompt reads.
+    # (a) doer surface: a testable rejection must attach its test.
+    cap = {}
+
+    async def _fake_run(cmd, stdin_text=None):
+        cap["prompt"] = stdin_text
+        return _GOOD_DOER
+
+    real_run = orchestrator.run_subprocess
+    orchestrator.run_subprocess = _fake_run
+    try:
+        await RealDoerClient(claude_cmd="unused").respond_to_review(
+            "spec", "acc", "diff", _VERDICT)
+    finally:
+        orchestrator.run_subprocess = real_run
+    doer_prompt = cap["prompt"]
+    doer_tail = _schema_tail(_DOER_RESPONSE_SCHEMA)
+    check("t14 doer: rule present -- testable rejection must attach its test",
+          "attach the test" in doer_prompt
+          and "does not qualify as a reasoning" in doer_prompt)
+    check("t14 doer: schema tail is STILL the last line (undisturbed)",
+          doer_prompt.rstrip("\n").splitlines()[-1] == doer_tail)
+    check("t14 doer: the new rule precedes the schema tail",
+          doer_prompt.index("attach the test") < doer_prompt.rindex(doer_tail))
+
+    # (b) reviewer surface: no conceding to an unevidenced empirical claim;
+    # legal moves are request-evidence or hold. The REVIEW_VERDICT tail is
+    # appended after the diff, so assemble the real stdin prompt and confirm the
+    # tail still terminates it -- after the framing that now carries the rule.
+    framing = _review_followup_framing("spec", "acc", _REJECTED)
+    check("t14 reviewer: forbids conceding to an unevidenced empirical claim",
+          "may NOT" in framing and "unevidenced empirical claim" in framing)
+    check("t14 reviewer: legal moves are request-evidence or HOLD",
+          "REQUEST THE EVIDENCE" in framing and "HOLD" in framing)
+    r_tail = _with_retry_note(_schema_tail(_REVIEW_VERDICT_SCHEMA), None)
+    r_prompt = _assemble_prompt(
+        _STDIN_BACKEND, framing, "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n-a\n+b\n",
+        step="probe", prompt_cfg=HarnessConfig().prompt,
+        log=_noop_prompt_log, tail=r_tail)
+    check("t14 reviewer: schema tail is STILL the last line (undisturbed)",
+          r_prompt.rstrip("\n").splitlines()[-1] == r_tail)
+    check("t14 reviewer: the new rule precedes the schema tail",
+          r_prompt.index("REQUEST THE EVIDENCE") < r_prompt.rindex(r_tail))
 
     print("\nALL PASS" if ok else "\nSOME FAILED")
     return ok

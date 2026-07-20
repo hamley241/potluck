@@ -268,20 +268,53 @@ _MSG_TYPES = ("review", "followup", "doer_response", "tiebreak", "closure")
 def _new_reprompt_metrics() -> dict:
     """The per-message-type re-prompt counters (slice B3's measuring device).
     For every message type: `malformed_seen` split by defect kind, the number
-    of `reprompts_issued`, and the retry `cured`/`recurred` tally. Fully
-    pre-seeded (every type, every defect kind at 0) so a before/after read never
-    has to distinguish "key absent" from "count zero" -- a zero that was
-    measured and a zero that was never looked at are different claims, and the
-    dense shape keeps them from being confused (scope-of-claim)."""
+    of `reprompts_issued`, and the retry outcome tally -- the four terminal
+    outcomes the re-prompt can reach: `cured`/`recurred` (the parse-terminal
+    ones) and `timed_out`/`not_ok` (the retry itself timed out or came back
+    not-ok; slice B3b). Fully pre-seeded (every type, every defect kind, every
+    outcome at 0) so a before/after read never has to distinguish "key absent"
+    from "count zero" -- a zero that was measured and a zero that was never
+    looked at are different claims, and the dense shape keeps them from being
+    confused (scope-of-claim). The four outcomes are pre-seeded together
+    because the conservation invariant (`_reprompt_outcome`) sums ALL of them:
+    a missing key would read as an unaccounted retry, the very gap B3b closes."""
     return {
         mt: {
             "malformed_seen": {k: 0 for k in _DEFECT_KINDS},
             "reprompts_issued": 0,
             "cured": 0,
             "recurred": 0,
+            "timed_out": 0,
+            "not_ok": 0,
         }
         for mt in _MSG_TYPES
     }
+
+
+# The four terminal outcomes a single issued re-prompt can reach. Every issued
+# re-prompt terminates in EXACTLY one of these -- that is the conservation
+# invariant `_reprompt_outcome` enforces (slice B3b): an issued retry is an
+# obligation that must land in a counted outcome, never vanish.
+_REPROMPT_OUTCOMES = ("cured", "recurred", "timed_out", "not_ok")
+
+
+class RepromptConservationError(Exception):
+    """The re-prompt conservation invariant was violated for one message type:
+    `reprompts_issued` did not equal `cured + recurred + timed_out + not_ok`
+    (slice B3b). Raised -- NOT asserted -- so it survives `python -O`: a
+    production invariant that vanishes under optimization is not an invariant.
+    Names the message type and BOTH sides of the imbalance so the gap is
+    diagnosable, not merely flagged."""
+
+    def __init__(self, msg_type: str, issued: int, accounted: int):
+        self.msg_type = msg_type
+        self.issued = issued
+        self.accounted = accounted
+        super().__init__(
+            f"reprompt conservation violated for {msg_type!r}: "
+            f"reprompts_issued={issued} != "
+            f"cured+recurred+timed_out+not_ok={accounted}"
+        )
 
 
 def _defect_kind(e: Exception) -> str:
@@ -1073,7 +1106,9 @@ class RealDoerClient(DoerClient):
             f"A reviewer found issues with your implementation. For each issue, decide "
             f"whether to accept (with a fix plan) or reject (with reasoning). You are "
             f"EXPECTED to reject issues the reviewer got wrong. Verify each issue "
-            f"against the DIFF -- do not accept or reject blind.\n\n"
+            f"against the DIFF -- do not accept or reject blind. A rejection whose "
+            f"reasoning makes a TESTABLE claim must attach the test -- the command and "
+            f"its output -- or the claim does not qualify as a reasoning.\n\n"
             f"SPEC:\n{spec}\n\n"
             f"ACCEPTANCE CRITERIA:\n{acceptance}\n\n"
             f"DIFF:\n{diff}\n\n"
@@ -1894,10 +1929,18 @@ class Orchestrator:
             # The retry is a fresh model call: its own timeout / not-ok are
             # handled like the first attempt's and are NOT themselves retried
             # (only a PARSE failure triggers the single retry, and it has now
-            # been spent).
+            # been spent). These two exits were the B3 gap (slice B3b): the
+            # retry left through on_timeout()/on_not_ok() with no event and no
+            # terminal counter, so `reprompts_issued` could exceed
+            # cured+recurred with nothing in the stream explaining the gap.
+            # Record the outcome FIRST, then take the SAME exit as before --
+            # instrumentation observes, it never decides: on_timeout()/
+            # on_not_ok() still run and still return what they return.
             if retry.timed_out:
+                self._reprompt_outcome(msg_type, defect, "timed_out")
                 return on_timeout()
             if not retry.ok:
+                self._reprompt_outcome(msg_type, defect, "not_ok")
                 if on_not_ok is not None:
                     return on_not_ok(retry)
                 raise ModelUnavailable(role, retry.error or not_ok_detail)
@@ -2398,22 +2441,39 @@ class Orchestrator:
 
     def _reprompt_outcome(self, msg_type: str, defect: str, outcome: str,
                           second_defect: str | None = None) -> None:
-        """Record the re-prompt's terminal PARSE outcome and emit the one
-        per-retry log event. `outcome` is 'cured' (the retry parsed) or
-        'recurred' (it produced a second malformed reply); `second_defect`, set
-        only on a recurrence, is that second reply's kind -- another malformed
-        reply seen. `defect` on the event is the FIRST reply's kind, the one the
-        re-prompt was written to fix. Emitting through `_log` gives this event
-        the SAME `_pack_event`/`_truncate_walk` treatment every other event
-        gets -- no second-shaped truncation at this boundary (a real slice-A
-        blocking finding). Counter bump + event share this one call site so the
-        aggregate and the stream cannot drift apart."""
+        """Record the re-prompt's terminal outcome and emit the one per-retry
+        log event. `outcome` is one of the four terminal outcomes an issued
+        re-prompt can reach: 'cured' (the retry parsed), 'recurred' (a second
+        malformed reply), 'timed_out' (the retry hung), or 'not_ok' (the retry
+        call came back not-ok) -- slice B3b added the last two so EVERY issued
+        re-prompt terminates in a counted outcome, never through an
+        unaccounted exit. `second_defect`, set only on a recurrence, is that
+        second reply's kind -- another malformed reply seen. `defect` on the
+        event is the FIRST reply's kind, the one the re-prompt was written to
+        fix. Emitting through `_log` gives this event the SAME
+        `_pack_event`/`_truncate_walk` treatment every other event gets -- no
+        second-shaped truncation at this boundary (a real slice-A blocking
+        finding). Counter bump + event share this one call site so the
+        aggregate and the stream cannot drift apart.
+
+        The conservation invariant (slice B3b), enforced HERE because this is
+        the one site every issued re-prompt passes through exactly once: for
+        this message type, `reprompts_issued` MUST equal the sum of the four
+        terminal outcomes. Every issued retry is an OBLIGATION that terminates
+        in a counted outcome; an unaccounted retry is a lost concern in a
+        different costume. `raise`, not `assert`, so it survives `python -O` --
+        a production invariant that vanishes under optimization is not an
+        invariant."""
         m = self._reprompt_metrics[msg_type]
         m[outcome] += 1
         if second_defect is not None:
             m["malformed_seen"][second_defect] += 1
         self._log("reprompt", msg_type=msg_type, defect=defect,
                   outcome=outcome)
+        issued = m["reprompts_issued"]
+        accounted = sum(m[o] for o in _REPROMPT_OUTCOMES)
+        if issued != accounted:
+            raise RepromptConservationError(msg_type, issued, accounted)
 
     def _log(self, event: str, event_version: int = 1, **kw) -> None:
         self.log.append(_pack_event(event, event_version, **kw))
@@ -2607,9 +2667,11 @@ DIFF:
 def _review_followup_framing(spec: str, acceptance: str, rejections) -> str:
     rej = json.dumps([r.model_dump() for r in rejections.responses], indent=2)
     return f"""The author responded to your review. For each issue they REJECTED,
-either concede (drop it) or hold (keep it, with a sharper reason). Do not raise
-new issues. Return ONLY the same JSON verdict schema, containing only the issues
-you still hold:
+either concede (drop it) or hold (keep it, with a sharper reason). You may NOT
+concede to an unevidenced empirical claim: if the rejection asserts something
+empirical that nobody ran, the legal moves are REQUEST THE EVIDENCE or HOLD. Do
+not raise new issues. Return ONLY the same JSON verdict schema, containing only
+the issues you still hold:
 {_REVIEW_VERDICT_SCHEMA}
 
 SPEC:
