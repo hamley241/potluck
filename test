@@ -9,6 +9,16 @@ set -uo pipefail
 REPO="$(cd "$(dirname "$0")" && pwd)"
 CORE="${CORE_REPO:-$REPO/../harness_core}"
 [ -d "$CORE/harness_core" ] || { echo "./test: harness_core not found at $CORE" >&2; exit 2; }
+# Fail closed on a missing toolchain, and never fall back to a bare `python3`
+# (macOS ships 3.9, which lacks tomllib; this gate needs >=3.11). uv is the only
+# toolchain dependency — it fetches Python 3.11 and pydantic — so its absence is
+# a no-signal environment failure (exit 2), not a red gate. Name the fix.
+command -v uv >/dev/null 2>&1 || {
+  echo "./test: uv not found — it is the only toolchain dependency (it fetches" \
+       "Python 3.11 and pydantic). Install https://docs.astral.sh/uv/ then re-run." \
+       "Exiting 2 (no signal): a missing toolchain is not a test failure." >&2
+  exit 2
+}
 cd "$REPO"
 
 run() {
@@ -36,7 +46,8 @@ fail=0
 #   (2) IMPORTABILITY — dynamic; runs in a stateful uv environment, so it
 #       does NOT independently prove the declaration exists.
 echo "=== packaging (1/2): harness-core declared in pyproject ==="
-python3 - "$REPO/pyproject.toml" <<'PY' || fail=1
+# uv provides the 3.11 interpreter (tomllib); never a bare, possibly-3.9 python3.
+uv run --no-project --python 3.11 python3.11 - "$REPO/pyproject.toml" <<'PY' || fail=1
 import re, sys, tomllib, pathlib
 data = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
 names = set()
