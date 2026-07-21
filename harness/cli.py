@@ -270,19 +270,37 @@ def add_resolve_parser(subparsers):
         resolve_mod.cmd_resolve(auto=a.auto, claude_only=a.claude_only)))
 
 
+def _reviewgate_doctor() -> int:
+    import subprocess
+    vendored = Path(__file__).parent / "_vendor" / "reviewgate.py"
+    return subprocess.run(["python3", str(vendored), "--doctor"]).returncode
+
+
+def _doctor_and_gate() -> int:
+    # Run BOTH and fail if EITHER fails — never let a gate-doctor failure be
+    # swallowed into an overall success (fail-closed reporting; finding 5).
+    rc1 = resolve_mod.cmd_doctor() or 0
+    rc2 = _reviewgate_doctor()
+    return rc1 or rc2
+
+
 def add_doctor_parser(subparsers):
-    p = subparsers.add_parser("doctor", help="Show detected backends; write nothing")
-    p.set_defaults(func=lambda a: sys.exit(resolve_mod.cmd_doctor()))
+    p = subparsers.add_parser("doctor",
+                              help="Show detected backends + gate status; write nothing")
+    p.set_defaults(func=lambda a: sys.exit(_doctor_and_gate()))
 
 
 def add_setup_parser(subparsers):
     p = subparsers.add_parser(
         "setup",
-        help="Install slash commands/hooks/rules into ~/.claude, then resolve models")
+        help="Install slash commands/hooks/rules into ~/.claude + the reviewgate "
+             "pre-push hook, then resolve models")
     p.add_argument("--claude-home", type=str, default=None,
                    help="Target config dir (default: $CLAUDE_HOME or ~/.claude)")
     p.add_argument("--auto", action="store_true", help="Resolve with everything detected")
     p.add_argument("--claude-only", action="store_true", help="Resolve to the Claude-only floor")
+    p.add_argument("--hooks", choices=["compose", "repo-local"], default=None,
+                   help="reviewgate hooksPath regime when core.hooksPath is non-default")
     p.set_defaults(func=cmd_setup)
 
 
@@ -325,6 +343,29 @@ def cmd_setup(args):
         print(f"  hook {result['status']}: {result['settings_path']}")
     except RuntimeError as e:
         print(f"  hook registration skipped: {e}", file=sys.stderr)
+
+    # Install the reviewgate pre-push hook from potluck's own vendored copy, if
+    # run inside a git repo (the hook is repo-local, and self-contained on a
+    # stock clone). Skipped with a note outside a work tree.
+    import subprocess as _sp
+    inside = _sp.run(["git", "rev-parse", "--is-inside-work-tree"],
+                     stdout=_sp.DEVNULL, stderr=_sp.DEVNULL).returncode == 0
+    if inside:
+        vendored = Path(__file__).parent / "_vendor" / "reviewgate.py"
+        rg = ["python3", str(vendored), "--install"]
+        if getattr(args, "hooks", None):
+            rg.append("--hooks=" + args.hooks)
+        rg_rc = _sp.run(rg).returncode
+        if rg_rc != 0:
+            # A refusal (e.g. non-default hooksPath) or any install failure must
+            # STOP setup — never fall through to a successful resolve and leave
+            # the repo ungated (finding 4).
+            print("  reviewgate hook install FAILED (exit %d) — stopping; the gate "
+                  "is NOT in place. Re-run per the message above." % rg_rc,
+                  file=sys.stderr)
+            sys.exit(rg_rc)
+    else:
+        print("  reviewgate hook: skipped (not inside a git work tree)")
 
     print(f"\nAssets installed into {dest}. Restart Claude Code to pick up new commands.\n")
     rc = resolve_mod.cmd_resolve(auto=args.auto, claude_only=args.claude_only)
