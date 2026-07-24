@@ -33,29 +33,36 @@ def main() -> bool:
     results["override_wins_default"] = (t_ov.resolve_doer_timeout("doer:unknown") == 450)
     results["override_wins_respond"] = (t_ov.resolve_doer_timeout("doer:respond") == 450)
 
-    # --- T4: validate refuses an override above the outer bound ----------
+    # --- T4: validate refuses when feature_seconds < outer_min (§1.3) ----
+    # The §1<->§2 coupling: the outer bound is now outer_min = C_max x N_max
+    # (backoff-inclusive per-call ceiling x the pinned call budget), NOT merely
+    # the single heaviest step. An override raises C_max, so it participates.
     cfg = HarnessConfig()
-    cfg.timeouts.feature_seconds = 1200
     cfg.timeouts.doer_step_seconds = {"doer:implement": 600}
-    cfg.timeouts.doer_timeout_override = 5000  # > feature_seconds
+    cfg.timeouts.doer_timeout_override = 5000  # lifts C_max well above the bound
+    cfg.timeouts.feature_seconds = 1200        # far below outer_min -> refuse
     raised = False
     try:
         cfg.validate()
     except ValueError:
         raised = True
-    results["override_above_feature_refuses"] = raised
+    results["override_above_outer_min_refuses"] = raised
 
-    # A within-bound override validates.
+    # A feature_seconds AT outer_min validates (the boundary is inclusive).
     cfg2 = HarnessConfig()
-    cfg2.timeouts.feature_seconds = 1200
     cfg2.timeouts.doer_step_seconds = {"doer:implement": 600}
-    cfg2.timeouts.doer_timeout_override = 900  # <= feature_seconds
+    cfg2.timeouts.doer_timeout_override = 900   # C_max = 900*2+5 = 1805
+    cfg2.timeouts.feature_seconds = cfg2.outer_min()  # exactly the computed bound
     ok = True
     try:
         cfg2.validate()
     except ValueError:
         ok = False
-    results["override_within_bound_ok"] = ok
+    results["feature_at_outer_min_ok"] = ok
+    # And the override genuinely moved the bound: outer_min reflects C_max(1805).
+    results["override_lifts_outer_min"] = (
+        cfg2.timeouts.c_max() == 900 * 2 + 5
+        and cfg2.outer_min() == cfg2.timeouts.c_max() * cfg2.n_max())
 
     # Negative map value and negative override both refuse (fail closed).
     cfg3 = HarnessConfig()
@@ -76,11 +83,11 @@ def main() -> bool:
         neg_ov = True
     results["negative_override_refuses"] = neg_ov
 
-    # The built-in step ceiling participates in the outer-bound check: a
-    # feature_seconds below the 600s map ceiling refuses (the finer signal
-    # could otherwise never fire).
+    # The built-in step ceiling participates in the outer bound (C_max includes
+    # the 600s map ceiling), so a feature_seconds below outer_min refuses -- the
+    # finer step/call signal could otherwise never fire before the outer cancel.
     cfg5 = HarnessConfig()
-    cfg5.timeouts.feature_seconds = 500  # < the 600 built-in implement ceiling
+    cfg5.timeouts.feature_seconds = 500  # far below outer_min (>= C_max >= 600)
     step_floor = False
     try:
         cfg5.validate()

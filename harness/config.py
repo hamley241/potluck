@@ -62,15 +62,50 @@ class Timeouts:
     # Per verification-gate run. Build/test can legitimately take a while;
     # tune per project -- this default is deliberately generous.
     gate_seconds: int = 300
-    # Outer bound on a single feature across all rounds/retries. Raised for the
-    # 600s step ceilings (hardening Step-0 §1.3): must dominate C_max * N_max.
-    feature_seconds: int = 10800  # 3 h
+    # Outer bound on a single feature across all rounds/retries. Set to the
+    # computed outer_min = C_max x N_max (hardening Step-0 §1.3): with the default
+    # 600s heaviest step, R=1, delay=5 -> C_max=1205, and N_max=30 -> 36150s
+    # (~10 h). This is a CONSERVATIVE DOMINATING backstop, not an expected
+    # runtime (a heavy real 2-round run dispatches ~11 bounded calls); the real
+    # protection is the per-step timeout + the pre-dispatch call-budget admission.
+    # Delegated default, disclosed in the first run's report, Goutham-overridable
+    # (raise/lower alongside the call budget). validate() enforces >= outer_min.
+    feature_seconds: int = 36150
     # The `--doer-timeout` UNIFORM override (potluck fix only). None = unset.
     # When set, it wins over the built-in map for EVERY doer step (§1.1). Set by
     # the CLI edge post-load; validate() is re-run afterward (§1.2) so a value
     # above feature_seconds REFUSES rather than silently breaking the finer-signal
     # guarantee (closing the pre-existing --gate-timeout bypass in the same spot).
     doer_timeout_override: int | None = None
+    # Resume backoff (hardening Step-0 §2.4). A resumed step re-runs at the SAME
+    # resolved adaptive timeout (NOT a doubling one), separated by a fixed
+    # BACKOFF_DELAY, bounded by MAX_RESUME_RETRIES. Both the retry timeouts and
+    # the delays live INSIDE the §1.1 effective-step-max closed form, so they are
+    # covered by the outer-bound validation below -- retries can never silently
+    # exceed the wall-clock guarantee.
+    max_resume_retries: int = 1        # MAX_RESUME_RETRIES (R)
+    backoff_delay_seconds: int = 5     # BACKOFF_DELAY
+
+    def max_call_base(self) -> int:
+        """The heaviest single-call timeout across ALL bounded call classes
+        (doer steps incl. any override, the gate, and the model_call default that
+        the reviewer/tiebreak/diff/closure calls inherit). This is C_max's base
+        BEFORE the backoff multiplier (§1.3)."""
+        bases = (self.model_call_seconds, self.gate_seconds,
+                 *self.doer_step_seconds.values())
+        if self.doer_timeout_override is not None:
+            bases = bases + (self.doer_timeout_override,)
+        return max(bases)
+
+    def c_max(self) -> int:
+        """The per-call ceiling that PROVABLY DOMINATES every bounded call class
+        (§1.3): the heaviest base timeout, taken across `1 + MAX_RESUME_RETRIES`
+        attempts separated by `MAX_RESUME_RETRIES` backoff delays. Because every
+        bounded call (of any class) takes <= this, `c_max x N_max` dominates the
+        true elapsed sum regardless of the exact per-class mix -- a miscounted
+        class cannot break the bound (round-3/4 MAJOR)."""
+        r = self.max_resume_retries
+        return self.max_call_base() * (1 + r) + self.backoff_delay_seconds * r
 
     def resolve_doer_timeout(self, step: str) -> int:
         """The single doer-timeout resolution function (hardening Step-0 §1.1),
@@ -83,6 +118,28 @@ class Timeouts:
         if self.doer_timeout_override is not None:
             return self.doer_timeout_override
         return self.doer_step_seconds.get(step, self.model_call_seconds)
+
+
+@dataclass
+class CallBudget:
+    """The declared UPPER BOUND on the number of bounded calls a single run makes
+    (hardening Step-0 §1.3): `N_max = fixed_call_budget + max_rounds x
+    per_round_call_budget`. Generous integer caps, PINNED here and ENFORCED
+    pre-dispatch (the orchestrator's BudgetedStepRunner refuses call N_max+1
+    BEFORE it runs, as ESCALATED_CALL_BUDGET), so the `<= N_max` premise the outer
+    bound rests on is enforced, not assumed (round-4 contract). Pinned above a
+    real 2-round run's measured bounded-call count (T4b asserts a live run stays
+    `<= N_max`, so the pin is not a fiction)."""
+    # fixed (non-round) bounded calls: implement, the two gates, the initial
+    # get_diff + review, apply_fixes, the closure sweep + its grep, and headroom.
+    # A heavy real 2-round run was MEASURED at 11 total bounded calls, so these
+    # pins (N_max = 14 + max_rounds*8 = 30 at defaults) dominate it with ~2.7x
+    # margin while still capping a runaway (a reviewer raising many deadlocked
+    # issues, or a resume-retry storm). T4b re-measures and asserts <= N_max.
+    fixed_call_budget: int = 14
+    # per debate round: doer respond (1), reviewer follow-up (1), and per-issue
+    # tiebreaks -- covers a worst realistic round of ~5-6 deadlocked issues.
+    per_round_call_budget: int = 8
 
 
 @dataclass
@@ -188,10 +245,25 @@ class HarnessConfig:
 
     timeouts: Timeouts = field(default_factory=Timeouts)
     debate: DebateConfig = field(default_factory=DebateConfig)
+    call_budget: CallBudget = field(default_factory=CallBudget)
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
     models: Models = field(default_factory=Models)
     diff: DiffConfig = field(default_factory=DiffConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
+
+    def n_max(self) -> int:
+        """The declared upper bound on bounded calls per run (§1.3):
+        `fixed_call_budget + max_rounds x per_round_call_budget`."""
+        return (self.call_budget.fixed_call_budget
+                + self.debate.max_rounds * self.call_budget.per_round_call_budget)
+
+    def outer_min(self) -> int:
+        """The conservative dominating outer wall-clock (§1.3): `C_max x N_max`.
+        Because every bounded call takes <= C_max and a run makes <= N_max of
+        them (enforced pre-dispatch), this dominates the true elapsed sum, so
+        feature_seconds >= outer_min makes the finer step/call signals always
+        able to fire before the outer budget cancels the run."""
+        return self.timeouts.c_max() * self.n_max()
 
     @classmethod
     def load(cls, profile_path: Path | None = None,
@@ -251,27 +323,50 @@ class HarnessConfig:
                 f"timeouts.doer_timeout_override must be a non-negative int or "
                 f"None, got {t.doer_timeout_override!r}"
             )
+        # Backoff knobs (§2.4) and call budgets (§1.3) participate in the outer
+        # bound, so they must be sane non-negative ints too (fail closed).
+        for name in ("max_resume_retries", "backoff_delay_seconds"):
+            v = getattr(t, name)
+            if not isinstance(v, int) or v < 0:
+                raise ValueError(
+                    f"timeouts.{name} must be a non-negative int, got {v!r}")
+        cb = self.call_budget
+        if not isinstance(cb.fixed_call_budget, int) or cb.fixed_call_budget < 1:
+            raise ValueError(
+                f"call_budget.fixed_call_budget must be a positive int, got "
+                f"{cb.fixed_call_budget!r}")
+        if not isinstance(cb.per_round_call_budget, int) or cb.per_round_call_budget < 0:
+            raise ValueError(
+                f"call_budget.per_round_call_budget must be a non-negative int, "
+                f"got {cb.per_round_call_budget!r}")
         # The --doer-timeout override, when set, is the effective bound for EVERY
         # doer step (§1.1), so it MUST participate in the outer-bound check --
         # this is what makes re-validation after the CLI override meaningful
         # (§1.2): a `--doer-timeout` above feature_seconds refuses here.
-        step_bounds = (t.model_call_seconds, t.gate_seconds,
-                       *t.doer_step_seconds.values())
-        if t.doer_timeout_override is not None:
-            step_bounds = step_bounds + (t.doer_timeout_override,)
-        max_step = max(step_bounds)
-        # feature_seconds == 0 is a special case: it fires immediately, but
-        # so does the step timeout, so the invariant is vacuously satisfied
-        # (used in tests to exercise the ABORTED_BUDGET path). For any
-        # positive value, the strict inequality is required.
-        if t.feature_seconds > 0 and t.feature_seconds < max_step:
+        # Outer-bound (hardening Step-0 §1.3, the §1<->§2 coupling): feature_seconds
+        # must dominate `C_max x N_max`, not merely the single heaviest step. C_max
+        # folds in the backoff-inclusive per-call ceiling (§1.1/§2.4) and N_max the
+        # pre-dispatch call budget (§1.3), so this ONE inequality subsumes the old
+        # `feature_seconds >= max_step` guarantee (C_max >= max_step, N_max >= 1)
+        # AND makes the call-budget premise sound: because every bounded call is
+        # <= C_max and a run makes <= N_max of them (enforced pre-dispatch by the
+        # BudgetedStepRunner), the true elapsed sum is <= outer_min, so a
+        # step-level OR call-budget signal can always fire before the outer budget
+        # cancels the run. This is why §1 cannot land without §2's backoff: the
+        # bound is defined in terms of it.
+        #
+        # feature_seconds == 0 stays the deliberate "fire immediately" escape used
+        # to exercise the ABORTED_BUDGET path. For any positive value the strict
+        # inequality is required.
+        outer_min = self.outer_min()
+        if t.feature_seconds > 0 and t.feature_seconds < outer_min:
             raise ValueError(
                 f"timeouts.feature_seconds ({t.feature_seconds}s) must be >= "
-                f"max step timeout ({max_step}s) so a step-level "
-                f"TimeoutEscalation can fire before the outer feature "
-                f"budget cancels the task -- otherwise the 'finer-grained "
-                f"signal never overwritten by a coarser one' guarantee "
-                f"cannot hold. Adjust one or the other."
+                f"outer_min ({outer_min}s = C_max {t.c_max()}s x N_max "
+                f"{self.n_max()}) so a step-level or call-budget escalation can "
+                f"always fire before the outer feature budget cancels the run "
+                f"(hardening Step-0 §1.3). Raise feature_seconds, or lower the "
+                f"step ceilings / call budget / max_rounds."
             )
 
     def _apply(self, data: dict) -> None:
@@ -288,6 +383,7 @@ class HarnessConfig:
         overlay_sections(data, {
             "timeouts": self.timeouts,
             "debate": self.debate,
+            "call_budget": self.call_budget,
             "escalation": self.escalation,
             "diff": self.diff,
             "prompt": self.prompt,

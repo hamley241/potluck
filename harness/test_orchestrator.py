@@ -940,18 +940,20 @@ async def main():
         assert resp.rejected_ids() == {"I1"}, \
             f"expected I1 rejected, got responses={resp.responses!r}"
 
-    # 15i. INVARIANT: HarnessConfig.validate() rejects feature_seconds smaller
-    # than the largest step timeout. The "finer signal never overwritten"
-    # guarantee only holds when steps can raise TimeoutEscalation before the
-    # outer wall-clock cancels the task; making the violating config
-    # unrepresentable at load time is stronger than handling the runtime race.
+    # 15i. INVARIANT: HarnessConfig.validate() rejects feature_seconds below the
+    # outer bound (outer_min = C_max x N_max, §1.3 -- which subsumes the old
+    # "< largest step timeout" floor since C_max >= max_step, N_max >= 1). The
+    # "finer signal never overwritten" guarantee only holds when a step OR the
+    # call budget can escalate before the outer wall-clock cancels the task;
+    # making the violating config unrepresentable at load time is stronger than
+    # handling the runtime race.
     from harness.config import HarnessConfig as _HC  # noqa: E402
     bad = _HC()
     bad.timeouts.feature_seconds = 30
     bad.timeouts.model_call_seconds = 120
     try:
         bad.validate()
-        assert False, "validate() must reject feature_seconds < max step timeout"
+        assert False, "validate() must reject feature_seconds < outer_min"
     except ValueError:
         pass  # expected
     # Zero feature_seconds is the deliberate "fire immediately" test case;
@@ -1029,17 +1031,20 @@ async def main():
         f"probe larger than NUL offset must skip as binary: {large_probe!r}"
 
     # 15k. INVARIANT: deleting the dead round_seconds field drops the phantom
-    # validation floor. feature_seconds=350 >= max(model_call=120, gate=300)
-    # now validates; under the old code the dead default round_seconds=400
-    # made max(step_bounds)=400 > 350 and raised for a knob that governed
-    # nothing. (doer_step_seconds is cleared here to ISOLATE the round_seconds
-    # concern -- the step-adaptive ceilings are a real, separately-tested floor,
-    # hardening Step-0 §1.1; this test is only about the dead key.)
+    # validation floor. A config whose feature_seconds meets the REAL bound
+    # (outer_min = C_max x N_max, §1.3) validates; under the old code the dead
+    # default round_seconds=400 made max(step_bounds)=400 an EXTRA floor for a
+    # knob that governed nothing. (doer_step_seconds is cleared here to ISOLATE
+    # the round_seconds concern -- the step-adaptive ceilings + the call budget
+    # are the real, separately-tested floors, §1.1/§1.3; this test is only about
+    # the dead key not contributing a phantom bound. c_max here = max(120,300)*2+5
+    # = 605, so a round_seconds=400 phantom is strictly below it and provably
+    # cannot be what gates this config.)
     floor = _HC()
     floor.timeouts.model_call_seconds = 120
     floor.timeouts.gate_seconds = 300
     floor.timeouts.doer_step_seconds = {}
-    floor.timeouts.feature_seconds = 350
+    floor.timeouts.feature_seconds = floor.outer_min()  # meets the real §1.3 bound
     floor.validate()  # must not raise
 
     # 15l. INVARIANT: round_seconds stays deleted from Timeouts. Trivially true

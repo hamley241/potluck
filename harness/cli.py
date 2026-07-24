@@ -185,11 +185,13 @@ def cmd_fix(args):
     # (hardening Step-0 §1.2) so an override above feature_seconds REFUSES rather
     # than silently breaking the finer-signal guarantee -- this closes the
     # pre-existing --gate-timeout bypass in the same spot.
-    if args.gate_timeout:
+    # `is not None`, not truthiness: a 0 override is a valid (immediate-fire)
+    # value, not "absent" -- truthiness would silently retain the profile value.
+    if args.gate_timeout is not None:
         cfg.timeouts.gate_seconds = args.gate_timeout
     if args.doer_timeout is not None:
         cfg.timeouts.doer_timeout_override = args.doer_timeout
-    if args.gate_timeout or args.doer_timeout is not None:
+    if args.gate_timeout is not None or args.doer_timeout is not None:
         try:
             cfg.validate()
         except ValueError as e:

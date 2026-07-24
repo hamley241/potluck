@@ -110,6 +110,54 @@ from .schemas import (
     TiebreakVerdict,
 )
 
+
+class CallBudgetExceeded(RuntimeError):
+    """Raised BEFORE dispatch when a run would exceed its declared `N_max`
+    bounded calls (hardening Step-0 §1.3). A RuntimeError subclass only for
+    typing -- it is raised in BudgetedStepRunner's override, OUTSIDE StepRunner's
+    own `(RuntimeError, OSError)` catch, so it propagates up to `run_feature` and
+    maps to `ESCALATED_CALL_BUDGET` rather than being swallowed as a non-ok step
+    result. Its sibling escalations are `TimeoutEscalation`/`ModelUnavailable`."""
+
+    def __init__(self, n_max: int, step_name: str):
+        self.n_max = n_max
+        self.step_name = step_name
+        super().__init__(
+            f"bounded-call budget exhausted: refused '{step_name}' -- it would "
+            f"be call #{n_max + 1}, exceeding N_max={n_max} (hardening Step-0 §1.3)"
+        )
+
+
+class BudgetedStepRunner(StepRunner):
+    """`StepRunner` + a pre-dispatch call-budget admission gate (hardening Step-0
+    §1.3). Placed CALLER-SIDE in potluck (a subclass here, not an edit to the
+    engine) so harness_core stays fenced per §9. Every bounded call flows through
+    `self.runner.run(...)`, so overriding `run` counts EVERY bounded call -- and,
+    because a §2 resume re-runs the failed step as a fresh `run` call, every
+    resume-retry attempt too. Admission is tested at the HEAD of each call, so the
+    `(N_max+1)`-th bounded call is REFUSED before it runs, never after -- which is
+    what makes the outer bound's `<= N_max` premise ENFORCED, not assumed (codex
+    round-4 contract). The counter is per-run: a fresh BudgetedStepRunner is
+    constructed per feature, exactly as the base StepRunner is."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self._n_max = config.n_max()
+        self._calls_dispatched = 0
+
+    @property
+    def calls_dispatched(self) -> int:
+        """Bounded calls admitted so far this run (read by the T4b test to assert
+        a real run stays `<= N_max`, so the pinned budget is not a fiction)."""
+        return self._calls_dispatched
+
+    async def run(self, step_name, coro_factory, timeout_seconds):
+        if self._calls_dispatched >= self._n_max:
+            # Refuse BEFORE dispatch -- the (N_max+1)-th call never runs.
+            raise CallBudgetExceeded(self._n_max, step_name)
+        self._calls_dispatched += 1
+        return await super().run(step_name, coro_factory, timeout_seconds)
+
 # Per-string truncation cap. Sized to preserve typical reviewer/doer reasoning
 # in full (a code snippet + a paragraph of prose) while bounding worst-case
 # FeatureResult size. Truncation is deterministic; the truncated slice is the
@@ -1300,7 +1348,10 @@ class Orchestrator:
         # --allow-dirty). Only implement attempts use it -- once the gate/debate
         # pipeline owns the diff, an escalation must leave the tree intact.
         self.restore_tree = restore_tree or _noop_restore_tree
-        self.runner = StepRunner(config)
+        # BudgetedStepRunner (not the bare engine StepRunner): adds the §1.3
+        # pre-dispatch call-budget admission caller-side, keeping harness_core
+        # fenced (§9). Per-run, exactly like the base runner it replaces.
+        self.runner = BudgetedStepRunner(config)
         # ab_swap decides per issue_id whether to place the reviewer's argument
         # in slot A (True) or the doer's (False). Randomized by default so a
         # tiebreaker that guesses by position gets no free signal; tests inject
@@ -1354,6 +1405,23 @@ class Orchestrator:
                 rounds_used=state.rounds_used,
                 debate_log=self.log,
                 escalation_reason=f"[{mu.role}] {mu.detail}",
+            )
+        except CallBudgetExceeded as cbe:
+            # The declared per-run bounded-call budget (§1.3) was hit: a run made
+            # N_max dispatched bounded calls and asked for one more. Refused
+            # BEFORE dispatch, so nothing ran past the budget. Distinct terminal
+            # outcome so the operator (and the conductor's aggregate cap) can tell
+            # a budget exhaustion from a hang or a no-signal.
+            self._log("call_budget_exceeded", step=cbe.step_name,
+                      n_max=cbe.n_max, rounds_used=state.rounds_used)
+            return FeatureResult(
+                outcome=Outcome.ESCALATED_CALL_BUDGET,
+                rounds_used=state.rounds_used,
+                debate_log=self.log,
+                escalation_reason=(
+                    f"bounded-call budget N_max={cbe.n_max} exhausted at "
+                    f"'{cbe.step_name}'"
+                ),
             )
         except DoerProtocolViolation as dpv:
             # The doer responded, but non-conformantly: it failed to take a

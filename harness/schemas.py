@@ -89,6 +89,94 @@ class Outcome(str, Enum):
     ESCALATED_GATE = "escalated_gate"                  # gate could not be made green
     ESCALATED_NO_SIGNAL = "escalated_no_signal"        # a model call errored (auth/missing)
     ABORTED_BUDGET = "aborted_budget"                  # whole-feature wall-clock blown
+    ESCALATED_CALL_BUDGET = "escalated_call_budget"    # N_max bounded-call budget exhausted (§1.3)
+
+
+# --- Resumable-run checkpoint types (hardening Step-0 §2) ---------------------
+#
+# The whole slice serves one invariant (§0): "a run may lose a call, never its
+# history." §2 makes any timeout non-catastrophic by persisting a typed execution
+# cursor + completed state so the FAILED call resumes exactly. These are the
+# serializable shapes; the behaviour (git-tree snapshot/restore, atomic write,
+# fail-closed identity recompute) lives in harness/checkpoint.py.
+
+# Bumped whenever the on-disk checkpoint shape changes incompatibly. Resume
+# REFUSES an unknown version (fail-closed, §2.1) rather than misreading it.
+CHECKPOINT_SCHEMA_VERSION = 1
+
+
+class Phase(str, Enum):
+    """potluck's STATION-SPECIFIC resumable-call phases (hardening Step-0 §2.0).
+
+    Each phase maps 1:1 onto a real resumable model-call site in potluck's
+    orchestrator, so a timeout in ANY call dispatches to the exact failed call.
+    This is NOT a subset of menu's phase set (round-2 BLOCKING): `IMPLEMENT`
+    (`doer:implement`) and `APPLY_FIXES` (`doer:apply_fixes`) are potluck-ONLY
+    generative doer phases with no menu analogue. The set is closed; an
+    unknown/absent phase on resume REFUSES (fail-closed, §2.0). `DONE` is terminal.
+    """
+    IMPLEMENT = "implement"          # doer:implement (orchestrator implement step)
+    GATE = "gate"                    # initial verification gate
+    REVIEW = "review"               # fresh reviewer pass
+    ROUND_RESPOND = "round_respond"  # doer:respond within a debate round
+    ROUND_FOLLOWUP = "round_followup"  # reviewer follow-up within a round
+    TIEBREAK = "tiebreak"            # tiebreaker adjudication
+    APPLY_FIXES = "apply_fixes"      # doer:apply_fixes (accepted-fix application)
+    GATE_FINAL = "gate_final"        # closing verification gate
+    DONE = "done"                    # terminal
+
+
+class ExecCursor(BaseModel):
+    """A persisted program counter, written BEFORE and AFTER every resumable
+    model call (§2.0). Resume dispatches on `(station, phase, round_index)`, NOT
+    on `rounds_used` -- `rounds_used` alone cannot resume a TAIL call (the first
+    customer's actual failure: a call AFTER 9 completed rounds)."""
+    station: Literal["potluck"] = "potluck"
+    phase: Phase
+    round_index: int = 0            # which debate round, when phase is round-scoped
+    failed_step: str | None = None  # the step that timed out (for exact retry)
+    attempt: int = 0                # retry attempt count for failed_step
+
+
+class TreeSnapshot(BaseModel):
+    """potluck's lossless git-tree checkpoint (§2.3, adopts Ruling A). Captures
+    BOTH the working tree AND the REAL index as content-addressed git OIDs -- a
+    textual `git diff` is INSUFFICIENT (binary/size guards can omit files). The
+    real index is captured because restoring the working tree alone leaves the
+    resumed repo's index corrupt, diverging potluck's diff/gate (round-4 MAJOR)."""
+    repo_base_commit: str      # HEAD the run began from (restore resets here first)
+    work_tree_oid: str         # tree OID of tracked+untracked+ignored working content
+    index_tree_oid: str        # tree OID of the REAL staged index at checkpoint time
+    tree_snapshot_digest: str  # canonical digest over `git ls-tree -r work_tree_oid`
+
+
+class CheckpointIdentity(BaseModel):
+    """The recomputed commitment set (§2.1). Resume recomputes each field from the
+    run being resumed and REFUSES on ANY divergence -- a mutated criteria, a
+    different input doc, a config change that would alter timeouts/caps, an unknown
+    schema, or (potluck) a base/tree mismatch. run_id/directory identity is NOT the
+    binding (that is circular, round-1 MAJOR-2); the binding is this recomputed set."""
+    schema_version: int
+    criteria_content_hash: str    # the sealed criteria
+    input_document_digest: str    # the draft/doc the run began from
+    effective_config_digest: str  # the resolved timeouts + caps actually in force
+    run_manifest_id: str          # the run's own manifest id (bound to the input)
+    repo_base_commit: str | None = None       # potluck only (§2.2)
+    tree_snapshot_digest: str | None = None    # potluck only (§2.2)
+
+
+class RunCheckpoint(BaseModel):
+    """The typed, serializable checkpoint written to `checkpoint.json` in run_dir,
+    LAST + temp-renamed at the completion of every resumable call (§2.1). Commits
+    the cursor, completed-round count, the identity commitment set, the potluck
+    tree snapshot (potluck only), and the serialized debate/ledger state needed to
+    re-enter without re-litigating completed rounds."""
+    schema_version: int = CHECKPOINT_SCHEMA_VERSION
+    cursor: ExecCursor
+    rounds_used: int
+    identity: CheckpointIdentity
+    tree: TreeSnapshot | None = None            # potluck only (§2.3)
+    state: dict = Field(default_factory=dict)   # serialized debate-position locals
 
 
 class ClosurePattern(BaseModel):
