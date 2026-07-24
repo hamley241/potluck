@@ -42,13 +42,47 @@ from harness_core.config import (  # noqa: F401  (EscalationConfig/Backend re-ex
 
 @dataclass
 class Timeouts:
-    # Per external-model call. Slow providers are common.
-    model_call_seconds: int = 120
+    # DEFAULT per external-model call, for any doer step without its own
+    # built-in entry (below) and absent a `--doer-timeout` override. Raised
+    # 120 -> 300 (hardening Step-0 §1.1): the flagship doer routinely exceeds
+    # 120s on real work -- the first-customer failure. Slow providers are common.
+    model_call_seconds: int = 300
+    # Step-adaptive ABSOLUTE per-doer-call bounds (hardening Step-0 §1.1). The
+    # heavy generative doer steps -- which emit a whole code diff -- get 600s;
+    # bounded responses inherit the 300s default. `resolve_doer_timeout` reads
+    # this. Reviewer/tiebreak/gate steps are NOT doer steps and use their own
+    # bounds. `--doer-timeout` (potluck fix only) is a UNIFORM override that wins
+    # over this map outright (§1.1 precedence); it is threaded in at the call
+    # site, so it is NOT stored here.
+    doer_step_seconds: dict[str, int] = field(default_factory=lambda: {
+        "doer:implement": 600,
+        "doer:apply_fixes": 600,
+        "doer:respond": 300,
+    })
     # Per verification-gate run. Build/test can legitimately take a while;
     # tune per project -- this default is deliberately generous.
     gate_seconds: int = 300
-    # Outer bound on a single feature across all rounds/retries.
-    feature_seconds: int = 1800  # 30 min
+    # Outer bound on a single feature across all rounds/retries. Raised for the
+    # 600s step ceilings (hardening Step-0 §1.3): must dominate C_max * N_max.
+    feature_seconds: int = 10800  # 3 h
+    # The `--doer-timeout` UNIFORM override (potluck fix only). None = unset.
+    # When set, it wins over the built-in map for EVERY doer step (§1.1). Set by
+    # the CLI edge post-load; validate() is re-run afterward (§1.2) so a value
+    # above feature_seconds REFUSES rather than silently breaking the finer-signal
+    # guarantee (closing the pre-existing --gate-timeout bypass in the same spot).
+    doer_timeout_override: int | None = None
+
+    def resolve_doer_timeout(self, step: str) -> int:
+        """The single doer-timeout resolution function (hardening Step-0 §1.1),
+        total precedence, all values absolute seconds:
+          1. `doer_timeout_override` (the `--doer-timeout` uniform override) wins
+             for EVERY doer step when set;
+          2. else the built-in `doer_step_seconds[step]` if mapped;
+          3. else `model_call_seconds` (the default).
+        No ratios, no post-scaling."""
+        if self.doer_timeout_override is not None:
+            return self.doer_timeout_override
+        return self.doer_step_seconds.get(step, self.model_call_seconds)
 
 
 @dataclass
@@ -201,7 +235,30 @@ class HarnessConfig:
                 raise ValueError(
                     f"timeouts.{name} must be a non-negative int, got {v!r}"
                 )
-        step_bounds = (t.model_call_seconds, t.gate_seconds)
+        # Step-adaptive per-doer-call bounds (hardening Step-0 §1.1): each must be
+        # a non-negative int, and each participates in the outer-bound check below
+        # so a raised step ceiling cannot silently exceed feature_seconds.
+        for step, v in t.doer_step_seconds.items():
+            if not isinstance(v, int) or v < 0:
+                raise ValueError(
+                    f"timeouts.doer_step_seconds[{step!r}] must be a non-negative "
+                    f"int, got {v!r}"
+                )
+        if t.doer_timeout_override is not None and (
+                not isinstance(t.doer_timeout_override, int)
+                or t.doer_timeout_override < 0):
+            raise ValueError(
+                f"timeouts.doer_timeout_override must be a non-negative int or "
+                f"None, got {t.doer_timeout_override!r}"
+            )
+        # The --doer-timeout override, when set, is the effective bound for EVERY
+        # doer step (§1.1), so it MUST participate in the outer-bound check --
+        # this is what makes re-validation after the CLI override meaningful
+        # (§1.2): a `--doer-timeout` above feature_seconds refuses here.
+        step_bounds = (t.model_call_seconds, t.gate_seconds,
+                       *t.doer_step_seconds.values())
+        if t.doer_timeout_override is not None:
+            step_bounds = step_bounds + (t.doer_timeout_override,)
         max_step = max(step_bounds)
         # feature_seconds == 0 is a special case: it fires immediately, but
         # so does the step timeout, so the invariant is vacuously satisfied

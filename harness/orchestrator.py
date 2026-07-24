@@ -1803,7 +1803,7 @@ class Orchestrator:
         res = await self.runner.run(
             "doer:implement",
             _attempt,
-            self.cfg.timeouts.model_call_seconds,
+            self.cfg.timeouts.resolve_doer_timeout("doer:implement"),
         )
         # On failure the implement step is fully resolved and the escalation is
         # about to propagate; restore the baseline so a partial/dead attempt's
@@ -1992,7 +1992,7 @@ class Orchestrator:
             step="doer:respond", role="doer", msg_type="doer_response",
             call=_call,
             parse=DoerResponse.model_validate_json,
-            timeout=self.cfg.timeouts.model_call_seconds,
+            timeout=self.cfg.timeouts.resolve_doer_timeout("doer:respond"),
             on_timeout=_raises(TimeoutEscalation(
                 "doer_no_signal", "doer timed out during respond_to_review")),
             schema=_DOER_RESPONSE_SCHEMA,
@@ -2004,7 +2004,7 @@ class Orchestrator:
         res = await self.runner.run(
             "doer:apply_fixes",
             lambda: self.doer.apply_fixes(issues, diff),
-            self.cfg.timeouts.model_call_seconds,
+            self.cfg.timeouts.resolve_doer_timeout("doer:apply_fixes"),
         )
         if res.timed_out:
             raise TimeoutEscalation("doer_no_signal",

@@ -155,6 +155,10 @@ def add_fix_parser(subparsers):
     p.add_argument("--no-tiebreaker", action="store_true")
     p.add_argument("--max-rounds", type=int, default=None)
     p.add_argument("--gate-timeout", type=int, default=None)
+    p.add_argument("--doer-timeout", type=int, default=None,
+                   help="Uniform per-doer-call timeout (seconds) overriding the "
+                        "step-adaptive defaults for EVERY doer step. Re-validated "
+                        "against the outer feature bound (hardening Step-0 §1).")
     p.add_argument("--allow-dirty", action="store_true",
                    help="Run against a dirty working tree; skips the clean-tree "
                         "precondition AND all tree-restore behavior")
@@ -176,8 +180,21 @@ def cmd_fix(args):
                   if args.acceptance_file else args.acceptance)
 
     cfg = load_config(args)
+    # CLI timeout overrides are applied POST-load, so load()'s validate() has
+    # already run against the un-overridden values. Re-validate afterward
+    # (hardening Step-0 §1.2) so an override above feature_seconds REFUSES rather
+    # than silently breaking the finer-signal guarantee -- this closes the
+    # pre-existing --gate-timeout bypass in the same spot.
     if args.gate_timeout:
         cfg.timeouts.gate_seconds = args.gate_timeout
+    if args.doer_timeout is not None:
+        cfg.timeouts.doer_timeout_override = args.doer_timeout
+    if args.gate_timeout or args.doer_timeout is not None:
+        try:
+            cfg.validate()
+        except ValueError as e:
+            print(f"Error: invalid timeout override: {e}", file=sys.stderr)
+            sys.exit(1)
 
     gate = Path(".claude/verify.sh")
     if not gate.exists():
@@ -397,6 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-tiebreaker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--max-rounds", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--gate-timeout", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--doer-timeout", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--allow-dirty", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--json-output", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--log-file", type=str, default=None, help=argparse.SUPPRESS)

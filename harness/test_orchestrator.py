@@ -572,6 +572,8 @@ async def main():
             return "never"
     cfg = HarnessConfig()
     cfg.timeouts.model_call_seconds = 0
+    # Step-adaptive (hardening Step-0 §1.1): bound the implement step itself.
+    cfg.timeouts.doer_step_seconds = {"doer:implement": 0}
     cfg.escalation.retries_before_counting = 0
     cfg.escalation.consecutive_same_step_threshold = 2
     orch = make(cfg, HangingDoerImplement({}), StubReviewer(cfg, {"issues": []}),
@@ -1030,10 +1032,13 @@ async def main():
     # validation floor. feature_seconds=350 >= max(model_call=120, gate=300)
     # now validates; under the old code the dead default round_seconds=400
     # made max(step_bounds)=400 > 350 and raised for a knob that governed
-    # nothing.
+    # nothing. (doer_step_seconds is cleared here to ISOLATE the round_seconds
+    # concern -- the step-adaptive ceilings are a real, separately-tested floor,
+    # hardening Step-0 §1.1; this test is only about the dead key.)
     floor = _HC()
     floor.timeouts.model_call_seconds = 120
     floor.timeouts.gate_seconds = 300
+    floor.timeouts.doer_step_seconds = {}
     floor.timeouts.feature_seconds = 350
     floor.validate()  # must not raise
 
@@ -1533,6 +1538,7 @@ async def main():
     cfg = HarnessConfig()
     cfg.timeouts.gate_seconds = 1        # bounds get_diff (local tooling)
     cfg.timeouts.model_call_seconds = 1  # keep max_step small for validate()
+    cfg.timeouts.doer_step_seconds = {}  # clear the 600s step ceilings so max_step stays small
     cfg.timeouts.feature_seconds = 120   # >> the ~1s get_diff hang
     cfg.escalation.retries_before_counting = 0  # single attempt -> fast
     async def diff_hang():
@@ -1624,6 +1630,9 @@ async def main():
             return "never"
     cfg = HarnessConfig()
     cfg.timeouts.model_call_seconds = 1   # positive: factory actually runs
+    # Step-adaptive (hardening Step-0 §1.1): the implement step now resolves via
+    # doer_step_seconds, so force ITS bound to 1 to drive the timeout+retry.
+    cfg.timeouts.doer_step_seconds = {"doer:implement": 1}
     cfg.escalation.retries_before_counting = 1  # -> 2 attempts (retry once)
     cfg.escalation.consecutive_same_step_threshold = 5  # don't escalate early
     cfg.escalation.timeout_count_threshold = 5
@@ -1797,6 +1806,7 @@ async def main():
             return "never"
     cfg = HarnessConfig()
     cfg.timeouts.model_call_seconds = 1          # positive: factory runs
+    cfg.timeouts.doer_step_seconds = {"doer:implement": 1}  # bound implement (§1.1)
     cfg.escalation.retries_before_counting = 0   # exactly one attempt
     cfg.escalation.consecutive_same_step_threshold = 5  # don't escalate early
     cfg.escalation.timeout_count_threshold = 5
