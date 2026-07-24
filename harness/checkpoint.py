@@ -381,3 +381,137 @@ def load_checkpoint(run_dir: Path) -> RunCheckpoint:
             f"!= supported {CHECKPOINT_SCHEMA_VERSION}"
         )
     return ckpt
+
+
+# --- run inputs (so resume can recompute the identity commitments) -----------
+
+_INPUTS_FILENAME = "run_inputs.json"
+
+
+def persist_run_inputs(run_dir: Path, spec: str, acceptance: str,
+                       config_digest_value: str, repo_base_commit: str,
+                       run_manifest_id: str) -> None:
+    """Persist the run's identity inputs alongside the checkpoint so a `--resume`
+    in a fresh process can RECOMPUTE the commitment set and fail closed on any
+    divergence (§2.1). Written once at run start, atomically."""
+    import json
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "spec": spec, "acceptance": acceptance,
+        "config_digest": config_digest_value,
+        "repo_base_commit": repo_base_commit,
+        "run_manifest_id": run_manifest_id,
+    }
+    tmp = run_dir / (_INPUTS_FILENAME + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, run_dir / _INPUTS_FILENAME)
+
+
+def load_run_inputs(run_dir: Path) -> dict:
+    import json
+    path = Path(run_dir) / _INPUTS_FILENAME
+    if not path.exists():
+        raise CheckpointError(f"no run inputs to resume at {path}")
+    return json.loads(path.read_text())
+
+
+def compute_manifest_id(spec: str, acceptance: str, config_digest_value: str,
+                        repo_base_commit: str) -> str:
+    """A run's own manifest id, bound to the run's ACTUAL inputs (not the run_dir
+    name -- that binding would be circular, round-1 MAJOR-2). Two runs over the
+    same spec+acceptance+config+base share an id; any input change changes it."""
+    joined = "\x00".join(
+        [spec, acceptance, config_digest_value, repo_base_commit])
+    return digest_text(joined)
+
+
+def build_identity(spec: str, acceptance: str, config_digest_value: str,
+                   repo_base_commit: str, tree_snapshot_digest: str,
+                   run_manifest_id: str) -> CheckpointIdentity:
+    """The recomputed commitment set for a potluck run (§2.1). criteria = the
+    acceptance criteria; input document = the spec. Resume rebuilds this from the
+    persisted inputs and refuses on ANY field divergence (verify_identity)."""
+    return CheckpointIdentity(
+        schema_version=CHECKPOINT_SCHEMA_VERSION,
+        criteria_content_hash=digest_text(acceptance),
+        input_document_digest=digest_text(spec),
+        effective_config_digest=config_digest_value,
+        run_manifest_id=run_manifest_id,
+        repo_base_commit=repo_base_commit,
+        tree_snapshot_digest=tree_snapshot_digest,
+    )
+
+
+# --- checkpoint store (injectable: git-backed in prod, fake in tests) --------
+
+class GitCheckpointStore:
+    """Production checkpoint store: the real git-tree snapshot/restore engine
+    (§2.3) plus atomic file IO in `run_dir`, over the target repo. Injected into
+    the Orchestrator so the resume RE-ENTRY logic (cursor/state) is separable
+    from -- and testable without -- the git tree mechanics (a FakeCheckpointStore
+    drives the T2 re-entry tests; the tree engine is proven in test_checkpoint)."""
+
+    def __init__(self, run_dir: Path, repo: Path | None = None):
+        self.run_dir = Path(run_dir)
+        self.repo = Path(repo) if repo is not None else Path.cwd()
+
+    def snapshot(self) -> TreeSnapshot:
+        return snapshot_tree(self.repo)
+
+    def restore(self, tree: TreeSnapshot) -> None:
+        restore_tree(self.repo, tree)
+
+    def write(self, ckpt: RunCheckpoint) -> None:
+        write_checkpoint(self.run_dir, ckpt)
+
+    def load(self) -> RunCheckpoint:
+        return load_checkpoint(self.run_dir)
+
+
+class Checkpointer:
+    """Drives checkpoint writes DURING a run and identity-verified restores on
+    resume (§2). Bundles a store with the run-level identity inputs so the
+    orchestrator can build a fail-closed identity per checkpoint from the current
+    tree snapshot -- the orchestrator stays storage-agnostic (a FakeCheckpointStore
+    with the same 4-method surface drives the T2 re-entry tests without git).
+
+    `write` is called at the HEAD of each resumable call (§2.0: written before the
+    call, so a timeout there resumes THAT call); it snapshots the tree, binds the
+    identity, and writes atomically. `load_and_verify` recomputes the commitment
+    set from the RESUMING process's inputs and refuses on any divergence (§2.1)."""
+
+    def __init__(self, store, spec: str, acceptance: str,
+                 config_digest_value: str, run_manifest_id: str):
+        self.store = store
+        self.spec = spec
+        self.acceptance = acceptance
+        self.config_digest = config_digest_value
+        self.manifest_id = run_manifest_id
+
+    def write(self, cursor, rounds_used: int, state: dict) -> None:
+        tree = self.store.snapshot()
+        identity = build_identity(
+            self.spec, self.acceptance, self.config_digest,
+            tree.repo_base_commit, tree.tree_snapshot_digest, self.manifest_id)
+        self.store.write(RunCheckpoint(
+            cursor=cursor, rounds_used=rounds_used,
+            identity=identity, tree=tree, state=state))
+
+    def load_and_verify(self) -> RunCheckpoint:
+        """Load the checkpoint and REFUSE (fail-closed) unless the resuming run's
+        recomputed commitments match what was checkpointed (§2.1). The tree
+        commitments ride the checkpoint's own TreeSnapshot (restore verifies them
+        against the actual tree); the run-level commitments -- criteria, input
+        doc, effective config, manifest id -- are recomputed HERE from the
+        resuming process's inputs, so a mutated spec/acceptance/config refuses."""
+        ckpt = self.store.load()
+        recomputed = build_identity(
+            self.spec, self.acceptance, self.config_digest,
+            ckpt.identity.repo_base_commit, ckpt.identity.tree_snapshot_digest,
+            self.manifest_id)
+        verify_identity(ckpt.identity, recomputed)
+        return ckpt
+
+    def restore(self, tree) -> None:
+        self.store.restore(tree)

@@ -71,7 +71,8 @@ def write_log(result: dict, args):
 
 
 def build_orchestrator(cfg: HarnessConfig,
-                       allow_dirty: bool = False) -> Orchestrator:
+                       allow_dirty: bool = False,
+                       checkpointer=None) -> Orchestrator:
     """Wire a cfg into a production Orchestrator (real doer/reviewer/tiebreaker,
     real gate, config-bound get_diff, real tree restore). Pure: cfg ->
     Orchestrator, no argparse and no I/O, so a test can build the exact object
@@ -82,16 +83,81 @@ def build_orchestrator(cfg: HarnessConfig,
     allow_dirty is False; when True (operator opted out of the clean-tree
     precondition), it is a no-op -- we cannot safely reset a tree whose
     baseline we don't own -- and we log a `tree_hygiene_disabled` event so the
-    transcript shows hygiene was turned off."""
+    transcript shows hygiene was turned off.
+
+    checkpointer (hardening Step-0 §2) enables resumable checkpoints; None (the
+    default) keeps the exact non-resumable behaviour."""
     doer = RealDoerClient()
     reviewer = ReviewerClient(cfg)
     tiebreaker = TiebreakerClient(cfg) if cfg.debate.use_tiebreaker else None
     restore_tree = None if allow_dirty else real_restore_tree
     orch = Orchestrator(cfg, doer, reviewer, tiebreaker, real_run_gate,
-                        bound_get_diff(cfg.diff), restore_tree=restore_tree)
+                        bound_get_diff(cfg.diff), restore_tree=restore_tree,
+                        checkpointer=checkpointer)
     if allow_dirty:
         orch._log("tree_hygiene_disabled", allow_dirty=True)
     return orch
+
+
+def _effective_config_dict(cfg: HarnessConfig) -> dict:
+    """The resolved timeouts + caps actually in force (hardening Step-0 §2.1):
+    the identity binds this so a config change that would alter timeouts/caps
+    refuses a resume. Deliberately EXCLUDES machine-local model backends (those
+    differ per machine and are not a run commitment)."""
+    t = cfg.timeouts
+    return {
+        "model_call_seconds": t.model_call_seconds,
+        "gate_seconds": t.gate_seconds,
+        "feature_seconds": t.feature_seconds,
+        "doer_step_seconds": dict(sorted(t.doer_step_seconds.items())),
+        "doer_timeout_override": t.doer_timeout_override,
+        "max_resume_retries": t.max_resume_retries,
+        "backoff_delay_seconds": t.backoff_delay_seconds,
+        "fixed_call_budget": cfg.call_budget.fixed_call_budget,
+        "per_round_call_budget": cfg.call_budget.per_round_call_budget,
+        "max_rounds": cfg.debate.max_rounds,
+    }
+
+
+def _git_head() -> str:
+    import subprocess
+    proc = subprocess.run(["git", "rev-parse", "HEAD"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"could not read git HEAD (exit {proc.returncode}): "
+            f"{(proc.stderr or '').strip()[:200]}")
+    return proc.stdout.strip()
+
+
+def _refuse_run_dir_inside_tree(run_dir: str) -> None:
+    """Refuse a run-dir inside the working tree (fail-closed). §2.3 restore does
+    `git clean -fdx`, which would DELETE a run-dir under the repo (even a
+    gitignored one), and the tree snapshot would CAPTURE it -- both corrupt the
+    checkpoint. The sidecar must live outside the tree it snapshots."""
+    rd = Path(run_dir).resolve()
+    root = Path.cwd().resolve()
+    if rd == root or root in rd.parents:
+        print(f"Error: --run-dir/--resume path ({rd}) is INSIDE the working "
+              f"tree ({root}). The checkpoint sidecar must live OUTSIDE the tree "
+              f"it snapshots -- restore's `git clean -fdx` would delete it and "
+              f"the snapshot would capture it. Use a path outside the repo, e.g. "
+              f"../potluck-runs/<id>.", file=sys.stderr)
+        sys.exit(1)
+
+
+def _build_checkpointer(run_dir: str, cfg: HarnessConfig, spec: str,
+                        acceptance: str):
+    """Construct a git-backed Checkpointer for `run_dir` bound to this run's
+    identity inputs (hardening Step-0 §2)."""
+    from . import checkpoint as ck
+    _refuse_run_dir_inside_tree(run_dir)
+    cfg_digest = ck.config_digest(_effective_config_dict(cfg))
+    base = _git_head()
+    manifest_id = ck.compute_manifest_id(spec, acceptance, cfg_digest, base)
+    store = ck.GitCheckpointStore(Path(run_dir), repo=Path.cwd())
+    return ck.Checkpointer(store, spec, acceptance, cfg_digest, manifest_id), \
+        cfg_digest, base, manifest_id
 
 
 def ensure_clean_tree(allow_dirty: bool = False) -> str | None:
@@ -162,29 +228,25 @@ def add_fix_parser(subparsers):
     p.add_argument("--allow-dirty", action="store_true",
                    help="Run against a dirty working tree; skips the clean-tree "
                         "precondition AND all tree-restore behavior")
+    p.add_argument("--run-dir", type=str, default=None,
+                   help="Persist a resumable checkpoint under this directory "
+                        "(hardening Step-0 §2). A timed-out run can then be "
+                        "continued with `potluck fix --resume <run-dir>`.")
+    p.add_argument("--resume", type=str, default=None, metavar="RUN_DIR",
+                   help="Resume a previously checkpointed run from its run-dir: "
+                        "the spec/acceptance/config are read back from there, the "
+                        "identity is re-verified fail-closed, the git tree is "
+                        "restored losslessly, and the failed call re-runs with "
+                        "backoff (hardening Step-0 §2). Ignores --spec/--run-dir.")
     p.add_argument("--json-output", action="store_true")
     p.add_argument("--log-file", type=str, default=None)
     p.set_defaults(func=cmd_fix)
 
 
-def cmd_fix(args):
-    if args.spec_file:
-        spec = Path(args.spec_file).read_text().strip()
-    elif args.spec:
-        spec = args.spec
-    else:
-        print("Error: provide --spec or --spec-file", file=sys.stderr)
-        sys.exit(1)
-
-    acceptance = (Path(args.acceptance_file).read_text().strip()
-                  if args.acceptance_file else args.acceptance)
-
-    cfg = load_config(args)
-    # CLI timeout overrides are applied POST-load, so load()'s validate() has
-    # already run against the un-overridden values. Re-validate afterward
-    # (hardening Step-0 §1.2) so an override above feature_seconds REFUSES rather
-    # than silently breaking the finer-signal guarantee -- this closes the
-    # pre-existing --gate-timeout bypass in the same spot.
+def _apply_timeout_overrides(args, cfg) -> None:
+    """Apply the CLI timeout overrides POST-load and re-validate (§1.2); exits on
+    an invalid override. Shared by the fresh and resume paths so a resumed run's
+    effective config (hence its config_digest) is computed identically."""
     # `is not None`, not truthiness: a 0 override is a valid (immediate-fire)
     # value, not "absent" -- truthiness would silently retain the profile value.
     if args.gate_timeout is not None:
@@ -198,32 +260,98 @@ def cmd_fix(args):
             print(f"Error: invalid timeout override: {e}", file=sys.stderr)
             sys.exit(1)
 
-    gate = Path(".claude/verify.sh")
-    if not gate.exists():
+
+def _require_gate() -> None:
+    if not Path(".claude/verify.sh").exists():
         print("Error: .claude/verify.sh not found.\n"
               "Copy verify.sh.example into your project as .claude/verify.sh.",
               file=sys.stderr)
         sys.exit(1)
 
-    # Clean-tree precondition (before the banner): a dead implement attempt
-    # leaves partial edits behind, so we start from a known-clean baseline that
-    # restore_tree can reset to. --allow-dirty is the visible, committed opt-out.
+
+def cmd_fix(args):
+    from . import checkpoint as ck
+    resume_dir = getattr(args, "resume", None)
+    run_dir = getattr(args, "run_dir", None)
     allow_dirty = getattr(args, "allow_dirty", False)
-    dirty_err = ensure_clean_tree(allow_dirty)
-    if dirty_err:
-        print(f"Error: {dirty_err}", file=sys.stderr)
-        sys.exit(1)
 
-    print(f"potluck: profile={cfg.profile}, debate={'on' if cfg.debate_enabled else 'off'}, "
-          f"max_rounds={cfg.debate.max_rounds}")
-    print(f"roles: reviewer={cfg.models.reviewer.name}, tiebreaker={cfg.models.tiebreaker.name}")
-    print(f"spec: {spec[:80]}{'...' if len(spec) > 80 else ''}\n")
+    if resume_dir:
+        # --- resume path (hardening Step-0 §2): spec/acceptance come from the
+        #     persisted run inputs, NOT --spec; the identity is re-verified
+        #     fail-closed and the tree restored losslessly before re-entry. ---
+        try:
+            inputs = ck.load_run_inputs(resume_dir)
+        except ck.CheckpointError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        spec, acceptance = inputs["spec"], inputs["acceptance"]
+        cfg = load_config(args)
+        _apply_timeout_overrides(args, cfg)
+        _require_gate()
+        # The tree must be clean at the checkpoint base for a lossless restore.
+        dirty_err = ensure_clean_tree(allow_dirty)
+        if dirty_err:
+            print(f"Error: {dirty_err}", file=sys.stderr)
+            sys.exit(1)
+        checkpointer, *_ = _build_checkpointer(resume_dir, cfg, spec, acceptance)
+        try:
+            resume_ckpt = checkpointer.load_and_verify()
+            checkpointer.restore(resume_ckpt.tree)
+        except ck.CheckpointError as e:
+            print(f"Error: resume refused (fail-closed): {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"potluck: RESUMING from {resume_dir} at "
+              f"{resume_ckpt.cursor.phase.value} (round {resume_ckpt.cursor.round_index})")
+        print(f"spec: {spec[:80]}{'...' if len(spec) > 80 else ''}\n")
 
-    async def _run():
-        orch = build_orchestrator(cfg, allow_dirty=allow_dirty)
-        return await orch.run_feature(spec, acceptance)
+        async def _run():
+            orch = build_orchestrator(cfg, allow_dirty=allow_dirty,
+                                      checkpointer=checkpointer)
+            return await orch.run_feature(spec, acceptance, resume=resume_ckpt)
 
-    result = asyncio.run(_run())
+        result = asyncio.run(_run())
+    else:
+        # --- fresh path (optionally checkpointed via --run-dir) ---
+        if args.spec_file:
+            spec = Path(args.spec_file).read_text().strip()
+        elif args.spec:
+            spec = args.spec
+        else:
+            print("Error: provide --spec or --spec-file", file=sys.stderr)
+            sys.exit(1)
+        acceptance = (Path(args.acceptance_file).read_text().strip()
+                      if args.acceptance_file else args.acceptance)
+
+        cfg = load_config(args)
+        _apply_timeout_overrides(args, cfg)
+        _require_gate()
+        # Clean-tree precondition (before the banner): a dead implement attempt
+        # leaves partial edits behind, so we start from a known-clean baseline
+        # restore_tree can reset to. --allow-dirty is the visible opt-out.
+        dirty_err = ensure_clean_tree(allow_dirty)
+        if dirty_err:
+            print(f"Error: {dirty_err}", file=sys.stderr)
+            sys.exit(1)
+
+        checkpointer = None
+        if run_dir:
+            checkpointer, cfg_digest, base, manifest_id = _build_checkpointer(
+                run_dir, cfg, spec, acceptance)
+            ck.persist_run_inputs(run_dir, spec, acceptance, cfg_digest, base,
+                                  manifest_id)
+
+        print(f"potluck: profile={cfg.profile}, debate={'on' if cfg.debate_enabled else 'off'}, "
+              f"max_rounds={cfg.debate.max_rounds}"
+              + (f", checkpoint={run_dir}" if run_dir else ""))
+        print(f"roles: reviewer={cfg.models.reviewer.name}, tiebreaker={cfg.models.tiebreaker.name}")
+        print(f"spec: {spec[:80]}{'...' if len(spec) > 80 else ''}\n")
+
+        async def _run():
+            orch = build_orchestrator(cfg, allow_dirty=allow_dirty,
+                                      checkpointer=checkpointer)
+            return await orch.run_feature(spec, acceptance)
+
+        result = asyncio.run(_run())
     out = {
         "outcome": result.outcome.value,
         "rounds_used": result.rounds_used,

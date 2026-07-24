@@ -103,12 +103,68 @@ from .schemas import (
     ClosurePattern,
     ClosureReport,
     DoerResponse,
+    ExecCursor,
     Outcome,
+    Phase,
     ReviewIssue,
     ReviewVerdict,
     Severity,
     TiebreakVerdict,
 )
+
+
+# --- resume phase ordering + debate-state (de)serialization (Step-0 §2) ------
+#
+# A total order over potluck's resumable phases, so a resume can decide, per
+# phase, whether it is already COMPLETED (skip -- its result rides the restored
+# state) or is the failed/next call to RUN. Round phases repeat, so the key
+# carries the round index; TIEBREAK/APPLY_FIXES/GATE_FINAL are post-loop and
+# sort after every round. This is the potluck analogue of menu's cursor dispatch
+# (§2.0): dispatch is on (phase, round_index), never on rounds_used.
+def _phase_key(phase: "Phase", round_index: int = 0) -> tuple:
+    table = {
+        Phase.IMPLEMENT: (0, 0, 0),
+        Phase.GATE: (1, 0, 0),
+        Phase.REVIEW: (2, 0, 0),
+        Phase.ROUND_RESPOND: (3, round_index, 0),
+        Phase.ROUND_FOLLOWUP: (3, round_index, 1),
+        Phase.TIEBREAK: (4, 0, 0),
+        Phase.APPLY_FIXES: (5, 0, 0),
+        Phase.GATE_FINAL: (6, 0, 0),
+        Phase.DONE: (7, 0, 0),
+    }
+    return table[phase]
+
+
+def _serialize_debate(diff, verdict, accepted_by_id, unresolved, response) -> dict:
+    """Serialize the debate-position locals into the checkpoint `state` (§2.1),
+    so a resume re-enters mid-debate without re-litigating completed rounds. The
+    tree itself rides the TreeSnapshot (§2.3); this is the reasoning state."""
+    return {
+        "diff": diff,
+        "verdict": verdict.model_dump(mode="json") if verdict is not None else None,
+        "accepted_by_id": {k: v.model_dump(mode="json")
+                           for k, v in accepted_by_id.items()},
+        "unresolved": sorted(unresolved),
+        "response": response.model_dump(mode="json") if response is not None else None,
+    }
+
+
+def _deserialize_debate(state: dict) -> dict:
+    """Inverse of _serialize_debate -- rebuild the typed debate locals from a
+    checkpoint's `state` on resume."""
+    verdict = (ReviewVerdict.model_validate(state["verdict"])
+               if state.get("verdict") is not None else None)
+    response = (DoerResponse.model_validate(state["response"])
+                if state.get("response") is not None else None)
+    return {
+        "diff": state.get("diff"),
+        "verdict": verdict,
+        "accepted_by_id": {k: ReviewIssue.model_validate(v)
+                           for k, v in state.get("accepted_by_id", {}).items()},
+        "unresolved": set(state.get("unresolved", [])),
+        "response": response,
+    }
 
 
 class CallBudgetExceeded(RuntimeError):
@@ -1335,6 +1391,7 @@ class Orchestrator:
         get_diff,             # async callable -> str
         restore_tree=None,    # async callable () -> None; restores pre-implement tree
         ab_swap: Callable[[str], bool] | None = None,
+        checkpointer=None,    # checkpoint.Checkpointer | None; None = no resume support
     ):
         self.cfg = config
         self.doer = doer
@@ -1342,6 +1399,12 @@ class Orchestrator:
         self.tiebreaker = tiebreaker
         self.run_gate = run_gate
         self.get_diff = get_diff
+        # checkpointer drives §2 resumable checkpoints. Defaults to None so every
+        # existing construction/test keeps the EXACT pre-§2 behaviour (no writes,
+        # no snapshots); cli wires a real git-backed Checkpointer when a run_dir
+        # is in play. When None, _ckpt/_resume are no-ops and _run is byte-for-
+        # byte the original linear flow.
+        self._checkpointer = checkpointer
         # restore_tree resets the working tree to the pre-implement baseline.
         # Defaults to a no-op so every existing construction/test keeps working
         # unchanged; cli wires the real git reset (or a no-op under
@@ -1372,7 +1435,61 @@ class Orchestrator:
         if self.tiebreaker is not None:
             self.tiebreaker._prompt_log = self._log
 
-    async def run_feature(self, spec: str, acceptance: str) -> FeatureResult:
+    # --- §2 resume plumbing (no-ops when self._checkpointer is None) ---
+
+    def _should_run(self, cur, phase, round_index: int = 0) -> bool:
+        """On a fresh run (cur is None) run everything. On resume, run a phase
+        iff it is the cursor's phase (the failed/next call, re-run with backoff)
+        or later -- earlier phases are COMPLETED and their results ride the
+        restored state. Dispatch is on (phase, round_index), never rounds_used
+        (§2.0)."""
+        if cur is None:
+            return True
+        return _phase_key(phase, round_index) >= _phase_key(cur.phase, cur.round_index)
+
+    def _is_failed_step(self, cur, phase, round_index: int = 0) -> bool:
+        """True only for the EXACT call the resume checkpoint was taken before --
+        the one that gets §2.4 backoff on re-run."""
+        return (cur is not None
+                and _phase_key(phase, round_index) == _phase_key(cur.phase, cur.round_index))
+
+    def _ckpt(self, phase, round_index, failed_step, state,
+              diff, verdict, accepted, unresolved, response, attempt: int = 0):
+        """Write a checkpoint at the HEAD of a resumable call (§2.0/§2.1): a
+        timeout in that call leaves this checkpoint on disk, so resume re-enters
+        exactly here. No-op without a checkpointer (every pre-§2 construction)."""
+        if self._checkpointer is None:
+            return
+        self._checkpointer.write(
+            ExecCursor(station="potluck", phase=phase, round_index=round_index,
+                       failed_step=failed_step, attempt=attempt),
+            state.rounds_used,
+            _serialize_debate(diff, verdict, accepted, unresolved, response))
+
+    async def _run_step(self, cur, phase, round_index, coro_factory):
+        """Run a resumable call, applying §2.4 backoff ONLY when this is the
+        resumed failed step: retry at the SAME resolved timeout, separated by
+        BACKOFF_DELAY, bounded by MAX_RESUME_RETRIES. Exhaustion re-raises the
+        TimeoutEscalation (still resumable: the checkpoint stands). A fresh run's
+        first-time timeout is NOT retried here -- it escalates and the checkpoint
+        makes it resumable, exactly the §2 contract."""
+        if not self._is_failed_step(cur, phase, round_index):
+            return await coro_factory()
+        attempts = 1 + self.cfg.timeouts.max_resume_retries
+        for attempt in range(attempts):
+            try:
+                return await coro_factory()
+            except TimeoutEscalation:
+                if attempt < attempts - 1:
+                    self._log("resume_backoff", phase=phase.value,
+                              attempt=attempt + 1,
+                              delay=self.cfg.timeouts.backoff_delay_seconds)
+                    await asyncio.sleep(self.cfg.timeouts.backoff_delay_seconds)
+                    continue
+                raise
+
+    async def run_feature(self, spec: str, acceptance: str,
+                          resume: "RunCheckpoint | None" = None) -> FeatureResult:
         # Per-invocation state box, not mutable `self` attribute -- if this
         # Orchestrator instance is ever reused across features, per-feature
         # counters would otherwise leak across.
@@ -1385,7 +1502,7 @@ class Orchestrator:
         # before asyncio.TimeoutError is even considered.
         try:
             return await asyncio.wait_for(
-                self._run(spec, acceptance, state),
+                self._run(spec, acceptance, state, resume),
                 timeout=self.cfg.timeouts.feature_seconds,
             )
         except TimeoutEscalation as te:
@@ -1461,141 +1578,188 @@ class Orchestrator:
             )
 
     async def _run(self, spec: str, acceptance: str,
-                   state: "_RunState") -> FeatureResult:
-        # 1. Implement (bounded by StepRunner -- previously unbounded, so a
-        #    hanging `claude -p` at the implement stage would wait forever
-        #    with no step-level signal).
-        await self._doer_implement(spec, acceptance)
+                   state: "_RunState",
+                   resume: "RunCheckpoint | None" = None) -> FeatureResult:
+        # --- resume setup (§2). cur is None on a fresh run -> every phase runs
+        #     and _run is the original linear flow; on resume, cur drives the
+        #     phase guards (_should_run) so completed phases are SKIPPED (their
+        #     results ride the restored state) and the failed call re-runs with
+        #     §2.4 backoff. The tree is restored by the caller BEFORE run_feature.
+        cur = resume.cursor if resume is not None else None
+        diff = None
+        verdict = None
+        response = None
+        # Track all accepted issues (not just IDs) so apply_fixes can pass full
+        # ReviewIssue objects (IDs alone aren't actionable for a stateless doer).
+        accepted_issues_by_id: dict[str, ReviewIssue] = {}
+        # deadlock_ids covers blocking AND major -- a rejected major deserves the
+        # same deadlock/tiebreak path as a rejected blocking.
+        unresolved: set[str] = set()
+        if resume is not None:
+            d = _deserialize_debate(resume.state)
+            diff = d["diff"]
+            verdict = d["verdict"]
+            response = d["response"]
+            accepted_issues_by_id = d["accepted_by_id"]
+            unresolved = d["unresolved"]
+            state.rounds_used = resume.rounds_used
+            self._log("resume", phase=cur.phase.value,
+                      round_index=cur.round_index, rounds_used=state.rounds_used)
 
-        # 1a. Inaction guarantee, Member A: capture the diff the implement step
-        #     produced BEFORE the gate. An EMPTY diff is no signal -- a fix run
-        #     that changed nothing has not done the job, and the gate would pass
-        #     trivially on the unchanged tree (the exact green-gate-on-empty-diff
-        #     blind spot this guarantee closes). "No change was needed" is a
-        #     legitimate outcome, but ONLY A HUMAN MAY CONCLUDE it: escalate WITH
-        #     THE EVIDENCE (a detail stating what was observed, not a conclusion)
-        #     via the established ModelUnavailable("doer", ...) no-signal channel,
-        #     and never infer it -- the same line drawn by refusing to treat a
-        #     timeout as approval. The diff is captured once here and reused for
-        #     the review below (the gate is local read-only tooling and does not
-        #     change the tree, so a second capture would cost a bounded step for
-        #     no analytic gain).
-        diff = await self._capture_diff("initial")
-        if not diff.strip():
-            raise ModelUnavailable(
-                "doer",
-                "doer:implement produced no changes; a fix run that changed "
-                "nothing has not done the job. If no change was genuinely "
-                "required, a human must confirm that -- the loop cannot infer "
-                "it.")
+        def _attempt(phase, round_index=0):
+            return (cur.attempt + 1
+                    if self._is_failed_step(cur, phase, round_index) else 0)
+
+        # 1. Implement (bounded by StepRunner). 1a folds in: capture the diff the
+        #    implement produced BEFORE the gate and treat an EMPTY diff as no
+        #    signal (a fix run that changed nothing has not done the job; only a
+        #    human may conclude "no change needed" -- the loop escalates with the
+        #    evidence via the ModelUnavailable no-signal channel, never infers it).
+        if self._should_run(cur, Phase.IMPLEMENT):
+            self._ckpt(Phase.IMPLEMENT, 0, "doer:implement", state, diff, verdict,
+                       accepted_issues_by_id, unresolved, response,
+                       attempt=_attempt(Phase.IMPLEMENT))
+            await self._run_step(cur, Phase.IMPLEMENT, 0,
+                                 lambda: self._doer_implement(spec, acceptance))
+            diff = await self._capture_diff("initial")
+            if not diff.strip():
+                raise ModelUnavailable(
+                    "doer",
+                    "doer:implement produced no changes; a fix run that changed "
+                    "nothing has not done the job. If no change was genuinely "
+                    "required, a human must confirm that -- the loop cannot infer "
+                    "it.")
 
         # 2. Gate (correctness is settled by tools, not opinion)
-        passed, detail = await self._gate_or_escalate("initial")
-        if not passed:
-            return self._gate_failure_result(
-                "initial", 0, detail,
-                "gate could not be made green before review")
+        if self._should_run(cur, Phase.GATE):
+            self._ckpt(Phase.GATE, 0, "gate:initial", state, diff, verdict,
+                       accepted_issues_by_id, unresolved, response,
+                       attempt=_attempt(Phase.GATE))
+            passed, detail = await self._run_step(
+                cur, Phase.GATE, 0, lambda: self._gate_or_escalate("initial"))
+            if not passed:
+                return self._gate_failure_result(
+                    "initial", 0, detail,
+                    "gate could not be made green before review")
 
-        # If debate disabled (e.g. CI) or diff touches human-only paths,
-        # stop at the deterministic gate.
-        if not self.cfg.debate_enabled:
-            self._log("debate_skipped", reason="disabled_by_profile")
-            return FeatureResult(Outcome.PASSED, 0, self.log)
-        if self._is_human_only(diff):
-            self._log("debate_skipped", reason="human_only_path")
-            return self._escalated(Outcome.ESCALATED_DISAGREEMENT, 0,
-                                   "diff touches human-only path; routed to human review")
+        # 3. Review (+ the pre-debate exits). Guarded under REVIEW so a resume
+        #    PAST review does not re-evaluate them (debate was on, else there
+        #    would be no debate phase to resume into).
+        if self._should_run(cur, Phase.REVIEW):
+            # If debate disabled (e.g. CI) or the diff touches human-only paths,
+            # stop at the deterministic gate.
+            if not self.cfg.debate_enabled:
+                self._log("debate_skipped", reason="disabled_by_profile")
+                return FeatureResult(Outcome.PASSED, 0, self.log)
+            if self._is_human_only(diff):
+                self._log("debate_skipped", reason="human_only_path")
+                return self._escalated(
+                    Outcome.ESCALATED_DISAGREEMENT, 0,
+                    "diff touches human-only path; routed to human review")
+            self._ckpt(Phase.REVIEW, 0, "reviewer:initial", state, diff, verdict,
+                       accepted_issues_by_id, unresolved, response,
+                       attempt=_attempt(Phase.REVIEW))
+            verdict = await self._run_step(
+                cur, Phase.REVIEW, 0, lambda: self._review(spec, acceptance, diff))
+            self._log("review", event_version=1, round=0,
+                      issues=[i.model_dump(mode="json") for i in verdict.issues])
+            if not verdict.has_blocking_or_major:
+                self._log("early_exit", reason="no_blocking_or_major")
+                result = FeatureResult(Outcome.PASSED, 0, self.log)
+                # Reuse the step-3 diff (a second get_diff would cost a bounded
+                # step for no analytic gain).
+                await self._run_closure_sweep(spec, diff, result)
+                return result
+            unresolved = verdict.deadlock_ids
 
-        # 3..6 debate
-        verdict = await self._review(spec, acceptance, diff)
-        self._log("review", event_version=1, round=0,
-                  issues=[i.model_dump(mode="json") for i in verdict.issues])
-        if not verdict.has_blocking_or_major:
-            self._log("early_exit", reason="no_blocking_or_major")
-            result = FeatureResult(Outcome.PASSED, 0, self.log)
-            # Reuse the step-3 diff (the bug class is evident there; a second
-            # get_diff would cost another bounded step for no analytic gain).
-            await self._run_closure_sweep(spec, diff, result)
-            return result
+        # 3b..5 debate. On resume into the debate, start at the cursor's round;
+        #       phases past the loop skip it entirely.
+        start_round = 1
+        if cur is not None:
+            if cur.phase in (Phase.ROUND_RESPOND, Phase.ROUND_FOLLOWUP):
+                start_round = cur.round_index
+            elif _phase_key(cur.phase) >= _phase_key(Phase.TIEBREAK):
+                start_round = self.cfg.debate.max_rounds + 1  # loop already done
 
-        # Track all accepted issues (not just IDs) so apply_fixes can pass
-        # full ReviewIssue objects with descriptions and suggested_fix to the
-        # doer -- IDs alone are not actionable for a stateless subprocess.
-        accepted_issues_by_id: dict[str, ReviewIssue] = {}
-        # deadlock_ids covers both blocking AND major -- reviewer flagged a
-        # major concern as materially wrong, so a rejected major deserves the
-        # same deadlock/tiebreak path as a rejected blocking.
-        unresolved = verdict.deadlock_ids
+        for rnd in range(start_round, self.cfg.debate.max_rounds + 1):
+            # 4. Doer responds per issue.
+            if self._should_run(cur, Phase.ROUND_RESPOND, rnd):
+                self._ckpt(Phase.ROUND_RESPOND, rnd, "doer:respond", state, diff,
+                           verdict, accepted_issues_by_id, unresolved, response,
+                           attempt=_attempt(Phase.ROUND_RESPOND, rnd))
+                response = await self._run_step(
+                    cur, Phase.ROUND_RESPOND, rnd,
+                    lambda: self._doer_respond_to_review(
+                        spec, acceptance, diff, verdict))
+                # Protocol invariant: the doer must take a stance on every issue
+                # the reviewer raised. A response omitting any verdict id emits no
+                # signal on those issues -- same bucket as a timeout -- so
+                # escalate. Logged BEFORE raising so the transcript captures it.
+                expected_ids = {i.id for i in verdict.issues}
+                responded_ids = {r.id for r in response.responses}
+                missing_ids = expected_ids - responded_ids
+                if missing_ids:
+                    self._log("doer_protocol_violation", event_version=1,
+                              round=rnd, missing_ids=sorted(missing_ids),
+                              verdict_issue_count=len(expected_ids),
+                              responded_id_count=len(responded_ids))
+                    raise DoerProtocolViolation(missing_ids, rnd)
+                for iresp in response.responses:
+                    if iresp.decision == "accept":
+                        for i in verdict.issues:
+                            if i.id == iresp.id:
+                                accepted_issues_by_id[i.id] = i
+                                break
+                # v2 payload: `responses` is the source of truth.
+                self._log("doer_response", event_version=2, round=rnd,
+                          responses=[r.model_dump(mode="json")
+                                     for r in response.responses])
+                rejected = response.rejected_ids() & unresolved
+                if not rejected:
+                    # rounds_used = COMPLETED rounds only. This round succeeded;
+                    # increment BEFORE break so escalation reporting is accurate.
+                    state.rounds_used = rnd
+                    unresolved = set()
+                    break
+            else:
+                # Resuming INTO the followup of this round: respond already
+                # completed, so recompute `rejected` from the restored response +
+                # the pre-followup unresolved (the checkpoint's serialized state).
+                rejected = (response.rejected_ids() & unresolved
+                            if response is not None else set())
+                if not rejected:
+                    state.rounds_used = rnd
+                    unresolved = set()
+                    break
 
-        for rnd in range(1, self.cfg.debate.max_rounds + 1):
-            # 4. Doer responds per issue
-            response = await self._doer_respond_to_review(
-                spec, acceptance, diff, verdict)
-            # Protocol invariant: the doer must take a stance (accept/reject)
-            # on every issue the reviewer raised. A DoerResponse that omits any
-            # verdict issue id is emitting no signal on those issues -- the same
-            # bucket as a timeout or an unavailable model -- so escalate rather
-            # than let an empty/partial response converge silently to PASSED.
-            # Checked one-directionally (expected - responded); hallucinated ids
-            # are out of scope. Logged BEFORE raising so the transcript captures
-            # the failure even if the exception path logs nothing further.
-            expected_ids = {i.id for i in verdict.issues}
-            responded_ids = {r.id for r in response.responses}
-            missing_ids = expected_ids - responded_ids
-            if missing_ids:
-                self._log("doer_protocol_violation", event_version=1, round=rnd,
-                          missing_ids=sorted(missing_ids),
-                          verdict_issue_count=len(expected_ids),
-                          responded_id_count=len(responded_ids))
-                raise DoerProtocolViolation(missing_ids, rnd)
-            for iresp in response.responses:
-                if iresp.decision == "accept":
-                    for i in verdict.issues:
-                        if i.id == iresp.id:
-                            accepted_issues_by_id[i.id] = i
-                            break
-            # v2 payload: `responses` is the source of truth; accepted/rejected
-            # id lists are derivable and were dropped to avoid two sources of
-            # truth (see event_version bump).
-            self._log("doer_response", event_version=2, round=rnd,
-                      responses=[r.model_dump(mode="json")
-                                 for r in response.responses])
-
-            rejected = response.rejected_ids() & unresolved
-            if not rejected:
-                # rounds_used = COMPLETED rounds only. This round succeeded
-                # (nothing left to argue about), so it counts. Increment
-                # BEFORE break so escalation reporting is accurate.
+            # 5. Reviewer responds to rejections only.
+            if self._should_run(cur, Phase.ROUND_FOLLOWUP, rnd):
+                self._ckpt(Phase.ROUND_FOLLOWUP, rnd, "reviewer:followup", state,
+                           diff, verdict, accepted_issues_by_id, unresolved,
+                           response, attempt=_attempt(Phase.ROUND_FOLLOWUP, rnd))
+                verdict = await self._run_step(
+                    cur, Phase.ROUND_FOLLOWUP, rnd,
+                    lambda: self._review_followup(spec, acceptance, diff, response))
+                unresolved = verdict.deadlock_ids & rejected
+                # v2 payload: `held_issues`, filtered to unresolved.
+                self._log("reviewer_followup", event_version=2, round=rnd,
+                          held_issues=[i.model_dump(mode="json")
+                                       for i in verdict.issues
+                                       if i.id in unresolved])
+                # Round is COMPLETED here (both replied, both logged).
                 state.rounds_used = rnd
-                unresolved = set()
-                break  # everything blocking-or-major accepted -> done debating
-
-            # 5. Reviewer responds to rejections only
-            verdict = await self._review_followup(
-                spec, acceptance, diff, response)
-            unresolved = verdict.deadlock_ids & rejected
-            # v2 payload: `held_issues` replaces `still_blocking` id list;
-            # id set derivable via {i["id"] for i in held_issues}. Filtered to
-            # unresolved so a followup verdict that (against the prompt)
-            # contains non-rejected or non-deadlock-eligible issues doesn't
-            # mislead consumers into thinking they were still held.
-            self._log("reviewer_followup", event_version=2, round=rnd,
-                      held_issues=[i.model_dump(mode="json")
-                                   for i in verdict.issues
-                                   if i.id in unresolved])
-            # Round is COMPLETED at this point (both doer & reviewer replied,
-            # both events logged). An exception raised beyond here reports
-            # this round as done; an exception raised inside the round body
-            # reports the PREVIOUS round as the last one that finished.
-            state.rounds_used = rnd
-            if not unresolved:
-                break
+                if not unresolved:
+                    break
 
         # 6. Resolve any remaining deadlock
-        if unresolved:
-            unresolved = await self._tiebreak(
-                spec, acceptance, diff, unresolved, verdict, response,
-                state.rounds_used)
+        if unresolved and self._should_run(cur, Phase.TIEBREAK):
+            self._ckpt(Phase.TIEBREAK, 0, "tiebreak", state, diff, verdict,
+                       accepted_issues_by_id, unresolved, response,
+                       attempt=_attempt(Phase.TIEBREAK))
+            unresolved = await self._run_step(
+                cur, Phase.TIEBREAK, 0,
+                lambda: self._tiebreak(spec, acceptance, diff, unresolved,
+                                       verdict, response, state.rounds_used))
             if unresolved:
                 return self._escalated(
                     Outcome.ESCALATED_DISAGREEMENT, state.rounds_used,
@@ -1611,7 +1775,7 @@ class Orchestrator:
         #    escalate a run that had actually converged). Skip the model call;
         #    step 8 still runs (it is local + deterministic and guards against
         #    any unexpected tree mutation during debate).
-        if accepted_issues_by_id:
+        if self._should_run(cur, Phase.APPLY_FIXES) and accepted_issues_by_id:
             accepted_ids = sorted(accepted_issues_by_id)
             # Inaction guarantee, Member B: an accepted issue creates an
             # OBLIGATION that discharges only through OBSERVABLE CHANGE. Capture
@@ -1636,9 +1800,14 @@ class Orchestrator:
             # change, THAT is when a final fresh-context pass ("does the applied
             # diff actually address the accepted issues?") gets built. Evidence
             # first, machinery second.
+            self._ckpt(Phase.APPLY_FIXES, 0, "doer:apply_fixes", state, diff,
+                       verdict, accepted_issues_by_id, unresolved, response,
+                       attempt=_attempt(Phase.APPLY_FIXES))
             pre_diff = await self._capture_diff("pre-apply")
-            await self._doer_apply_fixes(
-                [accepted_issues_by_id[k] for k in accepted_ids], diff)
+            await self._run_step(
+                cur, Phase.APPLY_FIXES, 0,
+                lambda: self._doer_apply_fixes(
+                    [accepted_issues_by_id[k] for k in accepted_ids], diff))
             post_diff = await self._capture_diff("post-apply")
             # Log both diff sizes so the transcript shows what was actually
             # produced (the no-silent-caps habit) -- never just the verdict.
@@ -1655,17 +1824,23 @@ class Orchestrator:
                     f"accepted issue that produces no edit has not done the "
                     f"job. If no change was genuinely required, a human must "
                     f"confirm that -- the loop cannot infer it.")
-        else:
+        elif self._should_run(cur, Phase.APPLY_FIXES):
             # Empty accepted set: apply_fixes is already skipped (nothing to
             # discharge), and Member B does not apply -- do not change that.
             self._log("apply_fixes_skipped", reason="no_accepted_issues")
 
         # 8. Gate again
-        passed, detail = await self._gate_or_escalate("post-fix")
-        if not passed:
-            return self._gate_failure_result(
-                "post-fix", state.rounds_used, detail,
-                "gate failed after applying fixes")
+        if self._should_run(cur, Phase.GATE_FINAL):
+            self._ckpt(Phase.GATE_FINAL, 0, "gate:post-fix", state, diff, verdict,
+                       accepted_issues_by_id, unresolved, response,
+                       attempt=_attempt(Phase.GATE_FINAL))
+            passed, detail = await self._run_step(
+                cur, Phase.GATE_FINAL, 0,
+                lambda: self._gate_or_escalate("post-fix"))
+            if not passed:
+                return self._gate_failure_result(
+                    "post-fix", state.rounds_used, detail,
+                    "gate failed after applying fixes")
 
         # 9. Done
         self._log("passed", rounds=state.rounds_used)
