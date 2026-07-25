@@ -208,6 +208,13 @@ class BudgetedStepRunner(StepRunner):
         super().__init__(config)
         self._n_max = config.n_max()
         self._calls_dispatched = 0
+        # Hook fired with the new count RIGHT AFTER a successful admission and
+        # BEFORE the provider dispatch (codex round-4): the orchestrator wires it
+        # to persist the increment into the checkpoint, so a call that dispatches
+        # and then the process crashes -- before its DONE checkpoint, on success
+        # OR a non-timeout error -- is still counted. Timeout-only bumping left
+        # that window open (cumulative dispatches could exceed N_max on resume).
+        self.on_admit = None
 
     @property
     def calls_dispatched(self) -> int:
@@ -226,6 +233,11 @@ class BudgetedStepRunner(StepRunner):
             # Refuse BEFORE dispatch -- the (N_max+1)-th call never runs.
             raise CallBudgetExceeded(self._n_max, step_name)
         self._calls_dispatched += 1
+        # Persist the increment at admission, BEFORE the provider call, so the
+        # count is durable even if the call succeeds/errors and the process dies
+        # before its DONE checkpoint (codex round-4 BLOCKING).
+        if self.on_admit is not None:
+            self.on_admit(self._calls_dispatched)
         return await super().run(step_name, coro_factory, timeout_seconds)
 
 # Per-string truncation cap. Sized to preserve typical reviewer/doer reasoning
@@ -1439,6 +1451,12 @@ class Orchestrator:
         # pre-dispatch call-budget admission caller-side, keeping harness_core
         # fenced (§9). Per-run, exactly like the base runner it replaces.
         self.runner = BudgetedStepRunner(config)
+        # Persist each admission's increment into the checkpoint at dispatch time
+        # (codex round-4): the last checkpoint's count is bumped the instant a
+        # call is admitted, so a crash between dispatch and the DONE checkpoint
+        # cannot undercount. No-op when unchecked or before the first head write.
+        if self._checkpointer is not None:
+            self.runner.on_admit = self._checkpointer.bump_calls_dispatched
         # ab_swap decides per issue_id whether to place the reviewer's argument
         # in slot A (True) or the doer's (False). Randomized by default so a
         # tiebreaker that guesses by position gets no free signal; tests inject
@@ -1532,18 +1550,9 @@ class Orchestrator:
                           attempt=cur.attempt + 1,
                           delay=self.cfg.timeouts.backoff_delay_seconds)
                 await asyncio.sleep(self.cfg.timeouts.backoff_delay_seconds)
-        try:
-            return await coro_factory()
-        except TimeoutEscalation:
-            # The call DISPATCHED (the runner admitted + incremented) and timed
-            # out. Persist the now-accurate cumulative count before escalating
-            # (codex round-3) -- a refused/exhausted NON-dispatch never reaches
-            # here (CallBudgetExceeded / resume_exhausted are not TimeoutEscalation
-            # / are raised before dispatch), so the count stays honest.
-            if self._checkpointer is not None:
-                self._checkpointer.bump_calls_dispatched(
-                    self.runner.calls_dispatched)
-            raise
+        # The dispatch count is persisted at admission by the runner's on_admit
+        # hook (codex round-4), so no timeout/DONE-window bump is needed here.
+        return await coro_factory()
 
     async def run_feature(self, spec: str, acceptance: str,
                           resume: "RunCheckpoint | None" = None) -> FeatureResult:
