@@ -956,11 +956,17 @@ async def main():
         assert False, "validate() must reject feature_seconds < outer_min"
     except ValueError:
         pass  # expected
-    # Zero feature_seconds is the deliberate "fire immediately" test case;
-    # validate() must NOT reject it (used by invariant_feature_budget above).
-    ok = _HC()
-    ok.timeouts.feature_seconds = 0
-    ok.validate()  # must not raise
+    # Zero feature_seconds is now REFUSED (codex round-9): there is no
+    # fire-immediately escape -- 0 < outer_min preempts every finer signal. (The
+    # ABORTED_BUDGET path above sets feature_seconds=0 on a cfg it does NOT
+    # validate, so it is unaffected.)
+    zero = _HC()
+    zero.timeouts.feature_seconds = 0
+    try:
+        zero.validate()
+        assert False, "validate() must reject feature_seconds=0 (< outer_min)"
+    except ValueError:
+        pass  # expected
     # Negative timeouts rejected.
     neg = _HC()
     neg.timeouts.model_call_seconds = -1

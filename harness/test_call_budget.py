@@ -116,6 +116,26 @@ async def main() -> bool:
     except ValueError:
         ok = False
     results["at_outer_min_ok"] = ok
+    # codex round-9: raising max_rounds lifts N_max -> outer_min, so a high
+    # max_rounds against the default feature_seconds must be REFUSED (the CLI's
+    # --max-rounds path re-validates unconditionally to enforce this).
+    mr = HarnessConfig()
+    mr.debate.max_rounds = 100  # N_max = 14 + 100*8 = 814 -> outer_min >> default
+    mr_refused = False
+    try:
+        mr.validate()
+    except ValueError:
+        mr_refused = True
+    results["high_max_rounds_refuses"] = mr_refused
+    # feature_seconds=0 is refused (no fire-immediately escape, round-9).
+    z = HarnessConfig()
+    z.timeouts.feature_seconds = 0
+    z_ref = False
+    try:
+        z.validate()
+    except ValueError:
+        z_ref = True
+    results["zero_feature_seconds_refused"] = z_ref
     # A non-positive fixed budget and a negative per-round budget refuse.
     for fld, val in [("fixed_call_budget", 0), ("per_round_call_budget", -1)]:
         c2 = HarnessConfig()

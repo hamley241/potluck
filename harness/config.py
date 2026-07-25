@@ -368,11 +368,14 @@ class HarnessConfig:
         # cancels the run. This is why §1 cannot land without §2's backoff: the
         # bound is defined in terms of it.
         #
-        # feature_seconds == 0 stays the deliberate "fire immediately" escape used
-        # to exercise the ABORTED_BUDGET path. For any positive value the strict
-        # inequality is required.
+        # The inequality is UNCONDITIONAL (codex round-9): there is no
+        # feature_seconds == 0 escape. A zero outer bound fires the wall-clock
+        # immediately, preempting every finer step-level / call-budget signal --
+        # exactly what outer_min exists to prevent -- so a config that sets it is
+        # refused, not exempted. (Tests exercising the ABORTED_BUDGET path set
+        # feature_seconds=0 on a cfg they do NOT validate, which is unaffected.)
         outer_min = self.outer_min()
-        if t.feature_seconds > 0 and t.feature_seconds < outer_min:
+        if t.feature_seconds < outer_min:
             raise ValueError(
                 f"timeouts.feature_seconds ({t.feature_seconds}s) must be >= "
                 f"outer_min ({outer_min}s = C_max {t.c_max()}s x N_max "

@@ -276,12 +276,17 @@ def _apply_timeout_overrides(args, cfg) -> None:
         cfg.timeouts.gate_seconds = args.gate_timeout
     if args.doer_timeout is not None:
         cfg.timeouts.doer_timeout_override = args.doer_timeout
-    if args.gate_timeout is not None or args.doer_timeout is not None:
-        try:
-            cfg.validate()
-        except ValueError as e:
-            print(f"Error: invalid timeout override: {e}", file=sys.stderr)
-            sys.exit(1)
+    # ALWAYS re-validate (codex round-9): --max-rounds (applied in load_config,
+    # AFTER load()'s validate) raises N_max -> outer_min, and --no-debate/
+    # --no-tiebreaker also change the effective config. Only gate/doer-timeout
+    # were re-validated before, so `--max-rounds 100` could start with an
+    # outer_min the feature bound no longer dominates (§1.2/§1.3 require
+    # post-override validation).
+    try:
+        cfg.validate()
+    except ValueError as e:
+        print(f"Error: invalid config override: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _require_gate() -> None:
