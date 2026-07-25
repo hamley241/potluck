@@ -2479,7 +2479,13 @@ class Orchestrator:
                         spec, acceptance, diff, issue_id, arg_a, arg_b,
                         retry_note=note),
                     parse=_parse_tiebreak,
-                    timeout=self.cfg.timeouts.resolve_doer_timeout("tiebreaker:adjudicate"),
+                    # Reviewer/tiebreak are NOT doer steps: they keep the 300s
+                    # model_call_seconds default and MUST NOT pick up the
+                    # --doer-timeout uniform override (§1.1/§1.2; codex round-5
+                    # MAJOR -- resolve_doer_timeout would have applied the doer
+                    # override to the tiebreaker, e.g. --doer-timeout 0 -> instant
+                    # tiebreak timeout).
+                    timeout=self.cfg.timeouts.model_call_seconds,
                     on_timeout=_raise_tiebreak_timeout(issue_id),
                     schema=_tiebreak_schema(issue_id),
                     not_ok_detail="tiebreaker call errored",

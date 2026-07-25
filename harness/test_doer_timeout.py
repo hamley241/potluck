@@ -64,6 +64,19 @@ def main() -> bool:
         cfg2.timeouts.c_max() == 900 * 2 + 5
         and cfg2.outer_min() == cfg2.timeouts.c_max() * cfg2.n_max())
 
+    # codex round-5 MAJOR: the --doer-timeout override REPLACES the built-in doer
+    # map, so the map's dormant values must NOT enter C_max. With override=100 and
+    # a 600s map entry, max_call_base is max(model_call 300, gate 300, override
+    # 100) = 300 -- NOT 600. Otherwise validate() refuses a config that satisfies
+    # the real effective bound.
+    t_ov2 = Timeouts(doer_timeout_override=100,
+                     doer_step_seconds={"doer:implement": 600})
+    results["override_replaces_map_in_c_max"] = (t_ov2.max_call_base() == 300)
+    # The override still participates when it is the largest base.
+    t_ov3 = Timeouts(doer_timeout_override=900,
+                     doer_step_seconds={"doer:implement": 600})
+    results["override_used_when_largest"] = (t_ov3.max_call_base() == 900)
+
     # Negative map value and negative override both refuse (fail closed).
     cfg3 = HarnessConfig()
     cfg3.timeouts.doer_step_seconds = {"doer:implement": -1}

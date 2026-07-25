@@ -87,14 +87,21 @@ class Timeouts:
     backoff_delay_seconds: int = 5     # BACKOFF_DELAY
 
     def max_call_base(self) -> int:
-        """The heaviest single-call timeout across ALL bounded call classes
-        (doer steps incl. any override, the gate, and the model_call default that
-        the reviewer/tiebreak/diff/closure calls inherit). This is C_max's base
-        BEFORE the backoff multiplier (§1.3)."""
-        bases = (self.model_call_seconds, self.gate_seconds,
-                 *self.doer_step_seconds.values())
+        """The heaviest single-call timeout across ALL bounded call classes, as
+        actually resolved (§1.3). Non-doer calls (reviewer/tiebreak/diff/closure)
+        inherit `model_call_seconds`; the gate uses `gate_seconds`; doer steps
+        resolve per `resolve_doer_timeout`. When `--doer-timeout` is set it is a
+        UNIFORM override that REPLACES the built-in doer map (§1.1), so the map's
+        (now dormant) values must NOT enter C_max -- only the override does (codex
+        round-5 MAJOR: keeping them made validate() refuse a config that satisfies
+        the real effective-timeout bound)."""
         if self.doer_timeout_override is not None:
-            bases = bases + (self.doer_timeout_override,)
+            # Override replaces the doer map: doer steps are all = override.
+            bases = (self.model_call_seconds, self.gate_seconds,
+                     self.doer_timeout_override)
+        else:
+            bases = (self.model_call_seconds, self.gate_seconds,
+                     *self.doer_step_seconds.values())
         return max(bases)
 
     def c_max(self) -> int:
