@@ -130,6 +130,20 @@ def _git_head() -> str:
     return proc.stdout.strip()
 
 
+def _git_toplevel() -> Path:
+    """The git working-tree ROOT (`git rev-parse --show-toplevel`), or cwd outside
+    a git repo. The whole checkpoint machinery -- containment refusal AND the
+    snapshot/restore/submodule-refusal -- must be rooted here, NOT at the
+    invocation cwd, or a run from a subdirectory scopes git ops to that subtree
+    and misses sibling nested repos / D-F transitions (codex round-6/7)."""
+    import subprocess
+    proc = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return Path.cwd().resolve()
+    return Path(proc.stdout.strip()).resolve()
+
+
 def _refuse_run_dir_inside_tree(run_dir: str) -> None:
     """Refuse a run-dir inside the working tree (fail-closed). §2.3 restore does
     `git clean -fdx`, which would DELETE a run-dir anywhere under the repo (even a
@@ -140,16 +154,8 @@ def _refuse_run_dir_inside_tree(run_dir: str) -> None:
     --show-toplevel`), NOT cwd (codex round-6 MAJOR): invoking from a subdirectory
     with `--run-dir ../runs/x` can resolve OUTSIDE cwd yet INSIDE the repo, which a
     cwd-based check would wrongly accept and clean -fdx would still destroy."""
-    import subprocess
     rd = Path(run_dir).resolve()
-    proc = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                          capture_output=True, text=True)
-    if proc.returncode != 0:
-        # Not in a git repo (or git unreadable): fall back to cwd -- there is no
-        # tree to snapshot/clean, so the only hazard is a run-dir under cwd.
-        root = Path.cwd().resolve()
-    else:
-        root = Path(proc.stdout.strip()).resolve()
+    root = _git_toplevel()
     if rd == root or root in rd.parents:
         print(f"Error: --run-dir/--resume path ({rd}) is INSIDE the git working "
               f"tree ({root}). The checkpoint sidecar must live OUTSIDE the tree "
@@ -168,7 +174,11 @@ def _build_checkpointer(run_dir: str, cfg: HarnessConfig, spec: str,
     cfg_digest = ck.config_digest(_effective_config_dict(cfg))
     base = _git_head()
     manifest_id = ck.compute_manifest_id(spec, acceptance, cfg_digest, base)
-    store = ck.GitCheckpointStore(Path(run_dir), repo=Path.cwd())
+    # Root the snapshot/restore engine at the git WORKING-TREE ROOT, not cwd
+    # (codex round-7): from a subdirectory, a cwd-scoped store would miss sibling
+    # nested repos (the mandatory submodule refusal) and sibling D-F transitions
+    # (losslessness), and clean/ls-files would only cover the subtree.
+    store = ck.GitCheckpointStore(Path(run_dir), repo=_git_toplevel())
     return ck.Checkpointer(store, spec, acceptance, cfg_digest, manifest_id), \
         cfg_digest, base, manifest_id
 
