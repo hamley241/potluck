@@ -460,6 +460,58 @@ async def main() -> bool:
     results["blocking2_skips_completed_apply"] = ("apply_fixes" not in resume_calls)
     results["blocking2_resumes_to_terminal"] = (r3.outcome == Outcome.PASSED)
 
+    # (i) MAJOR-2 (codex round-1): per-concern tiebreak idempotence. Two concerns
+    #     go to tiebreak; the 2nd times out. Resume must re-adjudicate ONLY the
+    #     2nd -- the 1st (already decided) is skipped, not re-adjudicated.
+    class TBRec(RecTiebreaker):
+        def __init__(self, cfg, fail_on):
+            super().__init__(cfg, {}, [])
+            self.asked = []
+            self.fail_on = fail_on
+            self._fired = set()
+        async def adjudicate(self, spec, acceptance, diff, issue_id, a, b, retry_note=None):
+            self.asked.append(issue_id)
+            if issue_id == self.fail_on and issue_id not in self._fired:
+                self._fired.add(issue_id)
+                raise TimeoutEscalation("tiebreaker_no_signal", "inject")
+            import json
+            return json.dumps({"id": issue_id, "sides_with": "b", "reasoning": "s"})
+
+    cfg = HarnessConfig()
+    cfg.debate.max_rounds = 1
+    cfg.timeouts.feature_seconds = max(cfg.outer_min(), 10_000)
+    store = FakeStore()
+    two = {"issues": [
+        {"id": "C1", "severity": "blocking", "issue": "i1", "suggested_fix": "f"},
+        {"id": "C2", "severity": "blocking", "issue": "i2", "suggested_fix": "f"}]}
+
+    async def gate_ok2():
+        import json
+        return json.dumps({"ok": True, "output": "green", "exit_code": 0})
+
+    async def diff2():
+        return "diff\n+x\n"
+
+    # pass 1: doer rejects both, reviewer holds both -> tiebreak; C2 times out.
+    doer1 = RecDoer({"C1": "reject", "C2": "reject"}, [], DiffState())
+    rev1 = RecReviewer(cfg, two, [], followups=[two])
+    tb1 = TBRec(cfg, fail_on="C2")
+    o = Orchestrator(cfg, doer1, rev1, tb1, gate_ok2, diff2,
+                     ab_swap=lambda _id: False, checkpointer=_checkpointer(store))
+    r = await o.run_feature("s", "a")
+    results["major2_pass1_timeout"] = (r.outcome == Outcome.ESCALATED_TIMEOUT)
+    results["major2_pass1_adjudicated_both_attempted"] = (tb1.asked == ["C1", "C2"])
+    # resume: only C2 re-adjudicated (C1 decided, skipped).
+    ck = _checkpointer(store).load_and_verify()
+    doer2 = RecDoer({"C1": "reject", "C2": "reject"}, [], DiffState())
+    rev2 = RecReviewer(cfg, two, [], followups=[two])
+    tb2 = TBRec(cfg, fail_on=None)
+    o2 = Orchestrator(cfg, doer2, rev2, tb2, gate_ok2, diff2,
+                      ab_swap=lambda _id: False, checkpointer=_checkpointer(store))
+    await o2.run_feature("s", "a", resume=ck)
+    results["major2_resume_only_readjudicates_C2"] = (tb2.asked == ["C2"])
+    results["major2_resume_skips_decided_C1"] = ("C1" not in tb2.asked)
+
     # (e) integration: real git-backed store through a full resume.
     g = await _git_integration()
     results["git_timed_out"] = g["timed_out"]

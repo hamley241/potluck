@@ -136,10 +136,16 @@ def _phase_key(phase: "Phase", round_index: int = 0) -> tuple:
     return table[phase]
 
 
-def _serialize_debate(diff, verdict, accepted_by_id, unresolved, response) -> dict:
+def _serialize_debate(diff, verdict, accepted_by_id, unresolved, response,
+                      tiebreak_decided=None) -> dict:
     """Serialize the debate-position locals into the checkpoint `state` (§2.1),
     so a resume re-enters mid-debate without re-litigating completed rounds. The
-    tree itself rides the TreeSnapshot (§2.3); this is the reasoning state."""
+    tree itself rides the TreeSnapshot (§2.3); this is the reasoning state.
+
+    `tiebreak_decided` (id -> stays-blocking bool) is the per-concern tiebreak
+    progress (codex round-1 MAJOR-2): checkpointed after EACH concern is
+    adjudicated so a resume into TIEBREAK skips already-decided concerns rather
+    than re-adjudicating (and re-charging the call budget for) them."""
     return {
         "diff": diff,
         "verdict": verdict.model_dump(mode="json") if verdict is not None else None,
@@ -147,6 +153,7 @@ def _serialize_debate(diff, verdict, accepted_by_id, unresolved, response) -> di
                            for k, v in accepted_by_id.items()},
         "unresolved": sorted(unresolved),
         "response": response.model_dump(mode="json") if response is not None else None,
+        "tiebreak_decided": dict(tiebreak_decided or {}),
     }
 
 
@@ -164,6 +171,7 @@ def _deserialize_debate(state: dict) -> dict:
                            for k, v in state.get("accepted_by_id", {}).items()},
         "unresolved": set(state.get("unresolved", [])),
         "response": response,
+        "tiebreak_decided": dict(state.get("tiebreak_decided", {})),
     }
 
 
@@ -1475,7 +1483,7 @@ class Orchestrator:
 
     def _ckpt(self, phase, round_index, failed_step, state,
               diff, verdict, accepted, unresolved, response, attempt: int = 0,
-              completed: bool = False):
+              completed: bool = False, tiebreak_decided=None):
         """Write a checkpoint for a resumable call (§2.0/§2.1). `completed=False`
         (the HEAD write, before the call) makes a timeout in the call resume AT
         it; `completed=True` (the DONE write, after the call succeeds) makes a
@@ -1486,7 +1494,8 @@ class Orchestrator:
             ExecCursor(station="potluck", phase=phase, round_index=round_index,
                        failed_step=failed_step, attempt=attempt, completed=completed),
             state.rounds_used,
-            _serialize_debate(diff, verdict, accepted, unresolved, response),
+            _serialize_debate(diff, verdict, accepted, unresolved, response,
+                              tiebreak_decided=tiebreak_decided),
             calls_dispatched=self.runner.calls_dispatched)
 
     async def _run_step(self, cur, phase, round_index, coro_factory):
@@ -1627,6 +1636,9 @@ class Orchestrator:
         # deadlock_ids covers blocking AND major -- a rejected major deserves the
         # same deadlock/tiebreak path as a rejected blocking.
         unresolved: set[str] = set()
+        # Per-concern tiebreak progress (id -> stays-blocking bool), §2.2 MAJOR-2:
+        # persisted so a resume into TIEBREAK skips already-adjudicated concerns.
+        tiebreak_decided: dict[str, bool] = {}
         if resume is not None:
             d = _deserialize_debate(resume.state)
             diff = d["diff"]
@@ -1634,6 +1646,7 @@ class Orchestrator:
             response = d["response"]
             accepted_issues_by_id = d["accepted_by_id"]
             unresolved = d["unresolved"]
+            tiebreak_decided = d["tiebreak_decided"]
             state.rounds_used = resume.rounds_used
             # Restore the CUMULATIVE bounded-call count so the §1.3 budget spans
             # the whole logical run, not just this process (codex round-1 MAJOR).
@@ -1650,7 +1663,17 @@ class Orchestrator:
             # after it resumes PAST it (never re-running/discarding completed work).
             # Reads the CURRENT locals (closure), so it captures post-call state.
             self._ckpt(phase, round_index, None, state, diff, verdict,
-                       accepted_issues_by_id, unresolved, response, completed=True)
+                       accepted_issues_by_id, unresolved, response, completed=True,
+                       tiebreak_decided=tiebreak_decided)
+
+        def _tb_ckpt(i, attempt):
+            # Per-concern HEAD write for the tiebreak (§2.2 MAJOR-2): persists the
+            # tiebreak_decided progress (concerns 0..i-1) BEFORE adjudicating
+            # concern i, so a timeout there resumes into TIEBREAK skipping the
+            # already-decided concerns rather than re-adjudicating them.
+            self._ckpt(Phase.TIEBREAK, i, "tiebreaker:adjudicate", state, diff,
+                       verdict, accepted_issues_by_id, unresolved, response,
+                       attempt=attempt, tiebreak_decided=tiebreak_decided)
 
         # 1. Implement (bounded by StepRunner). 1a folds in: capture the diff the
         #    implement produced BEFORE the gate and treat an EMPTY diff as no
@@ -1798,15 +1821,14 @@ class Orchestrator:
                 if not unresolved:
                     break
 
-        # 6. Resolve any remaining deadlock
+        # 6. Resolve any remaining deadlock. The tiebreak checkpoints PER CONCERN
+        #    and skips already-adjudicated ones on resume (§2.2 MAJOR-2), so it
+        #    manages its own per-concern head-writes/backoff rather than riding a
+        #    single _run_step over the whole loop.
         if unresolved and self._should_run(cur, Phase.TIEBREAK):
-            self._ckpt(Phase.TIEBREAK, 0, "tiebreak", state, diff, verdict,
-                       accepted_issues_by_id, unresolved, response,
-                       attempt=_attempt(Phase.TIEBREAK))
-            unresolved = await self._run_step(
-                cur, Phase.TIEBREAK, 0,
-                lambda: self._tiebreak(spec, acceptance, diff, unresolved,
-                                       verdict, response, state.rounds_used))
+            unresolved = await self._tiebreak(
+                cur, spec, acceptance, diff, unresolved, verdict, response,
+                state.rounds_used, tiebreak_decided, _tb_ckpt)
             _done(Phase.TIEBREAK)
             if unresolved:
                 return self._escalated(
@@ -2350,10 +2372,12 @@ class Orchestrator:
             not_ok_detail="reviewer follow-up errored",
             malformed_prefix="reviewer returned malformed response: ")
 
-    async def _tiebreak(self, spec, acceptance, diff, blocking: set[str],
+    async def _tiebreak(self, cur, spec, acceptance, diff, blocking: set[str],
                         verdict: ReviewVerdict,
                         response: DoerResponse,
-                        round_num: int) -> set[str]:
+                        round_num: int,
+                        tiebreak_decided: dict,
+                        checkpoint_fn) -> set[str]:
         if not (self.cfg.debate.use_tiebreaker and self.tiebreaker):
             return blocking  # no tiebreaker -> any unresolved blocking escalates
         # Both lookups are invariants: by construction (line ~253) an id in
@@ -2363,8 +2387,16 @@ class Orchestrator:
         reviewer_issues = {i.id: i for i in verdict.issues}
         doer_rejections = {r.id: r for r in response.responses
                            if r.decision == "reject"}
-        still_blocking: set[str] = set()
-        for issue_id in sorted(blocking):
+        # §2.2 MAJOR-2: per-concern resumability. `tiebreak_decided` (id ->
+        # stays-blocking bool) carries the progress of prior resumes; concerns
+        # already in it are SKIPPED (never re-adjudicated / re-charged to the call
+        # budget). `local_cur` applies §2.4 backoff to ONLY the FIRST re-adjudicated
+        # (failed) concern, then clears -- subsequent concerns run fresh.
+        ordered = sorted(blocking)
+        local_cur = cur
+        for i, issue_id in enumerate(ordered):
+            if issue_id in tiebreak_decided:
+                continue  # decided on a prior resume -- do not re-adjudicate
             r_issue = reviewer_issues.get(issue_id)
             d_resp = doer_rejections.get(issue_id)
             if r_issue is None or d_resp is None:
@@ -2373,6 +2405,11 @@ class Orchestrator:
                     f"reviewer_issue={r_issue is not None}, "
                     f"doer_rejection={d_resp is not None}"
                 )
+            # HEAD write BEFORE this concern's adjudication, persisting the
+            # progress (concerns 0..i-1) + the backoff attempt for a resume here.
+            attempt = (local_cur.attempt + 1
+                       if self._is_failed_step(local_cur, Phase.TIEBREAK, i) else 0)
+            checkpoint_fn(i, attempt)
             reviewer_arg = (
                 f"{r_issue.issue}\n\nSuggested fix: {r_issue.suggested_fix}"
             )
@@ -2388,29 +2425,31 @@ class Orchestrator:
             else:
                 arg_a, arg_b = doer_arg, reviewer_arg
                 role_of_a, role_of_b = "doer", "reviewer"
-            # A timeout is no signal on THIS issue: it stays contested and
-            # escalates to human (ESCALATED_DISAGREEMENT) -- the human is the
-            # correct fallback for a specific unadjudicated dispute -- so the
-            # timeout hook returns a sentinel to continue the loop rather than
-            # raising like the reviewer/doer boundaries do. An ERRORED tiebreaker
-            # (unauthenticated / missing binary) is a DIFFERENT signal: the
-            # adjudicator itself is unavailable, so not-ok escalates as
-            # no-signal, and a malformed reply (prose / schema mismatch)
-            # escalates the whole run the same way -- both via the shared
-            # ModelUnavailable raise, NOT the timeout branch. See _call_and_parse
-            # for the narrow (ValueError, RecursionError) parse catch.
-            tb = await self._call_and_parse(
-                step="tiebreaker:adjudicate", role="tiebreaker",
-                msg_type="tiebreak",
-                call=lambda note: self.tiebreaker.adjudicate(
-                    spec, acceptance, diff, issue_id, arg_a, arg_b,
-                    retry_note=note),
-                parse=_parse_tiebreak,
-                timeout=self.cfg.timeouts.resolve_doer_timeout("tiebreaker:adjudicate"),
-                on_timeout=_raise_tiebreak_timeout(issue_id),
-                schema=_tiebreak_schema(issue_id),
-                not_ok_detail="tiebreaker call errored",
-                malformed_prefix="tiebreaker returned malformed response: ")
+            # A timeout is a CHANNEL failure, NOT a disagreement (§2.2 ruling):
+            # on_timeout raises a resumable TimeoutEscalation (via
+            # _raise_tiebreak_timeout) so the run resumes at TIEBREAK and this
+            # concern is re-adjudicated -- never swallowed into ESCALATED_
+            # DISAGREEMENT. An ERRORED tiebreaker (unauthenticated / missing
+            # binary) or a malformed reply escalates via the shared ModelUnavailable
+            # raise. The adjudication runs under _run_step so §2.4 backoff applies
+            # to a resumed failed concern (local_cur), then clears for the rest.
+            tb = await self._run_step(
+                local_cur, Phase.TIEBREAK, i,
+                lambda: self._call_and_parse(
+                    step="tiebreaker:adjudicate", role="tiebreaker",
+                    msg_type="tiebreak",
+                    call=lambda note: self.tiebreaker.adjudicate(
+                        spec, acceptance, diff, issue_id, arg_a, arg_b,
+                        retry_note=note),
+                    parse=_parse_tiebreak,
+                    timeout=self.cfg.timeouts.resolve_doer_timeout("tiebreaker:adjudicate"),
+                    on_timeout=_raise_tiebreak_timeout(issue_id),
+                    schema=_tiebreak_schema(issue_id),
+                    not_ok_detail="tiebreaker call errored",
+                    malformed_prefix="tiebreaker returned malformed response: "))
+            # This concern's failed-step retry (if any) is spent; subsequent
+            # concerns in THIS resume run fresh (no backoff, attempt 0).
+            local_cur = None
             if tb.sides_with == "a":
                 winning_role = role_of_a
             elif tb.sides_with == "b":
@@ -2434,11 +2473,13 @@ class Orchestrator:
                       reviewer_position=reviewer_arg,
                       tb_reasoning=tb.reasoning)
             # 2-of-3: reviewer + tiebreaker agree it blocks -> stays blocking;
-            # doer + tiebreaker agree -> resolved; unclear -> escalate.
-            if winning_role in ("reviewer", "unclear"):
-                still_blocking.add(issue_id)
-            # "doer" -> resolved, drops out
-        return still_blocking
+            # doer + tiebreaker agree -> resolved; unclear -> escalate. Record the
+            # per-concern outcome in tiebreak_decided (persisted by the NEXT
+            # concern's head-write / the loop's DONE write) so a resume skips it.
+            tiebreak_decided[issue_id] = winning_role in ("reviewer", "unclear")
+        # still_blocking = every concern (decided this run OR on a prior resume)
+        # whose adjudication left it blocking.
+        return {iid for iid in ordered if tiebreak_decided.get(iid, False)}
 
     # --- class-closure sweep (advisory; runs only after a run PASSED) ---
 

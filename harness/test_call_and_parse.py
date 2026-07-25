@@ -129,8 +129,10 @@ async def _invoke_doer(orch):
 
 
 async def _invoke_tiebreak(orch):
-    return await orch._tiebreak("spec", "acc", "diff", {"I1"},
-                               _VERDICT, _REJECTED, 1)
+    # §2.2 signature: cur (None = fresh), ..., tiebreak_decided (fresh {}),
+    # checkpoint_fn (no-op -- these unit tests don't exercise resume).
+    return await orch._tiebreak(None, "spec", "acc", "diff", {"I1"},
+                                _VERDICT, _REJECTED, 1, {}, lambda i, a: None)
 
 
 _ESCALATING = [
