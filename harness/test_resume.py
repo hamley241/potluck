@@ -589,14 +589,17 @@ async def main() -> bool:
         _PRIOR["apply_fixes"] & set(d["resume_calls"]))
     results["apply_fixes_resumes_to_pass"] = (d["outcome2"] == Outcome.PASSED)
 
-    # ===== codex round-10 BLOCKING: identity must be BOUND to the tree ==========
-    # load_and_verify recomputes the identity from ckpt.TREE's fields, so a tamper
-    # that swaps ckpt.tree for another internally-valid snapshot (leaving identity
-    # untouched) is REFUSED -- restore never trusts an unbound tree.
+    # ===== codex round-10/11 BLOCKING: identity binds the WHOLE tree ============
+    # load_and_verify recomputes the identity from ckpt.TREE via a binding digest
+    # over ALL of (base, work-oid, INDEX-oid, content-digest), so a tamper that
+    # swaps ANY field of ckpt.tree for another internally-valid value (leaving
+    # identity untouched) is REFUSED -- restore never trusts an unbound field.
     from harness.schemas import (
         RunCheckpoint, ExecCursor, CheckpointIdentity, CHECKPOINT_SCHEMA_VERSION,
     )
-    from harness.checkpoint import build_identity, CheckpointError
+    from harness.checkpoint import (
+        build_identity, CheckpointError, _snapshot_binding_digest,
+    )
 
     def _refuses_cp(fn):
         try:
@@ -605,33 +608,44 @@ async def main() -> bool:
         except CheckpointError:
             return True
 
-    def _mk(base, digest, ident_base, ident_digest):
-        ident = build_identity("s", "a", "cfg", ident_base, ident_digest, "m")
+    def _ckpt_bound_to(honest, actual):
+        """Identity is built (bound) against `honest`; the stored ckpt.tree is
+        `actual`. honest==actual is a legitimate checkpoint; a mismatch is tamper."""
+        ident = build_identity("s", "a", "cfg", honest.repo_base_commit,
+                               _snapshot_binding_digest(honest), "m")
         return RunCheckpoint(
-            cursor=ExecCursor(phase=Phase.IMPLEMENT), rounds_used=0, identity=ident,
-            tree=TreeSnapshot(repo_base_commit=base, work_tree_oid="w",
-                              index_tree_oid="i", tree_snapshot_digest=digest))
+            cursor=ExecCursor(phase=Phase.IMPLEMENT), rounds_used=0,
+            identity=ident, tree=actual)
+
+    def _snap(base="baseX", work="w", index="i", digest="digX"):
+        return TreeSnapshot(repo_base_commit=base, work_tree_oid=work,
+                            index_tree_oid=index, tree_snapshot_digest=digest)
 
     class _OneStore:
         def __init__(self, ckpt): self._c = ckpt
         def load(self): return self._c
 
-    # Matched: identity's tree fields == ckpt.tree's -> verifies.
-    good = _mk("baseX", "digX", "baseX", "digX")
-    ok_bound = True
-    try:
-        Checkpointer(_OneStore(good), "s", "a", "cfg", "m").load_and_verify()
-    except CheckpointError:
-        ok_bound = False
-    results["tree_bound_identity_verifies"] = ok_bound
-    # Tampered tree.repo_base_commit (identity still says baseX) -> REFUSED.
-    tamper_base = _mk("baseEVIL", "digX", "baseX", "digX")
-    results["tampered_tree_base_refuses"] = _refuses_cp(
-        lambda: Checkpointer(_OneStore(tamper_base), "s", "a", "cfg", "m").load_and_verify())
-    # Tampered tree.tree_snapshot_digest -> REFUSED.
-    tamper_dig = _mk("baseX", "digEVIL", "baseX", "digX")
-    results["tampered_tree_digest_refuses"] = _refuses_cp(
-        lambda: Checkpointer(_OneStore(tamper_dig), "s", "a", "cfg", "m").load_and_verify())
+    def _verifies(ckpt):
+        try:
+            Checkpointer(_OneStore(ckpt), "s", "a", "cfg", "m").load_and_verify()
+            return True
+        except CheckpointError:
+            return False
+
+    honest = _snap()
+    # Legitimate: identity bound to the same snapshot that is stored -> verifies.
+    results["tree_bound_identity_verifies"] = _verifies(
+        _ckpt_bound_to(honest, honest))
+    # Each field tampered independently (identity bound to `honest`) -> REFUSED.
+    results["tampered_tree_base_refuses"] = not _verifies(
+        _ckpt_bound_to(honest, _snap(base="baseEVIL")))
+    results["tampered_tree_work_oid_refuses"] = not _verifies(
+        _ckpt_bound_to(honest, _snap(work="wEVIL")))
+    # round-11: the previously-UNBOUND field -- a swapped real-index tree.
+    results["tampered_tree_index_oid_refuses"] = not _verifies(
+        _ckpt_bound_to(honest, _snap(index="iEVIL")))
+    results["tampered_tree_digest_refuses"] = not _verifies(
+        _ckpt_bound_to(honest, _snap(digest="digEVIL")))
 
     ok_all = True
     for name, passed in results.items():

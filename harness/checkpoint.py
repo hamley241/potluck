@@ -204,6 +204,23 @@ def _tree_digest(repo: Path, tree_oid: str) -> str:
     return hashlib.sha256(listing).hexdigest()
 
 
+def _snapshot_binding_digest(tree: TreeSnapshot) -> str:
+    """A single fingerprint over the WHOLE TreeSnapshot -- base commit, working-tree
+    oid, INDEX-tree oid, and the content digest -- so the identity binds every field
+    restore will act on, not just the working-tree content (codex round-11 BLOCKING).
+
+    tree_snapshot_digest alone covers only work_tree_oid, so binding it left
+    index_tree_oid unbound: a tamperer could swap the real-index tree for another
+    valid OID, pass identity verification, and make resume install a staged state
+    different from the checkpointed run. Hashing all four fields closes that gap.
+    NUL-delimited so no field boundary can be forged by concatenation."""
+    payload = "\0".join([
+        tree.repo_base_commit, tree.work_tree_oid,
+        tree.index_tree_oid, tree.tree_snapshot_digest,
+    ]).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 # --- restore -----------------------------------------------------------------
 
 def restore_tree(repo: Path, tree: TreeSnapshot) -> None:
@@ -510,7 +527,7 @@ class Checkpointer:
         tree = self.store.snapshot()
         identity = build_identity(
             self.spec, self.acceptance, self.config_digest,
-            tree.repo_base_commit, tree.tree_snapshot_digest, self.manifest_id)
+            tree.repo_base_commit, _snapshot_binding_digest(tree), self.manifest_id)
         self._last = RunCheckpoint(
             cursor=cursor, rounds_used=rounds_used, calls_dispatched=calls_dispatched,
             identity=identity, tree=tree, state=state)
@@ -541,19 +558,21 @@ class Checkpointer:
         tree's recomputed write-tree + digest must equal work_tree_oid + the
         snapshot digest (dual verify).
 
-        codex round-10 (BLOCKING fold): but restore trusts ckpt.tree, while the
+        codex round-10/11 (BLOCKING folds): but restore trusts ckpt.tree, while the
         identity carries its OWN copies of the tree commitments -- so the identity
         must be BOUND to the tree it will restore, or a tamperer could swap
-        ckpt.tree for another internally-valid snapshot (leaving identity
-        untouched) and slip it past verification. We recompute the identity from
-        ckpt.TREE's fields (not ckpt.identity's), so verify_identity refuses unless
-        ckpt.identity.{repo_base_commit,tree_snapshot_digest} equal the snapshot's
-        -- the tree-to-identity binding is checked HERE, its absolute correctness at
-        restore."""
+        ckpt.tree for another internally-valid snapshot (leaving identity untouched)
+        and slip it past verification. We recompute the identity from ckpt.TREE via
+        _snapshot_binding_digest -- a fingerprint over the WHOLE snapshot (base,
+        work-oid, index-oid, content-digest), not just the working-tree content --
+        so verify_identity refuses unless every field restore will act on matches,
+        INCLUDING index_tree_oid (round-11: binding the content digest alone left
+        the real-index tree unbound). Tree-to-identity binding is checked HERE, its
+        absolute content correctness at restore."""
         ckpt = self.store.load()
         recomputed = build_identity(
             self.spec, self.acceptance, self.config_digest,
-            ckpt.tree.repo_base_commit, ckpt.tree.tree_snapshot_digest,
+            ckpt.tree.repo_base_commit, _snapshot_binding_digest(ckpt.tree),
             self.manifest_id)
         verify_identity(ckpt.identity, recomputed)
         return ckpt
