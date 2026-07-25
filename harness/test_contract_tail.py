@@ -297,6 +297,34 @@ async def test_no_behaviour_change(check) -> None:
     check("clean_review_still_passes", r.outcome == Outcome.PASSED)
 
 
+async def test_implement_prompt_undershoot_steering(check) -> None:
+    """§4b: the potluck doer:implement prompt states the smallest-sufficient-diff
+    discipline (Ruling B) -- satisfy the spec AND the acceptance, no speculative
+    abstraction, no unrequested surface. Capless prompt discipline, no enforcement.
+    Captured off the real RealDoerClient.implement path (run_subprocess stubbed)."""
+    cap: dict = {}
+
+    async def fake_run(cmd, stdin_text=None):
+        cap["prompt"] = stdin_text
+        return "done"
+
+    real = orch.run_subprocess
+    orch.run_subprocess = fake_run
+    try:
+        await RealDoerClient(claude_cmd="unused").implement("the spec", "the acc")
+    finally:
+        orch.run_subprocess = real
+    p = cap["prompt"]
+    check("implement_prompt_smallest_sufficient", "SMALLEST SUFFICIENT" in p)
+    check("implement_prompt_satisfies_spec_and_acceptance",
+          "spec AND " in p and "acceptance" in p)
+    check("implement_prompt_no_speculative",
+          "no speculative abstraction" in p and "no " in p and "unrequested" in p)
+    # It still carries the spec + acceptance content it always did.
+    check("implement_prompt_carries_spec_acc",
+          "the spec" in p and "the acc" in p)
+
+
 async def main() -> bool:
     ok = True
 
@@ -310,6 +338,7 @@ async def main() -> bool:
     await test_schema_reuse_and_injection(check)
     await test_payload_captured_and_bounded(check)
     await test_no_behaviour_change(check)
+    await test_implement_prompt_undershoot_steering(check)
     print("\nALL PASS" if ok else "\nSOME FAILED")
     return ok
 

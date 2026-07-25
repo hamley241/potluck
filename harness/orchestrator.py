@@ -1234,6 +1234,13 @@ class RealDoerClient(DoerClient):
             f"Implement the following change.\n\n"
             f"SPEC:\n{spec}\n\n"
             f"ACCEPTANCE CRITERIA:\n{acceptance}\n\n"
+            # §4b undershoot steering (Ruling B): the target is the SMALLEST
+            # SUFFICIENT diff that satisfies the SPEC and the ACCEPTANCE criteria
+            # -- not merely a gate-green diff, which may be incomplete. This is a
+            # prompt DISCIPLINE, not a machine-enforced size guarantee.
+            f"Make the SMALLEST SUFFICIENT change that satisfies the spec AND "
+            f"the acceptance criteria: no speculative abstraction, no "
+            f"unrequested surface, no refactoring beyond what the change needs. "
             f"Make the change now."
         )
         return await run_subprocess(
