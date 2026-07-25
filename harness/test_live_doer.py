@@ -70,7 +70,10 @@ def _diff_scope(root: str) -> str:
 
 
 async def main() -> bool:
-    if not os.environ.get(_LIVE_ENV):
+    # Enable ONLY on the exact opt-in value "1" (codex §5 MAJOR): `not .get(...)`
+    # would treat POTLUCK_LIVE=0 -- set to DOCUMENT that live tests are off -- as
+    # enabled and fire a billable call. The spec is POTLUCK_LIVE=1.
+    if os.environ.get(_LIVE_ENV) != "1":
         print(f"  [SKIP] potluck live-doer smoke ({_STEP}) -- set {_LIVE_ENV}=1 to run")
         print("\nALL PASS")
         return True
