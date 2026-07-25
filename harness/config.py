@@ -352,6 +352,15 @@ class HarnessConfig:
             raise ValueError(
                 f"call_budget.per_round_call_budget must be a non-negative int, "
                 f"got {cb.per_round_call_budget!r}")
+        # max_rounds bounds N_max (codex round-10 MINOR): a negative value makes
+        # N_max -- and therefore outer_min -- NEGATIVE, which would sail past the
+        # `feature_seconds >= outer_min` check below (any positive >= a negative)
+        # and then refuse the very first call under a nonsensical budget. Refuse the
+        # unrepresentable value at its source, not its symptom.
+        if not isinstance(self.debate.max_rounds, int) or self.debate.max_rounds < 0:
+            raise ValueError(
+                f"debate.max_rounds must be a non-negative int, got "
+                f"{self.debate.max_rounds!r}")
         # The --doer-timeout override, when set, is the effective bound for EVERY
         # doer step (§1.1), so it MUST participate in the outer-bound check --
         # this is what makes re-validation after the CLI override meaningful

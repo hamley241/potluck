@@ -175,6 +175,27 @@ def main() -> bool:
         results["restore_refuses_dirty"] = _refuses(
             lambda: ck.restore_tree(root, snap))
 
+    # ===== T3b (codex round-10 MAJOR): ignored file present -> restore REFUSES =
+    # `status --porcelain` calls the tree clean, but restore's `clean -fdx` would
+    # DELETE the ignored file -- so a post-timeout edit to an ignored path must be
+    # refused, not silently destroyed.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "repo"
+        root.mkdir()
+        snap = _build_base_and_midrun(root)
+        _git(["reset", "--hard", "-q", snap.repo_base_commit], root)
+        _git(["clean", "-fdxq"], root)               # pristine base
+        # ignored.txt is ignored by the base .gitignore; write live post-timeout
+        # work into it. `status --porcelain` stays empty, but restore must refuse.
+        (root / "ignored.txt").write_text("LIVE=post-timeout-work\n")
+        clean_status = _git(["status", "--porcelain"], root).decode().strip()
+        results["ignored_leaves_status_clean"] = (clean_status == "")
+        results["restore_refuses_ignored_present"] = _refuses(
+            lambda: ck.restore_tree(root, snap))
+        # ...and the live ignored work is intact (not clobbered).
+        results["ignored_work_preserved_on_refusal"] = (
+            (root / "ignored.txt").read_text() == "LIVE=post-timeout-work\n")
+
     # ================= T3b: submodule / nested .git REFUSES at checkpoint =
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "repo"

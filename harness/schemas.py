@@ -185,7 +185,10 @@ class RunCheckpoint(BaseModel):
     # across resumes and restored into the BudgetedStepRunner so repeated resumes
     # cannot each admit a fresh N_max and evade the total-call bound (codex round-1
     # MAJOR): the counter is per-logical-run, not per-process.
-    calls_dispatched: int = 0
+    # ge=0 (codex round-10 MAJOR): a corrupted checkpoint with a NEGATIVE count
+    # would let the resumed run dispatch N_max+1 calls before refusal, breaking the
+    # `<= N_max` premise under outer_min = C_max x N_max. Refuse it at parse.
+    calls_dispatched: int = Field(default=0, ge=0)
     tree: TreeSnapshot | None = None            # potluck only (§2.3)
     state: dict = Field(default_factory=dict)   # serialized debate-position locals
 

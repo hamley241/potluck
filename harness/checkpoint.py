@@ -237,6 +237,21 @@ def restore_tree(repo: Path, tree: TreeSnapshot) -> None:
             "restore refused: the working tree is not clean at the base commit "
             "(refusing to overwrite uncommitted work)"
         )
+    # codex round-10 (MAJOR fold): `status --porcelain` above omits ignored files,
+    # but step (2)'s `clean -fdx` DELETES them -- so a post-timeout edit to an
+    # ignored path (e.g. a `.env`) would pass the "clean" gate and then be silently
+    # destroyed on restore, breaking §2.3's "nothing uncommitted is lost". Refuse
+    # if any ignored file is present (`clean -fdX --dry-run`, capital X = ignored
+    # only). The snapshot's own ignored blobs are re-materialised in step (3), so a
+    # pristine resume tree loses nothing; a tree carrying live ignored work is
+    # refused, not clobbered. (Mock phase-1 repos carry none, per obs-017.)
+    ign = _git(["clean", "-fdX", "--dry-run"], repo)
+    if ign.stdout.strip():
+        raise CheckpointError(
+            "restore refused: ignored files are present that `clean -fdx` would "
+            "delete during restore (refusing to destroy uncommitted ignored work "
+            "-- remove them explicitly to resume)"
+        )
     _git(["reset", "--hard", "--quiet", tree.repo_base_commit], repo)
 
     # (2) Empty the working tree WITHOUT touching the real index. `ls-files -z`
@@ -519,17 +534,26 @@ class Checkpointer:
         overclaimed): the RUN-LEVEL commitments -- criteria, input doc, effective
         config, manifest id -- are genuinely RECOMPUTED here from the resuming
         process's inputs, so a mutated spec/acceptance/config refuses. The
-        potluck TREE commitments (repo_base_commit + tree_snapshot_digest) are NOT
-        re-derived here (that would be comparing the checkpoint to a copy of
-        itself); they are enforced downstream by restore_tree's own fail-closed
-        checks -- HEAD must equal repo_base_commit, and the materialised tree's
-        recomputed write-tree + digest must equal work_tree_oid + the snapshot
-        digest (dual verify). So the tree binding IS verified, just at restore,
-        not here."""
+        potluck TREE commitments (repo_base_commit + tree_snapshot_digest) are not
+        re-derived from the repo here (that would be comparing the checkpoint to a
+        copy of itself); their VALUES are enforced downstream by restore_tree's own
+        fail-closed checks -- HEAD must equal repo_base_commit, and the materialised
+        tree's recomputed write-tree + digest must equal work_tree_oid + the
+        snapshot digest (dual verify).
+
+        codex round-10 (BLOCKING fold): but restore trusts ckpt.tree, while the
+        identity carries its OWN copies of the tree commitments -- so the identity
+        must be BOUND to the tree it will restore, or a tamperer could swap
+        ckpt.tree for another internally-valid snapshot (leaving identity
+        untouched) and slip it past verification. We recompute the identity from
+        ckpt.TREE's fields (not ckpt.identity's), so verify_identity refuses unless
+        ckpt.identity.{repo_base_commit,tree_snapshot_digest} equal the snapshot's
+        -- the tree-to-identity binding is checked HERE, its absolute correctness at
+        restore."""
         ckpt = self.store.load()
         recomputed = build_identity(
             self.spec, self.acceptance, self.config_digest,
-            ckpt.identity.repo_base_commit, ckpt.identity.tree_snapshot_digest,
+            ckpt.tree.repo_base_commit, ckpt.tree.tree_snapshot_digest,
             self.manifest_id)
         verify_identity(ckpt.identity, recomputed)
         return ckpt

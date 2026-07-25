@@ -226,6 +226,8 @@ class BudgetedStepRunner(StepRunner):
         """Seed the admission counter on resume from the checkpointed cumulative
         count (§1.3), so the budget spans the whole LOGICAL run, not one process
         (codex round-1 MAJOR)."""
+        if n < 0:  # codex round-10 MAJOR: defense-in-depth behind schema ge=0
+            raise ValueError(f"restore_count refused: negative count {n}")
         self._calls_dispatched = n
 
     async def run(self, step_name, coro_factory, timeout_seconds):

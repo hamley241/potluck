@@ -589,6 +589,50 @@ async def main() -> bool:
         _PRIOR["apply_fixes"] & set(d["resume_calls"]))
     results["apply_fixes_resumes_to_pass"] = (d["outcome2"] == Outcome.PASSED)
 
+    # ===== codex round-10 BLOCKING: identity must be BOUND to the tree ==========
+    # load_and_verify recomputes the identity from ckpt.TREE's fields, so a tamper
+    # that swaps ckpt.tree for another internally-valid snapshot (leaving identity
+    # untouched) is REFUSED -- restore never trusts an unbound tree.
+    from harness.schemas import (
+        RunCheckpoint, ExecCursor, CheckpointIdentity, CHECKPOINT_SCHEMA_VERSION,
+    )
+    from harness.checkpoint import build_identity, CheckpointError
+
+    def _refuses_cp(fn):
+        try:
+            fn()
+            return False
+        except CheckpointError:
+            return True
+
+    def _mk(base, digest, ident_base, ident_digest):
+        ident = build_identity("s", "a", "cfg", ident_base, ident_digest, "m")
+        return RunCheckpoint(
+            cursor=ExecCursor(phase=Phase.IMPLEMENT), rounds_used=0, identity=ident,
+            tree=TreeSnapshot(repo_base_commit=base, work_tree_oid="w",
+                              index_tree_oid="i", tree_snapshot_digest=digest))
+
+    class _OneStore:
+        def __init__(self, ckpt): self._c = ckpt
+        def load(self): return self._c
+
+    # Matched: identity's tree fields == ckpt.tree's -> verifies.
+    good = _mk("baseX", "digX", "baseX", "digX")
+    ok_bound = True
+    try:
+        Checkpointer(_OneStore(good), "s", "a", "cfg", "m").load_and_verify()
+    except CheckpointError:
+        ok_bound = False
+    results["tree_bound_identity_verifies"] = ok_bound
+    # Tampered tree.repo_base_commit (identity still says baseX) -> REFUSED.
+    tamper_base = _mk("baseEVIL", "digX", "baseX", "digX")
+    results["tampered_tree_base_refuses"] = _refuses_cp(
+        lambda: Checkpointer(_OneStore(tamper_base), "s", "a", "cfg", "m").load_and_verify())
+    # Tampered tree.tree_snapshot_digest -> REFUSED.
+    tamper_dig = _mk("baseX", "digEVIL", "baseX", "digX")
+    results["tampered_tree_digest_refuses"] = _refuses_cp(
+        lambda: Checkpointer(_OneStore(tamper_dig), "s", "a", "cfg", "m").load_and_verify())
+
     ok_all = True
     for name, passed in results.items():
         ok_all = ok_all and passed

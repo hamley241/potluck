@@ -136,6 +136,36 @@ async def main() -> bool:
     except ValueError:
         z_ref = True
     results["zero_feature_seconds_refused"] = z_ref
+    # codex round-10 MINOR: a NEGATIVE max_rounds makes N_max/outer_min negative,
+    # which would sail past `feature_seconds >= outer_min`. Refuse at source.
+    neg_mr = HarnessConfig()
+    neg_mr.debate.max_rounds = -100
+    nmr_ref = False
+    try:
+        neg_mr.validate()
+    except ValueError:
+        nmr_ref = True
+    results["negative_max_rounds_refuses"] = nmr_ref
+    # codex round-10 MAJOR: a NEGATIVE calls_dispatched in a checkpoint would let a
+    # resumed run dispatch N_max+1 calls -- refused at PARSE (schema ge=0).
+    from harness.schemas import (
+        RunCheckpoint, ExecCursor, Phase, CheckpointIdentity, TreeSnapshot,
+        CHECKPOINT_SCHEMA_VERSION,
+    )
+    _ident = CheckpointIdentity(
+        schema_version=CHECKPOINT_SCHEMA_VERSION, criteria_content_hash="c",
+        input_document_digest="d", effective_config_digest="e",
+        run_manifest_id="m", repo_base_commit="base", tree_snapshot_digest="td")
+    _tree = TreeSnapshot(repo_base_commit="base", work_tree_oid="w",
+                         index_tree_oid="i", tree_snapshot_digest="td")
+    parse_refused = False
+    try:
+        RunCheckpoint(cursor=ExecCursor(phase=Phase.IMPLEMENT), rounds_used=0,
+                      identity=_ident, tree=_tree, calls_dispatched=-1)
+    except Exception:
+        parse_refused = True
+    results["negative_calls_dispatched_refused_at_parse"] = parse_refused
+
     # A non-positive fixed budget and a negative per-round budget refuse.
     for fld, val in [("fixed_call_budget", 0), ("per_round_call_budget", -1)]:
         c2 = HarnessConfig()
