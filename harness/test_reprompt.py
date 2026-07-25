@@ -284,7 +284,7 @@ async def _run_doer(orch):
 async def _run_tiebreak(orch):
     # §2.2 signature: cur (None = fresh), ..., tiebreak_decided ({}), checkpoint_fn.
     return await orch._tiebreak(None, "spec", "acc", "diff", {"I1"},
-                                _VERDICT, _REJECTED, 1, {}, lambda i, a: None)
+                                _VERDICT, _REJECTED, 1, {}, lambda i, a, post=False: None)
 
 
 async def _run_closure(orch):

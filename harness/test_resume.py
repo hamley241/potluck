@@ -511,6 +511,23 @@ async def main() -> bool:
     await o2.run_feature("s", "a", resume=ck)
     results["major2_resume_only_readjudicates_C2"] = (tb2.asked == ["C2"])
     results["major2_resume_skips_decided_C1"] = ("C1" not in tb2.asked)
+    # codex round-2 BLOCKING: resume from C1's POST write (crash after C1 decided,
+    # BEFORE C2's head write) must still skip C1 -- the per-concern post write
+    # persisted C1's decision, so it is not re-adjudicated / discarded.
+    c1_post = [w for w in store.written
+               if w.cursor.phase == Phase.TIEBREAK
+               and not w.cursor.completed
+               and w.cursor.failed_step is None
+               and w.state.get("tiebreak_decided", {}).get("C1")
+               and "C2" not in w.state.get("tiebreak_decided", {})]
+    results["major2_c1_post_write_exists"] = (len(c1_post) >= 1)
+    tb3 = TBRec(cfg, fail_on=None)
+    o3 = Orchestrator(cfg, RecDoer({"C1": "reject", "C2": "reject"}, [], DiffState()),
+                      RecReviewer(cfg, two, [], followups=[two]), tb3, gate_ok2,
+                      diff2, ab_swap=lambda _id: False,
+                      checkpointer=_checkpointer(store))
+    await o3.run_feature("s", "a", resume=c1_post[0])
+    results["major2_resume_from_post_skips_C1"] = (tb3.asked == ["C2"])
 
     # (e) integration: real git-backed store through a full resume.
     g = await _git_integration()

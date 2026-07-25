@@ -132,7 +132,7 @@ async def _invoke_tiebreak(orch):
     # §2.2 signature: cur (None = fresh), ..., tiebreak_decided (fresh {}),
     # checkpoint_fn (no-op -- these unit tests don't exercise resume).
     return await orch._tiebreak(None, "spec", "acc", "diff", {"I1"},
-                                _VERDICT, _REJECTED, 1, {}, lambda i, a: None)
+                                _VERDICT, _REJECTED, 1, {}, lambda i, a, post=False: None)
 
 
 _ESCALATING = [
@@ -163,10 +163,11 @@ _ESCALATING = [
                                           "reasoning": "ok"}]}),
          happy_check=lambda r: isinstance(r, DoerResponse)
          and [x.id for x in r.responses] == ["I1"]),
-    # _tiebreak's TIMEOUT does NOT raise -- it leaves the issue contested and
-    # returns it still blocking. not-ok and malformed DO raise, like the others.
+    # _tiebreak's TIMEOUT now RAISES a resumable TimeoutEscalation (§2.2 + ruling
+    # -- a channel timeout is not a disagreement); asserted separately above.
+    # not-ok and malformed DO raise, like the others.
     dict(name="tiebreak", step="tiebreaker:adjudicate", role="tiebreaker",
-         tpat=None, tdetail=None,           # timeout handled specially below
+         tpat=None, tdetail=None,           # timeout handled specially above
          notok="tiebreaker call errored",
          prefix="tiebreaker returned malformed response: ",
          parser=_parse_tiebreak, invoke=_invoke_tiebreak,

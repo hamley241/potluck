@@ -128,7 +128,7 @@ def _phase_key(phase: "Phase", round_index: int = 0) -> tuple:
         Phase.REVIEW: (2, 0, 0),
         Phase.ROUND_RESPOND: (3, round_index, 0),
         Phase.ROUND_FOLLOWUP: (3, round_index, 1),
-        Phase.TIEBREAK: (4, 0, 0),
+        Phase.TIEBREAK: (4, round_index, 0),  # per-concern position (§2.2 MAJOR-2)
         Phase.APPLY_FIXES: (5, 0, 0),
         Phase.GATE_FINAL: (6, 0, 0),
         Phase.DONE: (7, 0, 0),
@@ -1490,13 +1490,20 @@ class Orchestrator:
         crash after it resume PAST it. No-op without a checkpointer."""
         if self._checkpointer is None:
             return
+        # Count the IN-FLIGHT call a HEAD write precedes (codex round-2 MAJOR):
+        # a HEAD write (failed_step set) is written BEFORE the admission
+        # increment, so persist count + 1 to include the call about to dispatch --
+        # otherwise a timed-out attempt is never counted and resume re-admits it
+        # at the same number, letting cumulative dispatches exceed N_max. DONE /
+        # post writes (failed_step None) run AFTER the call incremented -> +0.
+        pending = 1 if failed_step is not None else 0
         self._checkpointer.write(
             ExecCursor(station="potluck", phase=phase, round_index=round_index,
                        failed_step=failed_step, attempt=attempt, completed=completed),
             state.rounds_used,
             _serialize_debate(diff, verdict, accepted, unresolved, response,
                               tiebreak_decided=tiebreak_decided),
-            calls_dispatched=self.runner.calls_dispatched)
+            calls_dispatched=self.runner.calls_dispatched + pending)
 
     async def _run_step(self, cur, phase, round_index, coro_factory):
         """Run a resumable call, applying §2.4 backoff ONLY when this is the
@@ -1666,12 +1673,16 @@ class Orchestrator:
                        accepted_issues_by_id, unresolved, response, completed=True,
                        tiebreak_decided=tiebreak_decided)
 
-        def _tb_ckpt(i, attempt):
-            # Per-concern HEAD write for the tiebreak (§2.2 MAJOR-2): persists the
-            # tiebreak_decided progress (concerns 0..i-1) BEFORE adjudicating
-            # concern i, so a timeout there resumes into TIEBREAK skipping the
-            # already-decided concerns rather than re-adjudicating them.
-            self._ckpt(Phase.TIEBREAK, i, "tiebreaker:adjudicate", state, diff,
+        def _tb_ckpt(i, attempt, post=False):
+            # Per-concern tiebreak checkpoint (§2.2 MAJOR-2). HEAD (post=False,
+            # before concern i's call, failed_step set): persists progress
+            # 0..i-1 so a timeout resumes at concern i. POST (post=True, after
+            # concern i is decided, failed_step None): persists progress INCLUDING
+            # i so a CRASH after i resumes skipping it -- else i is re-adjudicated
+            # and, if it was the resumed retry, discarded by the exhausted attempt
+            # count (codex round-2 BLOCKING). attempt resets to 0 on the post write.
+            self._ckpt(Phase.TIEBREAK, i,
+                       None if post else "tiebreaker:adjudicate", state, diff,
                        verdict, accepted_issues_by_id, unresolved, response,
                        attempt=attempt, tiebreak_decided=tiebreak_decided)
 
@@ -1823,9 +1834,17 @@ class Orchestrator:
 
         # 6. Resolve any remaining deadlock. The tiebreak checkpoints PER CONCERN
         #    and skips already-adjudicated ones on resume (§2.2 MAJOR-2), so it
-        #    manages its own per-concern head-writes/backoff rather than riding a
-        #    single _run_step over the whole loop.
-        if unresolved and self._should_run(cur, Phase.TIEBREAK):
+        #    manages its own per-concern head/post writes + backoff. The block
+        #    guard can't use the round_index-0 _should_run (TIEBREAK's key now
+        #    carries the concern index): run the block iff there are unresolved
+        #    concerns and the cursor is IN the tiebreak (progress write, not the
+        #    final DONE) or strictly before APPLY_FIXES.
+        _do_tiebreak = bool(unresolved) and (
+            cur is None
+            or (not cur.completed if cur.phase == Phase.TIEBREAK
+                else _phase_key(cur.phase, cur.round_index)
+                < _phase_key(Phase.APPLY_FIXES)))
+        if _do_tiebreak:
             unresolved = await self._tiebreak(
                 cur, spec, acceptance, diff, unresolved, verdict, response,
                 state.rounds_used, tiebreak_decided, _tb_ckpt)
@@ -2473,10 +2492,12 @@ class Orchestrator:
                       reviewer_position=reviewer_arg,
                       tb_reasoning=tb.reasoning)
             # 2-of-3: reviewer + tiebreaker agree it blocks -> stays blocking;
-            # doer + tiebreaker agree -> resolved; unclear -> escalate. Record the
-            # per-concern outcome in tiebreak_decided (persisted by the NEXT
-            # concern's head-write / the loop's DONE write) so a resume skips it.
+            # doer + tiebreaker agree -> resolved; unclear -> escalate.
             tiebreak_decided[issue_id] = winning_role in ("reviewer", "unclear")
+            # POST write (codex round-2 BLOCKING): persist this concern's decision
+            # IMMEDIATELY (before the next concern) so a crash here resumes
+            # skipping it, and reset the attempt so the next concern runs fresh.
+            checkpoint_fn(i, 0, post=True)
         # still_blocking = every concern (decided this run OR on a prior resume)
         # whose adjudication left it blocking.
         return {iid for iid in ordered if tiebreak_decided.get(iid, False)}
