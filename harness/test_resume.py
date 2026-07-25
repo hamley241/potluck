@@ -325,38 +325,38 @@ async def _git_integration() -> dict:
     return out
 
 
-class CountFailDoer(DoerClient):
-    """Times out `fail_times` times on implement, then succeeds -- to exercise
-    §2.4 backoff retries on the resumed failed step."""
-    def __init__(self, fail_times, calls):
-        self.fail_times = fail_times
-        self.calls = calls
+class _CtrDoer(DoerClient):
+    """Fails on implement until the SHARED counter reaches `succeed_on` total
+    implement calls, then succeeds -- to exercise the one-attempt-per-resume §2.4
+    model (each resume makes exactly ONE attempt; the cumulative cap is 1+R)."""
+    def __init__(self, ctr, succeed_on):
+        self.ctr = ctr
+        self.succeed_on = succeed_on
     async def implement(self, spec, acceptance):
-        self.calls.append("implement")
-        if len(self.calls) <= self.fail_times:
+        self.ctr["n"] += 1
+        if self.ctr["n"] < self.succeed_on:
             raise TimeoutEscalation("doer_no_signal", "backoff test timeout")
         return "implemented"
     async def respond_to_review(self, spec, acceptance, diff, verdict, retry_note=None):
-        self.calls.append("respond")
         return DoerResponse(responses=[
-            IssueResponse(id=i.id, decision="reject", reasoning="s")
+            IssueResponse(id=i.id, decision="accept", reasoning="s")
             for i in verdict.issues])
     async def apply_fixes(self, issues, diff):
         return "applied"
 
 
-async def _backoff(fail_times):
-    """Resume at IMPLEMENT with a doer that times out `fail_times` times; §2.4
-    retries at the SAME timeout, bounded by MAX_RESUME_RETRIES (=2 here, so 3
-    attempts). Returns (outcome, implement_call_count)."""
+async def _backoff(succeed_on):
+    """Drive the fresh run + a resume LOOP (one implement attempt each, R=2 so the
+    cumulative cap is 1+R=3). `succeed_on` = the total implement-call index the
+    doer finally succeeds on (>3 => never, to test exhaustion). Returns
+    (outcome, total_implement_attempts, resumes_that_dispatched)."""
     cfg = HarnessConfig()
     cfg.debate.max_rounds = 1
     cfg.timeouts.max_resume_retries = 2
     cfg.timeouts.backoff_delay_seconds = 0     # keep the test fast
     cfg.timeouts.feature_seconds = max(cfg.outer_min(), 10_000)
     store = FakeStore()
-    blocking = {"issues": [{"id": "C1", "severity": "blocking",
-                            "issue": "iss", "suggested_fix": "fix"}]}
+    ctr = {"n": 0}
 
     async def gate_ok():
         import json
@@ -365,36 +365,72 @@ async def _backoff(fail_times):
     async def diff():
         return "diff\n+x\n"
 
-    # pass 1: create a checkpoint at IMPLEMENT (fail there once).
-    p1 = CountFailDoer(fail_times=1, calls=[])
-    rev1 = RecReviewer(cfg, blocking, [])
-    o1 = Orchestrator(cfg, p1, rev1, RecTiebreaker(cfg, {}, []), gate_ok, diff,
-                      ab_swap=lambda _id: False, checkpointer=_checkpointer(store))
-    await o1.run_feature("s", "a")
-    resume_ckpt = _checkpointer(store).load_and_verify()
+    def mk():
+        return Orchestrator(cfg, _CtrDoer(ctr, succeed_on),
+                            RecReviewer(cfg, {"issues": []}, []),
+                            RecTiebreaker(cfg, {}, []), gate_ok, diff,
+                            ab_swap=lambda _id: False,
+                            checkpointer=_checkpointer(store))
 
-    # resume: the doer times out `fail_times` times before succeeding.
-    calls = []
-    doer = CountFailDoer(fail_times=fail_times, calls=calls)
-    rev = RecReviewer(cfg, blocking, [])
-    o2 = Orchestrator(cfg, doer, rev, RecTiebreaker(cfg, {"C1": "b"}, []),
-                      gate_ok, diff, ab_swap=lambda _id: False,
-                      checkpointer=_checkpointer(store))
-    r = await o2.run_feature("s", "a", resume=resume_ckpt)
-    return r.outcome, calls.count("implement")
+    # fresh run: implement attempt #1 (fails -> checkpoint at IMPLEMENT, attempt 0).
+    outcome = (await mk().run_feature("s", "a")).outcome
+    resumes = 0
+    for _ in range(6):  # guard against non-termination
+        if outcome != Outcome.ESCALATED_TIMEOUT:
+            break
+        before = ctr["n"]
+        ck = _checkpointer(store).load_and_verify()
+        outcome = (await mk().run_feature("s", "a", resume=ck)).outcome
+        if ctr["n"] > before:
+            resumes += 1        # this resume actually dispatched an attempt
+    return outcome, ctr["n"], resumes
 
 
 async def main() -> bool:
     results = {}
 
-    # (f) §2.4 backoff: within MAX_RESUME_RETRIES the resumed step retries and
-    #     recovers; beyond it, re-escalates ESCALATED_TIMEOUT (still resumable).
-    oc_recover, n_recover = await _backoff(fail_times=2)   # 2 fails, 3rd ok
-    results["backoff_retries_within_cap"] = (n_recover == 3)
-    results["backoff_recovers"] = (oc_recover != Outcome.ESCALATED_TIMEOUT)
-    oc_exhaust, n_exhaust = await _backoff(fail_times=5)   # exceeds cap
-    results["backoff_exhausts_at_cap"] = (n_exhaust == 3)  # 1 + 2 retries
+    # (f) §2.4 backoff, one-attempt-per-resume (codex round-1 BLOCKING fix): the
+    #     failed step gets 1+R TOTAL attempts across original+resumes, never
+    #     1+R per resume. R=2 -> cap 3 total implement attempts.
+    #  recover: doer succeeds on the 3rd total attempt (original + 2 resumes).
+    oc_recover, n_recover, res_recover = await _backoff(succeed_on=3)
+    results["backoff_total_attempts_capped"] = (n_recover == 3)
+    results["backoff_recovers_at_cap"] = (oc_recover == Outcome.PASSED)
+    results["backoff_two_resumes_dispatched"] = (res_recover == 2)
+    #  exhaust: doer never succeeds -> after R resume attempts the next resume is
+    #  refused (attempt >= R) WITHOUT dispatching, total attempts stays at 1+R.
+    oc_exhaust, n_exhaust, res_exhaust = await _backoff(succeed_on=99)
+    results["backoff_exhausts_at_cap"] = (n_exhaust == 3)          # 1 original + 2 resume
     results["backoff_reescalates_timeout"] = (oc_exhaust == Outcome.ESCALATED_TIMEOUT)
+    results["backoff_no_dispatch_past_cap"] = (res_exhaust == 2)   # 3rd resume dispatched nothing
+
+    # (g) MAJOR-5 (codex round-1): the bounded-call budget is CUMULATIVE across
+    #     resumes -- calls_dispatched is checkpointed and restored, so repeated
+    #     resumes cannot each admit a fresh N_max.
+    cfg = HarnessConfig()
+    cfg.debate.max_rounds = 1
+    cfg.timeouts.feature_seconds = max(cfg.outer_min(), 10_000)
+    store = FakeStore()
+    diff_state = DiffState()
+    blocking = {"issues": [{"id": "C1", "severity": "blocking",
+                            "issue": "iss", "suggested_fix": "fix"}]}
+    # Fail at APPLY_FIXES so several calls are dispatched before the checkpoint.
+    o = _build(cfg, store, decisions={"C1": "accept"}, first=blocking,
+               calls=[], diff_state=diff_state, doer_fail="apply_fixes")
+    await o.run_feature("s", "a")
+    ck = store.written[-1]
+    results["budget_checkpointed_nonzero"] = (ck.calls_dispatched > 0)
+    # Resume: the fresh runner is seeded from the checkpointed cumulative count,
+    # not reset to 0.
+    o2 = _build(cfg, store, decisions={"C1": "accept"}, first=blocking,
+                calls=[], diff_state=diff_state)
+    o2._checkpointer.restore(ck.tree)
+    # Before running, restore_count hasn't fired yet (it fires inside _run); drive
+    # the resume and assert the final cumulative count exceeds a single phase's
+    # worth -- i.e. the pre-checkpoint calls were carried, not dropped.
+    await o2.run_feature("s", "a", resume=ck)
+    results["budget_cumulative_across_resume"] = (
+        o2.runner.calls_dispatched > ck.calls_dispatched)
 
     # (e) integration: real git-backed store through a full resume.
     g = await _git_integration()

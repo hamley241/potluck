@@ -489,13 +489,14 @@ class Checkpointer:
         self.config_digest = config_digest_value
         self.manifest_id = run_manifest_id
 
-    def write(self, cursor, rounds_used: int, state: dict) -> None:
+    def write(self, cursor, rounds_used: int, state: dict,
+              calls_dispatched: int = 0) -> None:
         tree = self.store.snapshot()
         identity = build_identity(
             self.spec, self.acceptance, self.config_digest,
             tree.repo_base_commit, tree.tree_snapshot_digest, self.manifest_id)
         self.store.write(RunCheckpoint(
-            cursor=cursor, rounds_used=rounds_used,
+            cursor=cursor, rounds_used=rounds_used, calls_dispatched=calls_dispatched,
             identity=identity, tree=tree, state=state))
 
     def load_and_verify(self) -> RunCheckpoint:

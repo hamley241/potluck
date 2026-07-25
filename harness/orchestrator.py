@@ -207,6 +207,12 @@ class BudgetedStepRunner(StepRunner):
         a real run stays `<= N_max`, so the pinned budget is not a fiction)."""
         return self._calls_dispatched
 
+    def restore_count(self, n: int) -> None:
+        """Seed the admission counter on resume from the checkpointed cumulative
+        count (§1.3), so the budget spans the whole LOGICAL run, not one process
+        (codex round-1 MAJOR)."""
+        self._calls_dispatched = n
+
     async def run(self, step_name, coro_factory, timeout_seconds):
         if self._calls_dispatched >= self._n_max:
             # Refuse BEFORE dispatch -- the (N_max+1)-th call never runs.
@@ -1464,29 +1470,39 @@ class Orchestrator:
             ExecCursor(station="potluck", phase=phase, round_index=round_index,
                        failed_step=failed_step, attempt=attempt),
             state.rounds_used,
-            _serialize_debate(diff, verdict, accepted, unresolved, response))
+            _serialize_debate(diff, verdict, accepted, unresolved, response),
+            calls_dispatched=self.runner.calls_dispatched)
 
     async def _run_step(self, cur, phase, round_index, coro_factory):
         """Run a resumable call, applying §2.4 backoff ONLY when this is the
-        resumed failed step: retry at the SAME resolved timeout, separated by
-        BACKOFF_DELAY, bounded by MAX_RESUME_RETRIES. Exhaustion re-raises the
-        TimeoutEscalation (still resumable: the checkpoint stands). A fresh run's
-        first-time timeout is NOT retried here -- it escalates and the checkpoint
-        makes it resumable, exactly the §2 contract."""
+        resumed failed step.
+
+        The retry budget is CUMULATIVE across original + all resumes, matching the
+        ratified C_max = timeout x (1+R) + delay x R (§1.1), which allows 1+R TOTAL
+        attempts and R delays. The ORIGINAL attempt (which timed out and produced
+        the checkpoint) already consumed 1 of the 1+R; `cur.attempt` counts resume
+        retries spent across PRIOR resumes. So each resume makes exactly ONE more
+        attempt (preceded by one BACKOFF_DELAY) iff the budget is not exhausted --
+        giving `1 + min(R, resumes)` total attempts and <= R delays, never the
+        old in-process `1+R`-per-resume overshoot (codex round-1 BLOCKING). A fresh
+        run's first-time timeout is NOT retried here: it escalates and the
+        attempt-incremented checkpoint makes the NEXT resume see the higher count."""
         if not self._is_failed_step(cur, phase, round_index):
             return await coro_factory()
-        attempts = 1 + self.cfg.timeouts.max_resume_retries
-        for attempt in range(attempts):
-            try:
-                return await coro_factory()
-            except TimeoutEscalation:
-                if attempt < attempts - 1:
-                    self._log("resume_backoff", phase=phase.value,
-                              attempt=attempt + 1,
-                              delay=self.cfg.timeouts.backoff_delay_seconds)
-                    await asyncio.sleep(self.cfg.timeouts.backoff_delay_seconds)
-                    continue
-                raise
+        r = self.cfg.timeouts.max_resume_retries
+        if cur.attempt >= r:
+            # Budget exhausted across resumes -> re-escalate (still resumable: a
+            # human/conductor may resume again, but no further auto-retry).
+            raise TimeoutEscalation(
+                "resume_exhausted",
+                f"'{phase.value}' exhausted its {r} resume retr"
+                f"{'y' if r == 1 else 'ies'}")
+        if self.cfg.timeouts.backoff_delay_seconds:
+            self._log("resume_backoff", phase=phase.value,
+                      attempt=cur.attempt + 1,
+                      delay=self.cfg.timeouts.backoff_delay_seconds)
+            await asyncio.sleep(self.cfg.timeouts.backoff_delay_seconds)
+        return await coro_factory()
 
     async def run_feature(self, spec: str, acceptance: str,
                           resume: "RunCheckpoint | None" = None) -> FeatureResult:
@@ -1603,6 +1619,9 @@ class Orchestrator:
             accepted_issues_by_id = d["accepted_by_id"]
             unresolved = d["unresolved"]
             state.rounds_used = resume.rounds_used
+            # Restore the CUMULATIVE bounded-call count so the §1.3 budget spans
+            # the whole logical run, not just this process (codex round-1 MAJOR).
+            self.runner.restore_count(resume.calls_dispatched)
             self._log("resume", phase=cur.phase.value,
                       round_index=cur.round_index, rounds_used=state.rounds_used)
 
