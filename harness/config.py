@@ -132,12 +132,16 @@ class CallBudget:
     `<= N_max`, so the pin is not a fiction)."""
     # fixed (non-round) bounded calls: implement, the two gates, the initial
     # get_diff + review, apply_fixes, the closure sweep + its grep, and headroom.
-    # A heavy 2-round run under the STUB/mock suite was measured at 11 total
-    # bounded calls (NOT a live-provider run -- the offline suite is deliberately
-    # model-free; a live measurement rides the §5 opt-in smoke lane). These pins
-    # (N_max = 14 + max_rounds*8 = 30 at defaults) dominate that with ~2.7x margin
-    # while still capping a runaway (a reviewer raising many deadlocked issues, or
-    # a resume-retry storm). T4b re-measures and asserts <= N_max.
+    # DECLARED GAP (obs-017; decider ruling, landing of §1+§2): these N_max pins
+    # are STUB-MEASURED, not live-run justified. A heavy 2-round run under the
+    # offline mock suite was measured at 11 total bounded calls; the pins
+    # (N_max = 14 + max_rounds*8 = 30 at defaults) dominate that with ~2.7x
+    # margin. A LIVE-provider justification is deferred to §5 (the live-doer
+    # smoke, the immediate next slice item), which closes this gap.
+    #   Blast radius (why deferral is safe): the pin can only OVER-refuse, never
+    #   under-protect -- if a real run exceeded N_max it would hit a premature but
+    #   RESUMABLE ESCALATED_CALL_BUDGET, not a silent overrun. The gap errs in the
+    #   restrictive direction. T4b re-measures (under stubs) and asserts <= N_max.
     fixed_call_budget: int = 14
     # per debate round: doer respond (1), reviewer follow-up (1), and per-issue
     # tiebreaks -- covers a worst realistic round of ~5-6 deadlocked issues.
