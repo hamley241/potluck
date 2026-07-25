@@ -135,17 +135,21 @@ class CallBudget:
     pre-dispatch (the orchestrator's BudgetedStepRunner refuses call N_max+1
     BEFORE it runs, as ESCALATED_CALL_BUDGET), so the `<= N_max` premise the outer
     bound rests on is enforced, not assumed (round-4 contract). Pinned above a
-    real 2-round run's measured bounded-call count (T4b asserts a live run stays
+    STUB 2-round run's measured bounded-call count (T4b asserts that run stays
     `<= N_max`, so the pin is not a fiction)."""
     # fixed (non-round) bounded calls: implement, the two gates, the initial
     # get_diff + review, apply_fixes, the closure sweep + its grep, and headroom.
-    # DECLARED GAP (obs-017; decider ruling, landing of §1+§2): these N_max pins
-    # are STUB-MEASURED, not live-run justified. A heavy 2-round run under the
-    # offline mock suite was measured at 11 total bounded calls; the pins
-    # (N_max = 14 + max_rounds*8 = 30 at defaults) dominate that with ~2.7x
-    # margin. A LIVE-provider justification is deferred to §5 (the live-doer
-    # smoke, the immediate next slice item), which closes this gap.
-    #   Blast radius (why deferral is safe): the pin can only OVER-refuse, never
+    # obs-017 gap (declared at the §1+§2 landing, PARTIALLY RETIRED by §5): the
+    # N_max COUNT is pinned above a STUB 2-round run measured at 11 bounded calls;
+    # the pins (N_max = 14 + max_rounds*8 = 30 at defaults) dominate with ~2.7x
+    # margin. §5's live-doer smoke (`test_live_doer.py`, POTLUCK_LIVE=1) now grounds
+    # C_max in a REAL provider call -- one live `doer:implement` completed at ~1% of
+    # its 600s ceiling with a well-formed reply and a real 1-path edit, so the
+    # per-call ceiling is no longer stub-only. What STAYS structural (honest scope,
+    # obs-025): the `<= N_max` COUNT is still a formula + a stub assertion (T4b), NOT
+    # a live full-debate call count -- one smoke call cannot exercise the multi-round
+    # path.
+    #   Blast radius (why the residual is safe): the pin can only OVER-refuse, never
     #   under-protect -- if a real run exceeded N_max it would hit a premature but
     #   RESUMABLE ESCALATED_CALL_BUDGET, not a silent overrun. The gap errs in the
     #   restrictive direction. T4b re-measures (under stubs) and asserts <= N_max.
