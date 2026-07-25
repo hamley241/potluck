@@ -431,6 +431,12 @@ async def main() -> bool:
     await o2.run_feature("s", "a", resume=ck)
     results["budget_cumulative_across_resume"] = (
         o2.runner.calls_dispatched > ck.calls_dispatched)
+    # codex round-3 MAJOR: after a timeout, the checkpoint's count is BUMPED to
+    # the ACTUAL dispatch count -- it equals the runner's count (the timed-out
+    # dispatch IS counted), not the pre-dispatch value (under-count, round-2) and
+    # not a blind +1 (over-count, round-3). o's apply_fixes timed out.
+    results["budget_bumped_to_actual_on_timeout"] = (
+        ck.calls_dispatched == o.runner.calls_dispatched)
 
     # (h) BLOCKING-2 (codex round-1): "before AND after" checkpoints. A crash
     #     AFTER a call succeeds (a DONE write, completed=True) must resume PAST

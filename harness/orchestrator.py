@@ -1490,20 +1490,18 @@ class Orchestrator:
         crash after it resume PAST it. No-op without a checkpointer."""
         if self._checkpointer is None:
             return
-        # Count the IN-FLIGHT call a HEAD write precedes (codex round-2 MAJOR):
-        # a HEAD write (failed_step set) is written BEFORE the admission
-        # increment, so persist count + 1 to include the call about to dispatch --
-        # otherwise a timed-out attempt is never counted and resume re-admits it
-        # at the same number, letting cumulative dispatches exceed N_max. DONE /
-        # post writes (failed_step None) run AFTER the call incremented -> +0.
-        pending = 1 if failed_step is not None else 0
+        # Persist the ACCURATE cumulative dispatch count (codex round-3 MAJOR: a
+        # blind +1 over-counted refused/exhausted NON-dispatches). The count is
+        # bumped to the post-dispatch value on the timeout path in _run_step
+        # (bump_calls_dispatched), so a timed-out attempt IS counted (round-2)
+        # WITHOUT counting a call that never dispatched (round-3).
         self._checkpointer.write(
             ExecCursor(station="potluck", phase=phase, round_index=round_index,
                        failed_step=failed_step, attempt=attempt, completed=completed),
             state.rounds_used,
             _serialize_debate(diff, verdict, accepted, unresolved, response,
                               tiebreak_decided=tiebreak_decided),
-            calls_dispatched=self.runner.calls_dispatched + pending)
+            calls_dispatched=self.runner.calls_dispatched)
 
     async def _run_step(self, cur, phase, round_index, coro_factory):
         """Run a resumable call, applying §2.4 backoff ONLY when this is the
@@ -1519,22 +1517,33 @@ class Orchestrator:
         old in-process `1+R`-per-resume overshoot (codex round-1 BLOCKING). A fresh
         run's first-time timeout is NOT retried here: it escalates and the
         attempt-incremented checkpoint makes the NEXT resume see the higher count."""
-        if not self._is_failed_step(cur, phase, round_index):
+        if self._is_failed_step(cur, phase, round_index):
+            r = self.cfg.timeouts.max_resume_retries
+            if cur.attempt >= r:
+                # Budget exhausted across resumes -> re-escalate (still resumable:
+                # a human/conductor may resume again, but no further auto-retry).
+                # Raised BEFORE dispatch, so no bump (the call never ran).
+                raise TimeoutEscalation(
+                    "resume_exhausted",
+                    f"'{phase.value}' exhausted its {r} resume retr"
+                    f"{'y' if r == 1 else 'ies'}")
+            if self.cfg.timeouts.backoff_delay_seconds:
+                self._log("resume_backoff", phase=phase.value,
+                          attempt=cur.attempt + 1,
+                          delay=self.cfg.timeouts.backoff_delay_seconds)
+                await asyncio.sleep(self.cfg.timeouts.backoff_delay_seconds)
+        try:
             return await coro_factory()
-        r = self.cfg.timeouts.max_resume_retries
-        if cur.attempt >= r:
-            # Budget exhausted across resumes -> re-escalate (still resumable: a
-            # human/conductor may resume again, but no further auto-retry).
-            raise TimeoutEscalation(
-                "resume_exhausted",
-                f"'{phase.value}' exhausted its {r} resume retr"
-                f"{'y' if r == 1 else 'ies'}")
-        if self.cfg.timeouts.backoff_delay_seconds:
-            self._log("resume_backoff", phase=phase.value,
-                      attempt=cur.attempt + 1,
-                      delay=self.cfg.timeouts.backoff_delay_seconds)
-            await asyncio.sleep(self.cfg.timeouts.backoff_delay_seconds)
-        return await coro_factory()
+        except TimeoutEscalation:
+            # The call DISPATCHED (the runner admitted + incremented) and timed
+            # out. Persist the now-accurate cumulative count before escalating
+            # (codex round-3) -- a refused/exhausted NON-dispatch never reaches
+            # here (CallBudgetExceeded / resume_exhausted are not TimeoutEscalation
+            # / are raised before dispatch), so the count stays honest.
+            if self._checkpointer is not None:
+                self._checkpointer.bump_calls_dispatched(
+                    self.runner.calls_dispatched)
+            raise
 
     async def run_feature(self, spec: str, acceptance: str,
                           resume: "RunCheckpoint | None" = None) -> FeatureResult:

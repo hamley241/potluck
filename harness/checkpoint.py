@@ -488,6 +488,7 @@ class Checkpointer:
         self.acceptance = acceptance
         self.config_digest = config_digest_value
         self.manifest_id = run_manifest_id
+        self._last: RunCheckpoint | None = None
 
     def write(self, cursor, rounds_used: int, state: dict,
               calls_dispatched: int = 0) -> None:
@@ -495,9 +496,20 @@ class Checkpointer:
         identity = build_identity(
             self.spec, self.acceptance, self.config_digest,
             tree.repo_base_commit, tree.tree_snapshot_digest, self.manifest_id)
-        self.store.write(RunCheckpoint(
+        self._last = RunCheckpoint(
             cursor=cursor, rounds_used=rounds_used, calls_dispatched=calls_dispatched,
-            identity=identity, tree=tree, state=state))
+            identity=identity, tree=tree, state=state)
+        self.store.write(self._last)
+
+    def bump_calls_dispatched(self, n: int) -> None:
+        """Re-write the LAST checkpoint with an updated cumulative dispatch count
+        (§1.3, codex round-3). Called on the timeout path once the dispatch has
+        actually happened (the runner incremented), so a timed-out attempt is
+        persisted -- without the head write having blindly counted a call that
+        might never dispatch."""
+        if self._last is not None and n != self._last.calls_dispatched:
+            self._last = self._last.model_copy(update={"calls_dispatched": n})
+            self.store.write(self._last)
 
     def load_and_verify(self) -> RunCheckpoint:
         """Load the checkpoint and REFUSE (fail-closed) unless the resuming run's
