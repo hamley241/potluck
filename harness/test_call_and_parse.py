@@ -250,12 +250,21 @@ async def main():
         check(f"{b['name']}: timeout detail literal",
               getattr(raised, "detail", None) == tdetail)
 
-    # _tiebreak timeout: NOT a raise. The issue stays contested (still blocking).
+    # _tiebreak timeout: RAISES a resumable TimeoutEscalation (hardening Step-0
+    # §2.2 + decider ruling). A channel timeout is NOT a disagreement, so it must
+    # never be swallowed into "still blocking" -> ESCALATED_DISAGREEMENT (a false
+    # 'reviewers could not agree' record); it escalates as ESCALATED_TIMEOUT and
+    # the run resumes at TIEBREAK.
     orch = _make()
     orch.runner = StubRunner(
         {"tiebreaker:adjudicate": StepResult(ok=False, timed_out=True, error="x")})
-    result = await _invoke_tiebreak(orch)
-    check("tiebreak: timeout keeps issue blocking (no raise)", result == {"I1"})
+    raised = None
+    try:
+        await _invoke_tiebreak(orch)
+    except TimeoutEscalation as te:
+        raised = te
+    check("tiebreak: timeout RAISES TimeoutEscalation (resumable, not swallowed)",
+          raised is not None and raised.pattern == "tiebreaker_no_signal")
 
     # --- the closure sweep: LOG-and-skip, never raises -----------------------
     # timeout -> closure_skipped(reason="model_timeout"), returns None.

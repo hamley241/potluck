@@ -136,6 +136,12 @@ class ExecCursor(BaseModel):
     round_index: int = 0            # which debate round, when phase is round-scoped
     failed_step: str | None = None  # the step that timed out (for exact retry)
     attempt: int = 0                # retry attempt count for failed_step
+    # The §2.0 "before AND after" program counter: a HEAD write (completed=False)
+    # before a call makes a timeout IN it resume AT it; a DONE write
+    # (completed=True) after it succeeds makes a crash AFTER it resume PAST it,
+    # never re-running the completed call (discarding its tree/debate work) --
+    # codex round-1 BLOCKING.
+    completed: bool = False
 
 
 class TreeSnapshot(BaseModel):

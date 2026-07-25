@@ -669,11 +669,13 @@ async def main():
         ("doer", "doer:respond", _run_doer,
          lambda: _make(doer=ScriptedDoer([_BAD])), "doer_response",
          ("raise", TimeoutEscalation), ("raise", ModelUnavailable)),
-        # tiebreak: timeout leaves the issue CONTESTED (sentinel -> {"I1"});
-        # not-ok has no override, so it escalates via the shared raise.
+        # tiebreak: timeout now RAISES a resumable TimeoutEscalation (hardening
+        # Step-0 §2.2 + decider ruling -- a channel timeout is not a disagreement,
+        # so it is never swallowed into "still contested"); not-ok escalates via
+        # the shared ModelUnavailable raise.
         ("tiebreak", "tiebreaker:adjudicate", _run_tiebreak,
          lambda: _make(tiebreaker=ScriptedTiebreaker([_BAD])), "tiebreak",
-         ("return", {"I1"}), ("raise", ModelUnavailable)),
+         ("raise", TimeoutEscalation), ("raise", ModelUnavailable)),
         # closure: BOTH timeout and not-ok log-and-skip, returning None.
         ("closure", "closure", _run_closure,
          lambda: _make(reviewer=ScriptedReviewer(closure=[_BAD])), "closure",

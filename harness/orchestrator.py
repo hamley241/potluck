@@ -275,10 +275,20 @@ def _raises(exc: Exception):
     return _thunk
 
 
-# Sentinel the tiebreaker's on_timeout thunk returns so its caller can tell a
-# timed-out adjudication (issue stays contested, escalates to human) apart from
-# a parsed verdict. A distinct object -- never a value _parse_tiebreak yields.
-_TIEBREAK_TIMED_OUT = object()
+def _raise_tiebreak_timeout(issue_id: str):
+    """on_timeout hook for a tiebreak adjudication (hardening Step-0 §2.2, codex
+    round-1 MAJOR + decider ruling): a channel timeout is NOT a disagreement, so
+    it must never be swallowed into ESCALATED_DISAGREEMENT (a false 'the reviewers
+    could not agree' statement in a terminal record). It raises a RESUMABLE
+    TimeoutEscalation, so the run resumes at the TIEBREAK phase and the timed-out
+    concern is re-adjudicated -- ESCALATED_DISAGREEMENT is reserved for a tiebreak
+    that COMPLETED and genuinely split."""
+    def _hook():
+        raise TimeoutEscalation(
+            "tiebreaker_no_signal",
+            f"tiebreaker timed out adjudicating {issue_id}; a channel timeout is "
+            f"not a disagreement -- resumable at TIEBREAK (§2.2)")
+    return _hook
 
 
 # --- output-contract schemas: stated ONCE, reused at the tail ---------------
@@ -1444,31 +1454,37 @@ class Orchestrator:
     # --- §2 resume plumbing (no-ops when self._checkpointer is None) ---
 
     def _should_run(self, cur, phase, round_index: int = 0) -> bool:
-        """On a fresh run (cur is None) run everything. On resume, run a phase
-        iff it is the cursor's phase (the failed/next call, re-run with backoff)
-        or later -- earlier phases are COMPLETED and their results ride the
-        restored state. Dispatch is on (phase, round_index), never rounds_used
-        (§2.0)."""
+        """On a fresh run (cur is None) run everything. On resume, run a phase iff
+        it is the cursor's phase-or-later. The cursor's `completed` flag (§2.0
+        "before AND after") disambiguates: if the cursor's own call COMPLETED
+        (a DONE write survived), run strictly-later phases (never re-run the
+        completed call); otherwise (a HEAD write survived -- a timeout/crash
+        DURING the call) re-run from the cursor phase itself."""
         if cur is None:
             return True
-        return _phase_key(phase, round_index) >= _phase_key(cur.phase, cur.round_index)
+        ck = _phase_key(cur.phase, cur.round_index)
+        xk = _phase_key(phase, round_index)
+        return xk > ck if cur.completed else xk >= ck
 
     def _is_failed_step(self, cur, phase, round_index: int = 0) -> bool:
-        """True only for the EXACT call the resume checkpoint was taken before --
-        the one that gets §2.4 backoff on re-run."""
-        return (cur is not None
+        """True only for the EXACT call whose HEAD checkpoint survived (the call
+        did not complete) -- the one that gets §2.4 backoff on re-run. A COMPLETED
+        cursor has no failed step."""
+        return (cur is not None and not cur.completed
                 and _phase_key(phase, round_index) == _phase_key(cur.phase, cur.round_index))
 
     def _ckpt(self, phase, round_index, failed_step, state,
-              diff, verdict, accepted, unresolved, response, attempt: int = 0):
-        """Write a checkpoint at the HEAD of a resumable call (§2.0/§2.1): a
-        timeout in that call leaves this checkpoint on disk, so resume re-enters
-        exactly here. No-op without a checkpointer (every pre-§2 construction)."""
+              diff, verdict, accepted, unresolved, response, attempt: int = 0,
+              completed: bool = False):
+        """Write a checkpoint for a resumable call (§2.0/§2.1). `completed=False`
+        (the HEAD write, before the call) makes a timeout in the call resume AT
+        it; `completed=True` (the DONE write, after the call succeeds) makes a
+        crash after it resume PAST it. No-op without a checkpointer."""
         if self._checkpointer is None:
             return
         self._checkpointer.write(
             ExecCursor(station="potluck", phase=phase, round_index=round_index,
-                       failed_step=failed_step, attempt=attempt),
+                       failed_step=failed_step, attempt=attempt, completed=completed),
             state.rounds_used,
             _serialize_debate(diff, verdict, accepted, unresolved, response),
             calls_dispatched=self.runner.calls_dispatched)
@@ -1629,6 +1645,13 @@ class Orchestrator:
             return (cur.attempt + 1
                     if self._is_failed_step(cur, phase, round_index) else 0)
 
+        def _done(phase, round_index=0):
+            # The §2.0 AFTER (DONE) write: the phase's call completed, so a crash
+            # after it resumes PAST it (never re-running/discarding completed work).
+            # Reads the CURRENT locals (closure), so it captures post-call state.
+            self._ckpt(phase, round_index, None, state, diff, verdict,
+                       accepted_issues_by_id, unresolved, response, completed=True)
+
         # 1. Implement (bounded by StepRunner). 1a folds in: capture the diff the
         #    implement produced BEFORE the gate and treat an EMPTY diff as no
         #    signal (a fix run that changed nothing has not done the job; only a
@@ -1648,6 +1671,7 @@ class Orchestrator:
                     "nothing has not done the job. If no change was genuinely "
                     "required, a human must confirm that -- the loop cannot infer "
                     "it.")
+            _done(Phase.IMPLEMENT)
 
         # 2. Gate (correctness is settled by tools, not opinion)
         if self._should_run(cur, Phase.GATE):
@@ -1660,6 +1684,7 @@ class Orchestrator:
                 return self._gate_failure_result(
                     "initial", 0, detail,
                     "gate could not be made green before review")
+            _done(Phase.GATE)
 
         # 3. Review (+ the pre-debate exits). Guarded under REVIEW so a resume
         #    PAST review does not re-evaluate them (debate was on, else there
@@ -1690,6 +1715,7 @@ class Orchestrator:
                 await self._run_closure_sweep(spec, diff, result)
                 return result
             unresolved = verdict.deadlock_ids
+            _done(Phase.REVIEW)
 
         # 3b..5 debate. On resume into the debate, start at the cursor's round;
         #       phases past the loop skip it entirely.
@@ -1733,6 +1759,7 @@ class Orchestrator:
                 self._log("doer_response", event_version=2, round=rnd,
                           responses=[r.model_dump(mode="json")
                                      for r in response.responses])
+                _done(Phase.ROUND_RESPOND, rnd)
                 rejected = response.rejected_ids() & unresolved
                 if not rejected:
                     # rounds_used = COMPLETED rounds only. This round succeeded;
@@ -1767,6 +1794,7 @@ class Orchestrator:
                                        if i.id in unresolved])
                 # Round is COMPLETED here (both replied, both logged).
                 state.rounds_used = rnd
+                _done(Phase.ROUND_FOLLOWUP, rnd)
                 if not unresolved:
                     break
 
@@ -1779,6 +1807,7 @@ class Orchestrator:
                 cur, Phase.TIEBREAK, 0,
                 lambda: self._tiebreak(spec, acceptance, diff, unresolved,
                                        verdict, response, state.rounds_used))
+            _done(Phase.TIEBREAK)
             if unresolved:
                 return self._escalated(
                     Outcome.ESCALATED_DISAGREEMENT, state.rounds_used,
@@ -1843,6 +1872,11 @@ class Orchestrator:
                     f"accepted issue that produces no edit has not done the "
                     f"job. If no change was genuinely required, a human must "
                     f"confirm that -- the loop cannot infer it.")
+            # DONE write: apply_fixes mutated the TREE. Without this, a crash
+            # before GATE_FINAL's head-write resumes at APPLY_FIXES, restores the
+            # PRE-apply tree, and re-runs the doer -- discarding completed work
+            # (codex round-1 BLOCKING, the exact case named).
+            _done(Phase.APPLY_FIXES)
         elif self._should_run(cur, Phase.APPLY_FIXES):
             # Empty accepted set: apply_fixes is already skipped (nothing to
             # discharge), and Member B does not apply -- do not change that.
@@ -1860,6 +1894,7 @@ class Orchestrator:
                 return self._gate_failure_result(
                     "post-fix", state.rounds_used, detail,
                     "gate failed after applying fixes")
+            _done(Phase.GATE_FINAL)
 
         # 9. Done
         self._log("passed", rounds=state.rounds_used)
@@ -2371,14 +2406,11 @@ class Orchestrator:
                     spec, acceptance, diff, issue_id, arg_a, arg_b,
                     retry_note=note),
                 parse=_parse_tiebreak,
-                timeout=self.cfg.timeouts.model_call_seconds,
-                on_timeout=lambda: _TIEBREAK_TIMED_OUT,
+                timeout=self.cfg.timeouts.resolve_doer_timeout("tiebreaker:adjudicate"),
+                on_timeout=_raise_tiebreak_timeout(issue_id),
                 schema=_tiebreak_schema(issue_id),
                 not_ok_detail="tiebreaker call errored",
                 malformed_prefix="tiebreaker returned malformed response: ")
-            if tb is _TIEBREAK_TIMED_OUT:
-                still_blocking.add(issue_id)
-                continue
             if tb.sides_with == "a":
                 winning_role = role_of_a
             elif tb.sides_with == "b":

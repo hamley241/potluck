@@ -432,6 +432,34 @@ async def main() -> bool:
     results["budget_cumulative_across_resume"] = (
         o2.runner.calls_dispatched > ck.calls_dispatched)
 
+    # (h) BLOCKING-2 (codex round-1): "before AND after" checkpoints. A crash
+    #     AFTER a call succeeds (a DONE write, completed=True) must resume PAST
+    #     the completed call, never re-running it / discarding its tree work.
+    cfg = HarnessConfig()
+    cfg.debate.max_rounds = 1
+    cfg.timeouts.feature_seconds = max(cfg.outer_min(), 10_000)
+    store = FakeStore()
+    ds = DiffState()
+    blk = {"issues": [{"id": "C1", "severity": "blocking",
+                       "issue": "iss", "suggested_fix": "fix"}]}
+    o = _build(cfg, store, decisions={"C1": "accept"}, first=blk,
+               calls=[], diff_state=ds)     # full accept-path run -> PASSED
+    r = await o.run_feature("s", "a")
+    results["blocking2_run_passed"] = (r.outcome == Outcome.PASSED)
+    # Find the DONE write for APPLY_FIXES (completed=True) -- the "crash after
+    # apply_fixes succeeded" checkpoint.
+    done_apply = [w for w in store.written
+                  if w.cursor.phase == Phase.APPLY_FIXES and w.cursor.completed]
+    results["blocking2_apply_done_written"] = (len(done_apply) == 1)
+    # Resume from it: apply_fixes must NOT re-run (it completed); the run
+    # finishes from GATE_FINAL onward.
+    resume_calls = []
+    o3 = _build(cfg, store, decisions={"C1": "accept"}, first=blk,
+                calls=resume_calls, diff_state=ds)
+    r3 = await o3.run_feature("s", "a", resume=done_apply[0])
+    results["blocking2_skips_completed_apply"] = ("apply_fixes" not in resume_calls)
+    results["blocking2_resumes_to_terminal"] = (r3.outcome == Outcome.PASSED)
+
     # (e) integration: real git-backed store through a full resume.
     g = await _git_integration()
     results["git_timed_out"] = g["timed_out"]
