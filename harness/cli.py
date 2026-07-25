@@ -132,13 +132,26 @@ def _git_head() -> str:
 
 def _refuse_run_dir_inside_tree(run_dir: str) -> None:
     """Refuse a run-dir inside the working tree (fail-closed). §2.3 restore does
-    `git clean -fdx`, which would DELETE a run-dir under the repo (even a
+    `git clean -fdx`, which would DELETE a run-dir anywhere under the repo (even a
     gitignored one), and the tree snapshot would CAPTURE it -- both corrupt the
-    checkpoint. The sidecar must live outside the tree it snapshots."""
+    checkpoint. The sidecar must live outside the tree it snapshots.
+
+    Containment is checked against the git WORKING-TREE ROOT (`git rev-parse
+    --show-toplevel`), NOT cwd (codex round-6 MAJOR): invoking from a subdirectory
+    with `--run-dir ../runs/x` can resolve OUTSIDE cwd yet INSIDE the repo, which a
+    cwd-based check would wrongly accept and clean -fdx would still destroy."""
+    import subprocess
     rd = Path(run_dir).resolve()
-    root = Path.cwd().resolve()
+    proc = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        # Not in a git repo (or git unreadable): fall back to cwd -- there is no
+        # tree to snapshot/clean, so the only hazard is a run-dir under cwd.
+        root = Path.cwd().resolve()
+    else:
+        root = Path(proc.stdout.strip()).resolve()
     if rd == root or root in rd.parents:
-        print(f"Error: --run-dir/--resume path ({rd}) is INSIDE the working "
+        print(f"Error: --run-dir/--resume path ({rd}) is INSIDE the git working "
               f"tree ({root}). The checkpoint sidecar must live OUTSIDE the tree "
               f"it snapshots -- restore's `git clean -fdx` would delete it and "
               f"the snapshot would capture it. Use a path outside the repo, e.g. "
