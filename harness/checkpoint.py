@@ -501,11 +501,19 @@ class Checkpointer:
 
     def load_and_verify(self) -> RunCheckpoint:
         """Load the checkpoint and REFUSE (fail-closed) unless the resuming run's
-        recomputed commitments match what was checkpointed (§2.1). The tree
-        commitments ride the checkpoint's own TreeSnapshot (restore verifies them
-        against the actual tree); the run-level commitments -- criteria, input
-        doc, effective config, manifest id -- are recomputed HERE from the
-        resuming process's inputs, so a mutated spec/acceptance/config refuses."""
+        recomputed commitments match what was checkpointed (§2.1).
+
+        Division of labour (codex round-1 MINOR -- stated honestly rather than
+        overclaimed): the RUN-LEVEL commitments -- criteria, input doc, effective
+        config, manifest id -- are genuinely RECOMPUTED here from the resuming
+        process's inputs, so a mutated spec/acceptance/config refuses. The
+        potluck TREE commitments (repo_base_commit + tree_snapshot_digest) are NOT
+        re-derived here (that would be comparing the checkpoint to a copy of
+        itself); they are enforced downstream by restore_tree's own fail-closed
+        checks -- HEAD must equal repo_base_commit, and the materialised tree's
+        recomputed write-tree + digest must equal work_tree_oid + the snapshot
+        digest (dual verify). So the tree binding IS verified, just at restore,
+        not here."""
         ckpt = self.store.load()
         recomputed = build_identity(
             self.spec, self.acceptance, self.config_digest,

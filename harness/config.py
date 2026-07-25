@@ -132,10 +132,12 @@ class CallBudget:
     `<= N_max`, so the pin is not a fiction)."""
     # fixed (non-round) bounded calls: implement, the two gates, the initial
     # get_diff + review, apply_fixes, the closure sweep + its grep, and headroom.
-    # A heavy real 2-round run was MEASURED at 11 total bounded calls, so these
-    # pins (N_max = 14 + max_rounds*8 = 30 at defaults) dominate it with ~2.7x
-    # margin while still capping a runaway (a reviewer raising many deadlocked
-    # issues, or a resume-retry storm). T4b re-measures and asserts <= N_max.
+    # A heavy 2-round run under the STUB/mock suite was measured at 11 total
+    # bounded calls (NOT a live-provider run -- the offline suite is deliberately
+    # model-free; a live measurement rides the §5 opt-in smoke lane). These pins
+    # (N_max = 14 + max_rounds*8 = 30 at defaults) dominate that with ~2.7x margin
+    # while still capping a runaway (a reviewer raising many deadlocked issues, or
+    # a resume-retry storm). T4b re-measures and asserts <= N_max.
     fixed_call_budget: int = 14
     # per debate round: doer respond (1), reviewer follow-up (1), and per-issue
     # tiebreaks -- covers a worst realistic round of ~5-6 deadlocked issues.
