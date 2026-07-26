@@ -85,15 +85,22 @@ class StationRunArtifact(BaseModel):
 
 def _output_tree_digest(repo: Path) -> str:
     """The digest of the tree a `git add -A` + commit of the current working state
-    would produce — ignored files EXCLUDED (no `--force`), so it equals what reviewgate
-    recomputes over the committed tree. Staged into a FRESH temp index; the real index
-    is untouched. Same `ls-tree -r` fingerprint the checkpoint engine uses."""
+    would produce — so it equals what reviewgate recomputes over the committed tree.
+
+    The temp index is SEEDED FROM HEAD (`read-tree HEAD`), NOT empty (codex slice-2
+    BLOCKING): real `git add -A` runs against the HEAD-backed index, so a file that is
+    TRACKED yet matches `.gitignore` is retained and updated (`.gitignore` only affects
+    UNTRACKED files). An empty-index seed would mis-drop such a tracked-then-ignored
+    file, diverging from `reviewed_head^{tree}`. Seeded from HEAD, `add -A` then models
+    a real commit: tracked files updated (incl. tracked-ignored), untracked-non-ignored
+    added, deletions applied. Staged into a FRESH temp index; the real index is
+    untouched. Same `ls-tree -r` fingerprint the checkpoint engine uses."""
     repo = Path(repo)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_index = _fresh_index_path(tmpdir)
         wenv = {"GIT_INDEX_FILE": tmp_index}
-        _git(["read-tree", "--empty"], repo, env=wenv)
-        _git(["add", "-A"], repo, env=wenv)  # respects .gitignore (no --force)
+        _git(["read-tree", "HEAD"], repo, env=wenv)  # HEAD-backed, like real add -A
+        _git(["add", "-A"], repo, env=wenv)          # .gitignore affects untracked only
         tree_oid = _git(["write-tree"], repo, env=wenv).stdout.decode().strip()
     return _tree_digest(repo, tree_oid)
 
@@ -118,13 +125,28 @@ def build_station_run_artifact(
     )
 
 
+def clear_station_run_artifact(out_dir: Path) -> None:
+    """Remove any stale `station-run.json` BEFORE a run starts (codex slice-2 MAJOR):
+    a reused run directory must never leave a prior run's artifact behind for a run
+    whose own emission then fails — an old `passed` could be mistaken for the latest."""
+    path = Path(out_dir) / STATION_RUN_FILENAME
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def write_station_run_artifact(out_dir: Path, artifact: StationRunArtifact) -> Path:
-    """Write the artifact to `out_dir/station-run.json` (pretty, stable key order via
-    the model). Returns the path."""
+    """Write the artifact to `out_dir/station-run.json` ATOMICALLY (temp + os.replace),
+    so a crash mid-write never leaves a truncated or stale-mixed artifact. Returns the
+    path."""
+    import os
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / STATION_RUN_FILENAME
-    path.write_text(artifact.model_dump_json(indent=2) + "\n")
+    tmp = out_dir / (STATION_RUN_FILENAME + ".tmp")
+    tmp.write_text(artifact.model_dump_json(indent=2) + "\n")
+    os.replace(tmp, path)
     return path
 
 

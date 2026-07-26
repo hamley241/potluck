@@ -344,6 +344,8 @@ def cmd_fix(args):
             sys.exit(1)
         _art_dir = resume_dir
         _art_base = resume_ckpt.tree.repo_base_commit
+        from . import station_run as _sr
+        _sr.clear_station_run_artifact(_art_dir)  # no stale artifact survives a run
         print(f"potluck: RESUMING from {resume_dir} at "
               f"{resume_ckpt.cursor.phase.value} (round {resume_ckpt.cursor.round_index})")
         print(f"spec: {spec[:80]}{'...' if len(spec) > 80 else ''}\n")
@@ -386,6 +388,8 @@ def cmd_fix(args):
                                   manifest_id)
             _art_dir = run_dir
             _art_base = base
+            from . import station_run as _sr
+            _sr.clear_station_run_artifact(_art_dir)  # no stale artifact survives a run
 
         print(f"potluck: profile={cfg.profile}, debate={'on' if cfg.debate_enabled else 'off'}, "
               f"max_rounds={cfg.debate.max_rounds}"

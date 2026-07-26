@@ -44,16 +44,16 @@ def _init_repo(root: Path) -> str:
                           stdout=subprocess.PIPE).stdout.decode().strip()
 
 
-def _manual_add_a_tree_digest(root: Path) -> str:
-    """Independently: `git add -A` into a temp index + write-tree + the ls-tree digest —
-    the exact tree a commit of the current working state would produce."""
-    with tempfile.TemporaryDirectory() as d:
-        idx = os.path.join(d, "index")
-        env = {**os.environ, "GIT_INDEX_FILE": idx}
-        subprocess.run(["git", "read-tree", "--empty"], cwd=root, env=env, check=True)
-        subprocess.run(["git", "add", "-A"], cwd=root, env=env, check=True)
-        oid = subprocess.run(["git", "write-tree"], cwd=root, env=env,
-                             stdout=subprocess.PIPE).stdout.decode().strip()
+def _real_commit_tree_digest(root: Path) -> str:
+    """The INDEPENDENT oracle (codex slice-2 MINOR): perform an ACTUAL
+    `git add -A && git commit` and digest the committed tree — the exact thing
+    reviewgate recomputes over `reviewed_head^{tree}`, using real git rather than
+    reproducing production's temp-index algorithm (so it can expose a divergence)."""
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "output", "--allow-empty"], cwd=root,
+                   check=True)
+    oid = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=root,
+                         stdout=subprocess.PIPE).stdout.decode().strip()
     return _tree_digest(root, oid)
 
 
@@ -93,11 +93,6 @@ def main() -> bool:
                art.gate_digest == gate_digest_of_bytes(b"#!/bin/sh\necho ok\n"))
         _check("base_commit", art.base_commit == base)
         _check("terminal_state", art.terminal_state == "passed")
-
-        # --- output_tree_digest == the add-A tree digest (what a commit produces) ---
-        _check("output_tree_matches_add_A",
-               art.output_tree_digest == _manual_add_a_tree_digest(root),
-               f"{art.output_tree_digest} != manual")
 
         # --- ignored files are EXCLUDED: removing the ignored file leaves the digest
         #     unchanged (a commit would not have contained it) ---
@@ -144,6 +139,30 @@ def main() -> bool:
             _check("version_pin_refuses_canon", False, "accepted unknown canon_version")
         except Exception:
             _check("version_pin_refuses_canon", True)
+
+    # --- output_tree_digest EQUALS a REAL `git add -A && git commit` tree, including
+    #     the tracked-then-ignored case the empty-index seed would have mis-dropped
+    #     (codex slice-2 BLOCKING + MINOR). Own repo (the oracle commits). ---
+    with tempfile.TemporaryDirectory() as d2:
+        root = Path(d2) / "repo"
+        root.mkdir()
+        base = _init_repo(root)
+        # A file that is TRACKED (committed) and ALSO matches .gitignore, then modified:
+        # real `git add -A` retains + updates it; an empty-index seed would drop it.
+        (root / "conf.local").write_text("v1\n")
+        subprocess.run(["git", "add", "conf.local"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "track conf.local"], cwd=root, check=True)
+        base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                              stdout=subprocess.PIPE).stdout.decode().strip()
+        (root / ".gitignore").write_text("conf.local\n")   # now ignored, but TRACKED
+        (root / "conf.local").write_text("v2\n")            # modified tracked-ignored
+        (root / "feature.py").write_text("print('x')\n")    # a normal untracked add
+        gate_dig = gate_digest_of_bytes((root / ".claude" / "verify.sh").read_bytes())
+        prod = build_station_run_artifact(
+            root, "s", "a", gate_dig, base, "passed").output_tree_digest
+        oracle = _real_commit_tree_digest(root)  # real add -A && commit (mutates)
+        _check("output_tree_matches_real_commit", prod == oracle,
+               f"prod={prod} oracle={oracle} (tracked-then-ignored divergence)")
 
     ok_all = True
     for name, ok, detail in _results:
