@@ -38,6 +38,8 @@ Entry points:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -46,6 +48,31 @@ import time
 MIN_PY = (3, 9)
 RECEIPTS_PREFIX = "docs/reviews/"
 EXIT_REFUSE = 2  # fail-closed / refusal: a non-answer is never approval.
+
+# --- §4 station-provenance (COMPILED opt-in, enforced NOWHERE initially) ------
+# STATION_ENFORCED is a COMPILED map {remote-URL identifier -> frozen legacy boundary
+# commit OID} — the §8b-allowlist posture (like FLOOR_PRINCIPAL / LEGACY_ALLOWLIST):
+# activation and the boundary live in THIS reviewed-and-vendored code, NOT in the
+# pushed content, so a pusher can neither enable/disable enforcement nor move the
+# boundary in the very commit being checked (codex slice-3 BLOCKING-1/2). It is EMPTY
+# here: enforced NOWHERE, so this gate — active for its own landing via the working-tree
+# vendored copy — is inert in every repo (NON-CIRCULAR by construction). A product
+# repo is added, with its frozen boundary OID, in a REVIEWED CODE CHANGE (re-vendored),
+# ONLY once the conductor can feed a station_run. The key matches the push URL by exact
+# string or trailing-substring (a repo's canonical remote); "" boundary = no legacy
+# grandfathering (every landing must carry a station_run).
+STATION_ENFORCED = {}  # e.g. {"github.com/hamley241/derma-demo": "<frozen-boundary-oid>"}
+# The station artifact canon reviewgate recomputes (potluck's StationRunArtifact,
+# conductor Step-0 §4f). A different/unknown canon OR schema fails closed. The schema
+# version is pinned to potluck's Literal[1]; a v2 artifact (a new frame) requires a
+# reviewed verifier bump, never a silent v1 read (the frozen-frame ruling).
+STATION_ARTIFACT_CANON = "potluck-station-run-v1"
+STATION_ARTIFACT_SCHEMA_VERSION = 1
+# The station's ATTESTED terminal outcome that authorizes a landing. The station is a
+# gate: only a run that PASSED authorizes. A failed/escalated (or absent) terminal_state
+# REFUSES — the value is trusted (§4(f) declared limitation, threat-model B: a deliberate
+# fabricator could lie), but an HONEST station's non-passed outcome must never land.
+STATION_TERMINAL_PASSED = "passed"
 
 
 # --------------------------------------------------------------------------- #
@@ -281,7 +308,171 @@ def _receipt_paths_at(tip: str):
     return [p for p in out.splitlines() if p.strip().endswith(".md")]
 
 
-def _authorize_update(tip, remote_oid, zero, exclusions, ref_label):
+# --------------------------------------------------------------------------- #
+# §4 station-provenance verifier (opt-in)
+# --------------------------------------------------------------------------- #
+
+def _git_bytes(args):
+    """Run `git <args>` and return stdout as RAW BYTES, fail-closed. Distinct from
+    `_git` (which decodes text, corrupting non-UTF-8 pathnames): the station
+    output-tree digest is sha256 over the exact bytes of `git ls-tree -r -z`, and a
+    filename can be arbitrary bytes, so the digest must be recomputed over raw bytes to
+    byte-match potluck's producer."""
+    try:
+        proc = subprocess.run(["git"] + list(args), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+    except OSError as exc:
+        _die("could not run git %s: %s" % (" ".join(args), exc))
+    if proc.returncode != 0:
+        _die("git %s failed (exit %d): %s"
+             % (" ".join(args), proc.returncode, proc.stderr.decode(errors="replace").strip()))
+    return proc.stdout
+
+
+def _ls_tree_digest(tree_ish: str) -> str:
+    """sha256 over `git ls-tree -r -z <tree-ish>` — the SAME fingerprint potluck's
+    station artifact uses for `output_tree_digest`, so a committed tree recomputes to
+    the value the station attested when they are the same content."""
+    return hashlib.sha256(_git_bytes(["ls-tree", "-r", "-z", tree_ish])).hexdigest()
+
+
+def _sha256_text(s: str) -> str:
+    """sha256 over `s.encode(utf-8, replace)` — potluck's `checkpoint.digest_text`, so a
+    committed input file recomputes to the station artifact's spec/acceptance digest."""
+    return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _station_enforced(push_url):
+    """(enforced, boundary) for `push_url` from the COMPILED STATION_ENFORCED map. A key
+    matches when it is a substring of the push URL (a repo's canonical remote
+    identifier). Enforced NOWHERE while the map is empty; a pusher cannot change the
+    map (it is compiled + vendored). `boundary` "" means no legacy grandfathering."""
+    for key, boundary in STATION_ENFORCED.items():
+        if key and key in push_url:
+            return True, boundary
+    return False, None
+
+
+def _station_legacy_exempt(reviewed_head, boundary) -> bool:
+    """The FROZEN legacy exemption (conductor Step-0 §4): a field-less receipt is
+    grandfathered ONLY when its REVIEWED content is an ANCESTOR of the COMPILED boundary
+    OID (from STATION_ENFORCED — NOT from the pushed tip, codex slice-3 BLOCKING-2). An
+    empty boundary grandfathers nothing. Objects absent locally / not-an-ancestor =>
+    `--is-ancestor` returns non-zero => NOT exempt (enforce): fail-closed, never granting
+    the exemption on an unresolved or non-ancestor boundary."""
+    if not boundary:
+        return False
+    res = _git(["merge-base", "--is-ancestor", reviewed_head, boundary],
+               allow_fail=True)
+    return res is not None  # None on non-zero/absent-object -> enforce (fail closed)
+
+
+def _committed_text(tip, path, ref_label):
+    if not _path_present_at(tip, path):
+        _die("refusing %s: station provenance names %r, absent from the pushed tip."
+             % (ref_label, path))
+    return _git(["cat-file", "-p", "%s:%s" % (tip, path)])
+
+
+def _same_repo_pointer(ref, ref_label, what):
+    """Reject a URL/scp `:`, an absolute path, or a `..`-escaping pointer (the
+    `findings`-pointer containment rule)."""
+    norm = os.path.normpath(ref)
+    if (":" in ref or os.path.isabs(ref) or norm == ".."
+            or norm.startswith(".." + os.sep)):
+        _die("refusing %s: %s is not a same-repo relative path: %r"
+             % (ref_label, what, ref))
+    return ref
+
+
+def _station_run_resolves(fields, tip, reviewed_head, ref_label) -> None:
+    """A present `station_run` field must RESOLVE against recomputed git evidence, or
+    `_die`. `station_run` names a committed station artifact (potluck's
+    StationRunArtifact JSON) and `station_bundle` the committed handoff-bundle directory
+    (menu handoff's spec.md / acceptance.md / verify.sh — the REAL landed format).
+    reviewgate recomputes, trusting git not the record:
+
+      * the artifact canon is known (fail closed on unknown);
+      * `output_tree_digest` == the ls-tree digest of the landed station-output tree
+        (`reviewed_head^{tree}`) — the landed code IS this run's output;
+      * `base_commit` == that commit's own parent — committed on the base it ran from;
+      * the artifact's INPUT digests bind to the committed bundle (codex slice-3
+        BLOCKING-3): `spec_digest`/`acceptance_digest` == sha256 of the committed
+        spec.md/acceptance.md (stripped, as potluck read them) and `gate_digest` ==
+        sha256 of the committed verify.sh BYTES — so an artifact from a DIFFERENT run's
+        inputs cannot be substituted under the same base+tree (§4(e)(4)).
+
+    DECLARED PRODUCER-FIRST GAP (decider ruling 2026-07-26): the §4 tuple's
+    `conductor_record_digest` — binding the whole task to the conductor's own run record
+    — is NOT verified here, because its producer (the conductor's record format) does
+    not exist yet. Building against a hypothesized format is the very producer-first
+    hazard the ordering ruling forbids. Its closure is written into the conductor
+    slice's completion requirements. `schema_version`/`canon_version` are pinned
+    fail-closed (a new frame needs a reviewed verifier bump), and `terminal_state` must
+    be "passed" — the station is a GATE, so a failed/escalated/absent outcome REFUSES;
+    the value is trusted, not recomputed (§4(f) declared limitation, threat-model B)."""
+    ref = _same_repo_pointer(fields["station_run"].strip(), ref_label, "station_run")
+    if not fields.get("station_bundle"):
+        _die("refusing %s: station_run is present but station_bundle (the committed "
+             "handoff-bundle dir) is not — the run's inputs cannot be bound." % ref_label)
+    bundle = _same_repo_pointer(fields["station_bundle"].strip(), ref_label, "station_bundle")
+    blob = _git(["cat-file", "-p", "%s:%s" % (tip, ref)], allow_fail=True)
+    if blob is None:
+        _die("refusing %s: station_run points at %r, absent from the pushed tip."
+             % (ref_label, ref))
+    try:
+        art = json.loads(blob)
+    except ValueError as e:
+        _die("refusing %s: station_run artifact %r is not valid JSON: %s"
+             % (ref_label, ref, e))
+    if not isinstance(art, dict) or art.get("canon_version") != STATION_ARTIFACT_CANON:
+        _die("refusing %s: station_run artifact canon is %r, not %r (fail closed)."
+             % (ref_label, art.get("canon_version") if isinstance(art, dict) else None,
+                STATION_ARTIFACT_CANON))
+    if art.get("schema_version") != STATION_ARTIFACT_SCHEMA_VERSION:
+        _die("refusing %s: station_run artifact schema_version is %r, not %r — a new "
+             "frame requires a reviewed verifier bump, never a silent v1 read (fail "
+             "closed)." % (ref_label, art.get("schema_version"),
+                           STATION_ARTIFACT_SCHEMA_VERSION))
+    if art.get("terminal_state") != STATION_TERMINAL_PASSED:
+        _die("refusing %s: station_run terminal_state is %r, not %r — the station is a "
+             "gate, and only a run that PASSED authorizes a landing (a failed/escalated "
+             "or absent outcome refuses; §4(f) attested)."
+             % (ref_label, art.get("terminal_state"), STATION_TERMINAL_PASSED))
+    # output tree + base
+    tree = _git(["rev-parse", "--verify", "%s^{tree}" % reviewed_head]).strip()
+    got = _ls_tree_digest(tree)
+    if art.get("output_tree_digest") != got:
+        _die("refusing %s: station_run output_tree_digest %r != the landed tree digest "
+             "%r at reviewed_head %s — the landed code is not this station run's output."
+             % (ref_label, art.get("output_tree_digest"), got, reviewed_head[:12]))
+    base_parent = _first_parent(reviewed_head)
+    if art.get("base_commit") != base_parent:
+        _die("refusing %s: station_run base_commit %r != reviewed_head's parent %r — "
+             "the station output is not committed on the base it ran from."
+             % (ref_label, art.get("base_commit"),
+                base_parent[:12] if base_parent else None))
+    # input binding vs the committed handoff bundle
+    for name, dig_field, digest in (
+        ("spec.md", "spec_digest",
+         lambda: _sha256_text(_committed_text(tip, bundle + "/spec.md", ref_label).strip())),
+        ("acceptance.md", "acceptance_digest",
+         lambda: _sha256_text(_committed_text(tip, bundle + "/acceptance.md", ref_label).strip())),
+        ("verify.sh", "gate_digest",
+         lambda: hashlib.sha256(
+             _git_bytes(["cat-file", "-p", "%s:%s/verify.sh" % (tip, bundle)])).hexdigest()),
+    ):
+        if not _path_present_at(tip, bundle + "/" + name):
+            _die("refusing %s: committed handoff bundle is missing %s/%s."
+                 % (ref_label, bundle, name))
+        want = digest()
+        if art.get(dig_field) != want:
+            _die("refusing %s: station_run %s %r != the committed %s/%s digest %r — the "
+                 "artifact's inputs are not this bundle's (unrelated-run substitution)."
+                 % (ref_label, dig_field, art.get(dig_field), bundle, name, want))
+
+
+def _authorize_update(tip, remote_oid, zero, exclusions, ref_label, push_url):
     """Authorize one ref update, or _die refusing (§A per-line)."""
     commits = _pushed_set(tip, remote_oid, zero, exclusions)
     if not commits:
@@ -318,6 +509,24 @@ def _authorize_update(tip, remote_oid, zero, exclusions, ref_label):
         if fields["reviewer.provider"].strip().lower() == \
                 fields["doer.provider"].strip().lower():
             continue
+        # §4 station-provenance (COMPILED opt-in). When THIS repo is in the compiled
+        # STATION_ENFORCED map (keyed on the push URL — not on pushed content, so a
+        # pusher cannot toggle it), the landing must be the output of a station run: the
+        # SHIP receipt must carry a `station_run` field that RESOLVES against recomputed
+        # git evidence, or the reviewed content must be a grandfathered pre-boundary
+        # landing (ancestor of the COMPILED boundary). `parent` == fields["reviewed_head"]
+        # — the station-output commit. The map is EMPTY, so this is enforced NOWHERE: the
+        # verifier running from the working-tree copy at its OWN 3-repo landing is inert
+        # (non-circular by construction).
+        enforced, boundary = _station_enforced(push_url)
+        if enforced:
+            if fields.get("station_run"):
+                _station_run_resolves(fields, tip, parent, ref_label)  # _die on mismatch
+            elif not _station_legacy_exempt(parent, boundary):
+                _die("refusing %s: station-run provenance is required in this repo but "
+                     "this receipt carries no station_run field and the reviewed content "
+                     "is past the frozen legacy boundary. A product landing must be the "
+                     "output of a station run." % ref_label)
         return  # authorized.
     _die(
         "refusing %s: no valid review receipt in %s names the tip's parent (%s), is "
@@ -349,7 +558,8 @@ def run_hook(argv, stdin_text) -> int:
         if not tip or not tip.strip():
             _die("refusing %s: %s does not peel to a commit (unsupported tag "
                  "target)." % (ref_label, local_oid[:12]))
-        _authorize_update(tip.strip(), remote_oid, zero, exclusions, ref_label)
+        _authorize_update(tip.strip(), remote_oid, zero, exclusions, ref_label,
+                          push_url)
     return 0
 
 
