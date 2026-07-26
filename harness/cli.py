@@ -302,6 +302,10 @@ def cmd_fix(args):
     resume_dir = getattr(args, "resume", None)
     run_dir = getattr(args, "run_dir", None)
     allow_dirty = getattr(args, "allow_dirty", False)
+    # §4f station-run artifact: the output dir + the base commit the run started from,
+    # captured per-path and emitted after the run completes (below).
+    _art_dir = None
+    _art_base = None
 
     if resume_dir:
         # --- resume path (hardening Step-0 §2): spec/acceptance come from the
@@ -328,6 +332,8 @@ def cmd_fix(args):
         except ck.CheckpointError as e:
             print(f"Error: resume refused (fail-closed): {e}", file=sys.stderr)
             sys.exit(1)
+        _art_dir = resume_dir
+        _art_base = resume_ckpt.tree.repo_base_commit
         print(f"potluck: RESUMING from {resume_dir} at "
               f"{resume_ckpt.cursor.phase.value} (round {resume_ckpt.cursor.round_index})")
         print(f"spec: {spec[:80]}{'...' if len(spec) > 80 else ''}\n")
@@ -367,6 +373,8 @@ def cmd_fix(args):
                 run_dir, cfg, spec, acceptance)
             ck.persist_run_inputs(run_dir, spec, acceptance, cfg_digest, base,
                                   manifest_id)
+            _art_dir = run_dir
+            _art_base = base
 
         print(f"potluck: profile={cfg.profile}, debate={'on' if cfg.debate_enabled else 'off'}, "
               f"max_rounds={cfg.debate.max_rounds}"
@@ -380,6 +388,22 @@ def cmd_fix(args):
             return await orch.run_feature(spec, acceptance)
 
         result = asyncio.run(_run())
+
+    # §4f: emit the station-run artifact (the producer half of the station-provenance
+    # chain) when the run has an output directory. Attests the run's inputs, base,
+    # terminal state, and OUTPUT tree so a later landing binds to a real station run.
+    # Best-effort: a failure to emit the artifact must not fail an otherwise-complete
+    # run (the artifact is provenance, not a gate), but it IS reported.
+    if _art_dir is not None:
+        from . import station_run as sr
+        try:
+            artifact = sr.build_station_run_artifact(
+                _git_toplevel(), spec, acceptance, Path(".claude/verify.sh"),
+                _art_base, result.outcome.value)
+            sr.write_station_run_artifact(Path(_art_dir), artifact)
+        except Exception as e:  # noqa: BLE001 — provenance emission is best-effort
+            print(f"warning: station-run artifact not written: {e}", file=sys.stderr)
+
     out = {
         "outcome": result.outcome.value,
         "rounds_used": result.rounds_used,
