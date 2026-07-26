@@ -155,7 +155,8 @@ async def main() -> bool:
     _ident = CheckpointIdentity(
         schema_version=CHECKPOINT_SCHEMA_VERSION, criteria_content_hash="c",
         input_document_digest="d", effective_config_digest="e",
-        run_manifest_id="m", repo_base_commit="base", tree_snapshot_digest="td")
+        run_manifest_id="m", gate_binding_digest="in-tree",
+        repo_base_commit="base", tree_snapshot_digest="td")
     _tree = TreeSnapshot(repo_base_commit="base", work_tree_oid="w",
                          index_tree_oid="i", tree_snapshot_digest="td")
     parse_refused = False

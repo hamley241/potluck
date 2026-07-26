@@ -236,7 +236,7 @@ def main() -> bool:
         schema_version=CHECKPOINT_SCHEMA_VERSION,
         criteria_content_hash="crit", input_document_digest="doc",
         effective_config_digest="cfg", run_manifest_id="mid",
-        repo_base_commit="base", tree_snapshot_digest="td")
+        gate_binding_digest="gate", repo_base_commit="base", tree_snapshot_digest="td")
     # Identical recompute passes.
     same = CheckpointIdentity(**ident.model_dump())
     ok = True
@@ -248,6 +248,7 @@ def main() -> bool:
     # Each divergence refuses.
     for fld, val in [("criteria_content_hash", "MUT"), ("input_document_digest", "MUT"),
                      ("effective_config_digest", "MUT"), ("run_manifest_id", "MUT"),
+                     ("gate_binding_digest", "MUT"),
                      ("repo_base_commit", "MUT"), ("tree_snapshot_digest", "MUT")]:
         other = CheckpointIdentity(**{**ident.model_dump(), fld: val})
         results[f"identity_refuses_{fld}"] = _refuses(

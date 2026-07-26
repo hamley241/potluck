@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -72,7 +74,8 @@ def write_log(result: dict, args):
 
 def build_orchestrator(cfg: HarnessConfig,
                        allow_dirty: bool = False,
-                       checkpointer=None) -> Orchestrator:
+                       checkpointer=None,
+                       gate_path: str | None = None) -> Orchestrator:
     """Wire a cfg into a production Orchestrator (real doer/reviewer/tiebreaker,
     real gate, config-bound get_diff, real tree restore). Pure: cfg ->
     Orchestrator, no argparse and no I/O, so a test can build the exact object
@@ -86,12 +89,19 @@ def build_orchestrator(cfg: HarnessConfig,
     transcript shows hygiene was turned off.
 
     checkpointer (hardening Step-0 §2) enables resumable checkpoints; None (the
-    default) keeps the exact non-resumable behaviour."""
+    default) keeps the exact non-resumable behaviour.
+
+    gate_path (conductor §5) runs the gate from an external, absolute path instead
+    of the in-tree default; None keeps `real_run_gate`'s `./.claude/verify.sh`. The
+    Orchestrator invokes the gate callable with no arguments, so an external path is
+    bound here (partial) rather than passed at the call site."""
     doer = RealDoerClient()
     reviewer = ReviewerClient(cfg)
     tiebreaker = TiebreakerClient(cfg) if cfg.debate.use_tiebreaker else None
     restore_tree = None if allow_dirty else real_restore_tree
-    orch = Orchestrator(cfg, doer, reviewer, tiebreaker, real_run_gate,
+    run_gate = (real_run_gate if gate_path is None
+                else functools.partial(real_run_gate, gate_path))
+    orch = Orchestrator(cfg, doer, reviewer, tiebreaker, run_gate,
                         bound_get_diff(cfg.diff), restore_tree=restore_tree,
                         checkpointer=checkpointer)
     if allow_dirty:
@@ -166,9 +176,9 @@ def _refuse_run_dir_inside_tree(run_dir: str) -> None:
 
 
 def _build_checkpointer(run_dir: str, cfg: HarnessConfig, spec: str,
-                        acceptance: str):
+                        acceptance: str, gate_binding_digest: str):
     """Construct a git-backed Checkpointer for `run_dir` bound to this run's
-    identity inputs (hardening Step-0 §2)."""
+    identity inputs (hardening Step-0 §2), including the gate binding (conductor §5)."""
     from . import checkpoint as ck
     _refuse_run_dir_inside_tree(run_dir)
     cfg_digest = ck.config_digest(_effective_config_dict(cfg))
@@ -179,7 +189,8 @@ def _build_checkpointer(run_dir: str, cfg: HarnessConfig, spec: str,
     # nested repos (the mandatory submodule refusal) and sibling D-F transitions
     # (losslessness), and clean/ls-files would only cover the subtree.
     store = ck.GitCheckpointStore(Path(run_dir), repo=_git_toplevel())
-    return ck.Checkpointer(store, spec, acceptance, cfg_digest, manifest_id), \
+    return ck.Checkpointer(store, spec, acceptance, cfg_digest, manifest_id,
+                           gate_binding_digest=gate_binding_digest), \
         cfg_digest, base, manifest_id
 
 
@@ -239,6 +250,12 @@ def add_fix_parser(subparsers):
     p.add_argument("--acceptance", type=str, default="All tests pass.",
                    help="Acceptance criteria")
     p.add_argument("--acceptance-file", type=str, help="Read acceptance from a file")
+    p.add_argument("--gate-file", type=str, default=None,
+                   help="Run the verification gate from an EXTERNAL path OUTSIDE the "
+                        "working tree (conductor §5 seam), instead of the in-tree "
+                        ".claude/verify.sh. The tree stays clean and the gate is never "
+                        "an unattributed commit; its digest is bound into the run so a "
+                        "--resume with a swapped gate fails closed.")
     p.add_argument("--profile", type=str, default=None)
     p.add_argument("--no-debate", action="store_true")
     p.add_argument("--no-tiebreaker", action="store_true")
@@ -289,7 +306,15 @@ def _apply_timeout_overrides(args, cfg) -> None:
         sys.exit(1)
 
 
-def _require_gate() -> None:
+def _require_gate(gate_file: str | None = None) -> None:
+    """Require a runnable gate. With --gate-file (conductor §5) the gate is the
+    external path and the in-tree .claude/verify.sh is NOT required (a product tree
+    may not carry one); otherwise the in-tree gate must exist."""
+    if gate_file is not None:
+        if not Path(gate_file).is_file():
+            print(f"Error: --gate-file not found: {gate_file}", file=sys.stderr)
+            sys.exit(1)
+        return
     if not Path(".claude/verify.sh").exists():
         print("Error: .claude/verify.sh not found.\n"
               "Copy verify.sh.example into your project as .claude/verify.sh.",
@@ -297,24 +322,95 @@ def _require_gate() -> None:
         sys.exit(1)
 
 
+# The run-owned, IMMUTABLE frozen copy of an external gate, living in the run-dir
+# (outside the working tree) — the bytes actually executed and digested (conductor §5).
+_FROZEN_GATE_NAME = "frozen-gate.sh"
+
+
+def _digest_gate_file(path: str) -> str | None:
+    """sha256 (station_run.gate_digest_of_bytes) of the gate at `path`, or None if
+    unreadable. The §4f station artifact's gate_digest is this over the gate ACTUALLY
+    run (the frozen external copy, or the in-tree .claude/verify.sh)."""
+    from . import station_run as sr
+    try:
+        return sr.gate_digest_of_bytes(Path(path).read_bytes())
+    except OSError:
+        return None
+
+
+def _refuse_gate_inside_tree(gate_file: str) -> None:
+    """Refuse an external gate whose path is INSIDE the working tree (conductor §5,
+    codex MAJOR). An in-tree gate is a mutable file the doer can rewrite before the
+    gate runs — the exact in-tree mutable-gate hazard §5 forbids — so the external
+    gate must live outside the tree. Containment is checked against the git
+    WORKING-TREE ROOT, matching `_refuse_run_dir_inside_tree`."""
+    g = Path(gate_file).resolve()
+    root = _git_toplevel()
+    if g == root or root in g.parents:
+        print(f"Error: --gate-file ({g}) is INSIDE the git working tree ({root}). "
+              f"The external gate must live OUTSIDE the tree so the doer cannot mutate "
+              f"it before it runs (conductor §5).", file=sys.stderr)
+        sys.exit(1)
+
+
+def _freeze_gate(gate_file: str, run_dir: str):
+    """Copy the external gate's bytes to an IMMUTABLE run-owned path (outside the
+    tree) and return (frozen_path, digest) (conductor §5, codex MAJOR/BLOCKING). The
+    gate ACTUALLY RUN is this frozen copy, so its digest is provably the digest of the
+    executed bytes even if the source changes after capture (handoff regeneration, a
+    doer edit). The frozen copy persists in the run-dir, so a `--resume` re-runs the
+    SAME gate without needing --gate-file re-passed and can verify it fail-closed."""
+    from . import station_run as sr
+    data = Path(gate_file).read_bytes()
+    dest = Path(run_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    frozen = dest / _FROZEN_GATE_NAME
+    tmp = dest / (_FROZEN_GATE_NAME + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, frozen)
+    return str(frozen), sr.gate_digest_of_bytes(data)
+
+
+def _resolve_resume_gate(resume_dir: str):
+    """Resolve the gate for a resume from a FILE FACT — the frozen copy's presence —
+    NOT an editable run_inputs field (conductor §5, codex §5 r2 BLOCKING). Returns
+    (effective_gate_path, gate_binding_digest); `--gate-file` is ignored on resume.
+
+      * a frozen copy present in the run-dir ⇒ external run: run it, bind its digest;
+      * absent ⇒ in-tree run: the in-tree sentinel.
+
+    This is only the RESOLUTION. The tamper check is `verify_identity`: the resolved
+    `gate_binding_digest` is fed into the recomputed identity, so a tampered frozen
+    gate (digest ≠ committed) OR a deleted frozen copy that flips an external run to
+    the in-tree sentinel (≠ the committed external digest) is refused fail-closed at
+    `load_and_verify` — a downgrade cannot pass by editing run_inputs alone."""
+    from . import checkpoint as ck
+    from . import station_run as sr
+    frozen = Path(resume_dir) / _FROZEN_GATE_NAME
+    if frozen.is_file():
+        return str(frozen), sr.gate_digest_of_bytes(frozen.read_bytes())
+    return None, ck.INTREE_GATE_BINDING
+
+
 def cmd_fix(args):
     from . import checkpoint as ck
     resume_dir = getattr(args, "resume", None)
     run_dir = getattr(args, "run_dir", None)
     allow_dirty = getattr(args, "allow_dirty", False)
+    # conductor §5: an external gate path (outside the working tree) resolved to
+    # ABSOLUTE now, before any chdir, so `bash <gate>` runs the same file regardless
+    # of cwd. None keeps the in-tree .claude/verify.sh.
+    gate_file = getattr(args, "gate_file", None)
+    if gate_file is not None:
+        gate_file = str(Path(gate_file).resolve())
     # §4f station-run artifact: the output dir, the base commit the run started from,
     # and the gate digest captured at run START (before the doer, which can rewrite
-    # .claude/verify.sh) — emitted after the run completes (below).
+    # the gate) — emitted after the run completes (below). With --gate-file the digest
+    # is of the EXTERNAL gate (the gate actually run), so the artifact + the resume
+    # binding both reflect the real gate.
     _art_dir = None
     _art_base = None
     _art_gate = None
-
-    def _capture_gate_digest():
-        from . import station_run as sr
-        try:
-            return sr.gate_digest_of_bytes(Path(".claude/verify.sh").read_bytes())
-        except OSError:
-            return None
 
     if resume_dir:
         # --- resume path (hardening Step-0 §2): spec/acceptance come from the
@@ -328,14 +424,24 @@ def cmd_fix(args):
         spec, acceptance = inputs["spec"], inputs["acceptance"]
         cfg = load_config(args)
         _apply_timeout_overrides(args, cfg)
-        _require_gate()
-        _art_gate = _capture_gate_digest()  # BEFORE the doer runs (§4f)
+        # Gate (conductor §5): resolved from a FILE FACT — the frozen copy's presence —
+        # so an external run resumes from its frozen copy (never the mutable in-tree
+        # gate) and an in-tree run resumes in-tree. `--gate-file` is ignored on resume.
+        # The gate_binding_digest flows into the recomputed identity, so a tampered
+        # frozen gate or a deleted-frozen downgrade is refused at load_and_verify below.
+        gate_path, gate_binding = _resolve_resume_gate(resume_dir)
+        if gate_path is None:
+            _require_gate(None)  # in-tree run: the in-tree gate must still be present
+            _art_gate = _digest_gate_file(".claude/verify.sh")
+        else:
+            _art_gate = gate_binding  # external: the frozen copy's digest (the run gate)
         # The tree must be clean at the checkpoint base for a lossless restore.
         dirty_err = ensure_clean_tree(allow_dirty)
         if dirty_err:
             print(f"Error: {dirty_err}", file=sys.stderr)
             sys.exit(1)
-        checkpointer, *_ = _build_checkpointer(resume_dir, cfg, spec, acceptance)
+        checkpointer, *_ = _build_checkpointer(resume_dir, cfg, spec, acceptance,
+                                               gate_binding)
         try:
             resume_ckpt = checkpointer.load_and_verify()
             checkpointer.restore(resume_ckpt.tree)
@@ -352,7 +458,7 @@ def cmd_fix(args):
 
         async def _run():
             orch = build_orchestrator(cfg, allow_dirty=allow_dirty,
-                                      checkpointer=checkpointer)
+                                      checkpointer=checkpointer, gate_path=gate_path)
             return await orch.run_feature(spec, acceptance, resume=resume_ckpt)
 
         result = asyncio.run(_run())
@@ -370,8 +476,17 @@ def cmd_fix(args):
 
         cfg = load_config(args)
         _apply_timeout_overrides(args, cfg)
-        _require_gate()
-        _art_gate = _capture_gate_digest()  # BEFORE the doer runs (§4f)
+        # conductor §5: an external gate is a station-run mechanism — it requires a
+        # run-dir (the frozen copy's durable, resumable home) and must live OUTSIDE the
+        # working tree. Both are validated before the gate is required/frozen.
+        if gate_file is not None:
+            if not run_dir:
+                print("Error: --gate-file requires --run-dir (the external gate is "
+                      "frozen into the run-dir so a resume re-runs the same gate).",
+                      file=sys.stderr)
+                sys.exit(1)
+            _refuse_gate_inside_tree(gate_file)
+        _require_gate(gate_file)
         # Clean-tree precondition (before the banner): a dead implement attempt
         # leaves partial edits behind, so we start from a known-clean baseline
         # restore_tree can reset to. --allow-dirty is the visible opt-out.
@@ -381,9 +496,23 @@ def cmd_fix(args):
             sys.exit(1)
 
         checkpointer = None
+        gate_path = None
         if run_dir:
+            _refuse_run_dir_inside_tree(run_dir)  # validate BEFORE freezing into it
+            # An external gate is FROZEN into the (outside-the-tree) run-dir and the
+            # IMMUTABLE copy is run: the digest is provably the executed bytes, a resume
+            # re-runs the same gate, and gate_binding is bound into the tamper-evident
+            # identity (codex §5 r1/r2 MAJOR/BLOCKING). In-tree uses the sentinel (its
+            # bytes are already bound via the tree snapshot). Captured BEFORE the doer
+            # runs (§4f — the doer can rewrite .claude/verify.sh).
+            if gate_file is not None:
+                gate_path, gate_binding = _freeze_gate(gate_file, run_dir)
+                _art_gate = gate_binding
+            else:
+                gate_binding = ck.INTREE_GATE_BINDING
+                _art_gate = _digest_gate_file(".claude/verify.sh")
             checkpointer, cfg_digest, base, manifest_id = _build_checkpointer(
-                run_dir, cfg, spec, acceptance)
+                run_dir, cfg, spec, acceptance, gate_binding)
             ck.persist_run_inputs(run_dir, spec, acceptance, cfg_digest, base,
                                   manifest_id)
             _art_dir = run_dir
@@ -399,7 +528,7 @@ def cmd_fix(args):
 
         async def _run():
             orch = build_orchestrator(cfg, allow_dirty=allow_dirty,
-                                      checkpointer=checkpointer)
+                                      checkpointer=checkpointer, gate_path=gate_path)
             return await orch.run_feature(spec, acceptance)
 
         result = asyncio.run(_run())

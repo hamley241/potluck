@@ -612,7 +612,7 @@ async def main() -> bool:
         """Identity is built (bound) against `honest`; the stored ckpt.tree is
         `actual`. honest==actual is a legitimate checkpoint; a mismatch is tamper."""
         ident = build_identity("s", "a", "cfg", honest.repo_base_commit,
-                               _snapshot_binding_digest(honest), "m")
+                               _snapshot_binding_digest(honest), "m", "in-tree")
         return RunCheckpoint(
             cursor=ExecCursor(phase=Phase.IMPLEMENT), rounds_used=0,
             identity=ident, tree=actual)

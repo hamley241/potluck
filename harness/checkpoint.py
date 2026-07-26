@@ -377,6 +377,7 @@ def verify_identity(committed: CheckpointIdentity,
         ("input_document_digest", "the input document changed"),
         ("effective_config_digest", "the effective config (timeouts/caps) changed"),
         ("run_manifest_id", "the run manifest id does not match"),
+        ("gate_binding_digest", "the gate binding changed (gate downgrade/swap)"),
         ("repo_base_commit", "the repo base commit does not match"),
         ("tree_snapshot_digest", "the tree snapshot digest does not match"),
     ]
@@ -425,7 +426,13 @@ def persist_run_inputs(run_dir: Path, spec: str, acceptance: str,
                        run_manifest_id: str) -> None:
     """Persist the run's identity inputs alongside the checkpoint so a `--resume`
     in a fresh process can RECOMPUTE the commitment set and fail closed on any
-    divergence (§2.1). Written once at run start, atomically."""
+    divergence (§2.1). Written once at run start, atomically.
+
+    NOTE (conductor §5): the gate binding is deliberately NOT stored here. run_inputs
+    is a plain, editable sidecar; binding the gate via an editable field would let a
+    resume downgrade the gate by editing this file (codex §5 r2 BLOCKING). The gate is
+    instead bound into the tamper-evident CheckpointIdentity (`gate_binding_digest`)
+    and resolved from a FILE FACT — the frozen copy's presence — never a mutable field."""
     import json
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -458,18 +465,29 @@ def compute_manifest_id(spec: str, acceptance: str, config_digest_value: str,
     return digest_text(joined)
 
 
+# The gate binding for an IN-TREE run (conductor §5): a fixed, non-digest sentinel.
+# The in-tree gate's bytes are already bound via tree_snapshot_digest, so the binding
+# only needs to distinguish "in-tree mode" from any external gate's frozen digest —
+# and a resume that lost/deleted the frozen copy recomputes THIS value, which cannot
+# equal the external digest the checkpoint committed, so the downgrade is refused.
+INTREE_GATE_BINDING = "in-tree"
+
+
 def build_identity(spec: str, acceptance: str, config_digest_value: str,
                    repo_base_commit: str, tree_snapshot_digest: str,
-                   run_manifest_id: str) -> CheckpointIdentity:
+                   run_manifest_id: str, gate_binding_digest: str) -> CheckpointIdentity:
     """The recomputed commitment set for a potluck run (§2.1). criteria = the
-    acceptance criteria; input document = the spec. Resume rebuilds this from the
-    persisted inputs and refuses on ANY field divergence (verify_identity)."""
+    acceptance criteria; input document = the spec; gate_binding_digest = the external
+    gate's frozen-copy digest or INTREE_GATE_BINDING (conductor §5). Resume rebuilds
+    this from the persisted inputs + the resolved gate and refuses on ANY field
+    divergence (verify_identity)."""
     return CheckpointIdentity(
         schema_version=CHECKPOINT_SCHEMA_VERSION,
         criteria_content_hash=digest_text(acceptance),
         input_document_digest=digest_text(spec),
         effective_config_digest=config_digest_value,
         run_manifest_id=run_manifest_id,
+        gate_binding_digest=gate_binding_digest,
         repo_base_commit=repo_base_commit,
         tree_snapshot_digest=tree_snapshot_digest,
     )
@@ -514,8 +532,10 @@ class Checkpointer:
     set from the RESUMING process's inputs and refuses on any divergence (§2.1)."""
 
     def __init__(self, store, spec: str, acceptance: str,
-                 config_digest_value: str, run_manifest_id: str):
+                 config_digest_value: str, run_manifest_id: str,
+                 gate_binding_digest: str = INTREE_GATE_BINDING):
         self.store = store
+        self.gate_binding_digest = gate_binding_digest
         self.spec = spec
         self.acceptance = acceptance
         self.config_digest = config_digest_value
@@ -527,7 +547,8 @@ class Checkpointer:
         tree = self.store.snapshot()
         identity = build_identity(
             self.spec, self.acceptance, self.config_digest,
-            tree.repo_base_commit, _snapshot_binding_digest(tree), self.manifest_id)
+            tree.repo_base_commit, _snapshot_binding_digest(tree), self.manifest_id,
+            self.gate_binding_digest)
         self._last = RunCheckpoint(
             cursor=cursor, rounds_used=rounds_used, calls_dispatched=calls_dispatched,
             identity=identity, tree=tree, state=state)
@@ -573,7 +594,7 @@ class Checkpointer:
         recomputed = build_identity(
             self.spec, self.acceptance, self.config_digest,
             ckpt.tree.repo_base_commit, _snapshot_binding_digest(ckpt.tree),
-            self.manifest_id)
+            self.manifest_id, self.gate_binding_digest)
         verify_identity(ckpt.identity, recomputed)
         return ckpt
 

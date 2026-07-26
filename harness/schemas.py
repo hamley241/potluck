@@ -102,7 +102,10 @@ class Outcome(str, Enum):
 
 # Bumped whenever the on-disk checkpoint shape changes incompatibly. Resume
 # REFUSES an unknown version (fail-closed, §2.1) rather than misreading it.
-CHECKPOINT_SCHEMA_VERSION = 1
+# v2 (conductor §5): the identity binds `gate_binding_digest`. A v1 checkpoint
+# (no gate binding) refuses on resume — the explicit version discriminator, NOT a
+# missing-field fallback that would let a gate downgrade slip through (codex §5 r2).
+CHECKPOINT_SCHEMA_VERSION = 2
 
 
 class Phase(str, Enum):
@@ -167,6 +170,10 @@ class CheckpointIdentity(BaseModel):
     input_document_digest: str    # the draft/doc the run began from
     effective_config_digest: str  # the resolved timeouts + caps actually in force
     run_manifest_id: str          # the run's own manifest id (bound to the input)
+    gate_binding_digest: str      # the gate: an external gate's frozen-copy digest,
+                                  # or the in-tree sentinel (conductor §5). Binds the
+                                  # gate MODE + bytes into the tamper-evident identity so
+                                  # a resume cannot downgrade to a mutable in-tree gate.
     repo_base_commit: str | None = None       # potluck only (§2.2)
     tree_snapshot_digest: str | None = None    # potluck only (§2.2)
 
