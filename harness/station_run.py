@@ -19,12 +19,24 @@ will later recompute over the committed tree: the tree a `git add -A` (respectin
 git commit excludes them; the conductor commits the potluck output with `git add -A`,
 so the committed tree matches this digest. Computed through a FRESH temp index, so the
 run's real index is untouched.
+
+RECOMPUTABLE vs ATTESTED (codex slice-2 BLOCKING). Four fields are independently
+RECOMPUTABLE — the input digests (spec/acceptance/gate, vs the committed handoff
+bundle), `base_commit` (git), and `output_tree_digest` (git) — and a verifier trusts
+recomputation, never the record. `terminal_state`, by contrast, depends on the run's
+DYNAMICS (reviewer verdicts, debate) and is NOT recoverable from inputs + tree; it is
+the station's ATTESTED outcome. Trusting it is exactly the Step-0 §4(f) DECLARED
+LIMITATION (threat-model B, decider-ruled 2026-07-25): under the ruled threat — the
+automated doer SKIPPING the station — the station's own terminal report is sound; a
+deliberate operator fabrication is out of the threat model. The recomputable fields
+carry the provenance chain; `terminal_state` is attested run metadata.
 """
 from __future__ import annotations
 
-import json
+import hashlib
 import tempfile
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -41,24 +53,34 @@ STATION_RUN_SCHEMA_VERSION: int = 1
 STATION_RUN_FILENAME: str = "station-run.json"
 
 
+def gate_digest_of_bytes(gate_bytes: bytes) -> str:
+    """sha256 over the gate file's EXACT bytes (codex slice-2 MAJOR — never a lossy
+    UTF-8 decode, which would collapse distinct byte files to one digest)."""
+    return hashlib.sha256(gate_bytes).hexdigest()
+
+
 class StationRunArtifact(BaseModel):
-    """A `potluck fix` run's canonical, station-emitted attestation (§4f). Every field
-    is independently RECOMPUTABLE from the run's inputs + the repository, so a verifier
-    trusts recomputation, never this record's say-so."""
+    """A `potluck fix` run's canonical, station-emitted attestation (§4f). The input
+    digests + base_commit + output_tree_digest are independently RECOMPUTABLE (a
+    verifier trusts recomputation); `terminal_state` is the station's ATTESTED outcome
+    (the Step-0 §4(f) declared limitation), not a recomputed value.
+
+    `schema_version`/`canon_version` are `Literal`-pinned (codex slice-2 MAJOR): a v1
+    reader REFUSES a future v2 artifact rather than mis-reading it as v1 — born
+    versioned, fail-closed on an unknown version."""
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: int = STATION_RUN_SCHEMA_VERSION
-    canon_version: str = STATION_RUN_CANON
-    # Inputs (sha256 over the exact text / bytes the run consumed).
+    schema_version: Literal[1] = STATION_RUN_SCHEMA_VERSION
+    canon_version: Literal["potluck-station-run-v1"] = STATION_RUN_CANON
+    # RECOMPUTABLE — input digests (sha256; the gate over its exact bytes).
     spec_digest: str = Field(description="sha256 of the spec text")
     acceptance_digest: str = Field(description="sha256 of the acceptance text")
-    gate_digest: str = Field(description="sha256 of the .claude/verify.sh gate")
-    # Provenance.
+    gate_digest: str = Field(description="sha256 of the gate bytes, captured at run start")
+    # RECOMPUTABLE — provenance from git.
     base_commit: str = Field(description="repo HEAD the run started from")
-    terminal_state: str = Field(description="the FeatureResult outcome value")
-    # The station OUTPUT — the `git add -A` (gitignore-respecting) tree the run left,
-    # fingerprinted the way reviewgate will recompute reviewed_head^{tree}.
-    output_tree_digest: str = Field(description="ls-tree digest of the output tree")
+    output_tree_digest: str = Field(description="ls-tree digest of the add-A output tree")
+    # ATTESTED (not recomputable) — the station's own terminal report.
+    terminal_state: str = Field(description="station-attested FeatureResult outcome")
 
 
 def _output_tree_digest(repo: Path) -> str:
@@ -77,22 +99,19 @@ def _output_tree_digest(repo: Path) -> str:
 
 
 def build_station_run_artifact(
-    repo: Path, spec: str, acceptance: str, gate_path: Path,
+    repo: Path, spec: str, acceptance: str, gate_digest: str,
     base_commit: str, terminal_state: str,
 ) -> StationRunArtifact:
     """Assemble the artifact from the run's inputs + the repository AFTER the run.
-    `gate_path` is the `.claude/verify.sh` the run gated on; `base_commit` the HEAD it
-    started from (captured before the run); `terminal_state` the FeatureResult outcome
-    value."""
-    gate_path = Path(gate_path)
-    try:
-        gate_bytes = gate_path.read_bytes()
-    except OSError as e:
-        raise CheckpointError(f"station-run: cannot read gate {gate_path}: {e}")
+    `gate_digest` MUST be captured at run START (`gate_digest_of_bytes` on the gate
+    file's bytes before the doer runs — the doer can rewrite `.claude/verify.sh`, so a
+    run-end read would attest the modified gate, codex slice-2 MAJOR); `base_commit` the
+    HEAD it started from; `terminal_state` the station's attested FeatureResult
+    outcome. Only `output_tree_digest` is computed here (over the post-run tree)."""
     return StationRunArtifact(
         spec_digest=digest_text(spec),
         acceptance_digest=digest_text(acceptance),
-        gate_digest=digest_text(gate_bytes.decode("utf-8", errors="replace")),
+        gate_digest=gate_digest,
         base_commit=base_commit,
         terminal_state=terminal_state,
         output_tree_digest=_output_tree_digest(repo),

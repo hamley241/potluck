@@ -16,8 +16,10 @@ from pathlib import Path
 from harness.checkpoint import _git, _tree_digest, digest_text
 from harness.station_run import (
     STATION_RUN_CANON,
+    STATION_RUN_FILENAME,
     StationRunArtifact,
     build_station_run_artifact,
+    gate_digest_of_bytes,
     load_station_run_artifact,
     write_station_run_artifact,
 )
@@ -79,15 +81,16 @@ def main() -> bool:
         (root / ".gitignore").write_text("secret.env\n")
         (root / "secret.env").write_text("IGNORED\n")  # must NOT affect the digest
 
+        gate_dig = gate_digest_of_bytes((root / ".claude" / "verify.sh").read_bytes())
         art = build_station_run_artifact(
-            root, "the spec", "the acceptance", root / ".claude" / "verify.sh",
-            base, "passed")
+            root, "the spec", "the acceptance", gate_dig, base, "passed")
 
         # --- input digests recompute independently ---
         _check("spec_digest", art.spec_digest == digest_text("the spec"))
         _check("acceptance_digest", art.acceptance_digest == digest_text("the acceptance"))
+        # gate digest is over the exact BYTES (not a lossy decode).
         _check("gate_digest",
-               art.gate_digest == digest_text("#!/bin/sh\necho ok\n"))
+               art.gate_digest == gate_digest_of_bytes(b"#!/bin/sh\necho ok\n"))
         _check("base_commit", art.base_commit == base)
         _check("terminal_state", art.terminal_state == "passed")
 
@@ -100,8 +103,7 @@ def main() -> bool:
         #     unchanged (a commit would not have contained it) ---
         (root / "secret.env").unlink()
         art2 = build_station_run_artifact(
-            root, "the spec", "the acceptance", root / ".claude" / "verify.sh",
-            base, "passed")
+            root, "the spec", "the acceptance", gate_dig, base, "passed")
         _check("ignored_excluded",
                art2.output_tree_digest == art.output_tree_digest,
                "ignored file changed the output tree digest")
@@ -109,8 +111,7 @@ def main() -> bool:
         # --- a real output change DOES change the digest ---
         (root / "feature.py").write_text("print('changed')\n")
         art3 = build_station_run_artifact(
-            root, "the spec", "the acceptance", root / ".claude" / "verify.sh",
-            base, "passed")
+            root, "the spec", "the acceptance", gate_dig, base, "passed")
         _check("output_change_shifts_digest",
                art3.output_tree_digest != art.output_tree_digest)
 
@@ -120,6 +121,29 @@ def main() -> bool:
         loaded = load_station_run_artifact(out)
         _check("roundtrip", loaded == art)
         _check("file_written", (out / "station-run.json").is_file())
+
+        # --- version pin: a future v2/unknown artifact is REFUSED by the v1 reader
+        #     (Literal pins, fail-closed) rather than mis-read as v1 ---
+        import json as _json
+
+        def _write_mutated(dirp: Path, **overrides):
+            dirp.mkdir()
+            obj = _json.loads(art.model_dump_json())
+            obj.update(overrides)
+            (dirp / STATION_RUN_FILENAME).write_text(_json.dumps(obj))
+
+        _write_mutated(Path(d) / "v2", schema_version=2)
+        try:
+            load_station_run_artifact(Path(d) / "v2")
+            _check("version_pin_refuses_v2", False, "v1 reader accepted schema_version 2")
+        except Exception:
+            _check("version_pin_refuses_v2", True)
+        _write_mutated(Path(d) / "badcanon", canon_version="some-other-canon-v9")
+        try:
+            load_station_run_artifact(Path(d) / "badcanon")
+            _check("version_pin_refuses_canon", False, "accepted unknown canon_version")
+        except Exception:
+            _check("version_pin_refuses_canon", True)
 
     ok_all = True
     for name, ok, detail in _results:

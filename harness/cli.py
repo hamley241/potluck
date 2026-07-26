@@ -302,10 +302,19 @@ def cmd_fix(args):
     resume_dir = getattr(args, "resume", None)
     run_dir = getattr(args, "run_dir", None)
     allow_dirty = getattr(args, "allow_dirty", False)
-    # §4f station-run artifact: the output dir + the base commit the run started from,
-    # captured per-path and emitted after the run completes (below).
+    # §4f station-run artifact: the output dir, the base commit the run started from,
+    # and the gate digest captured at run START (before the doer, which can rewrite
+    # .claude/verify.sh) — emitted after the run completes (below).
     _art_dir = None
     _art_base = None
+    _art_gate = None
+
+    def _capture_gate_digest():
+        from . import station_run as sr
+        try:
+            return sr.gate_digest_of_bytes(Path(".claude/verify.sh").read_bytes())
+        except OSError:
+            return None
 
     if resume_dir:
         # --- resume path (hardening Step-0 §2): spec/acceptance come from the
@@ -320,6 +329,7 @@ def cmd_fix(args):
         cfg = load_config(args)
         _apply_timeout_overrides(args, cfg)
         _require_gate()
+        _art_gate = _capture_gate_digest()  # BEFORE the doer runs (§4f)
         # The tree must be clean at the checkpoint base for a lossless restore.
         dirty_err = ensure_clean_tree(allow_dirty)
         if dirty_err:
@@ -359,6 +369,7 @@ def cmd_fix(args):
         cfg = load_config(args)
         _apply_timeout_overrides(args, cfg)
         _require_gate()
+        _art_gate = _capture_gate_digest()  # BEFORE the doer runs (§4f)
         # Clean-tree precondition (before the banner): a dead implement attempt
         # leaves partial edits behind, so we start from a known-clean baseline
         # restore_tree can reset to. --allow-dirty is the visible opt-out.
@@ -390,15 +401,20 @@ def cmd_fix(args):
         result = asyncio.run(_run())
 
     # §4f: emit the station-run artifact (the producer half of the station-provenance
-    # chain) when the run has an output directory. Attests the run's inputs, base,
-    # terminal state, and OUTPUT tree so a later landing binds to a real station run.
-    # Best-effort: a failure to emit the artifact must not fail an otherwise-complete
-    # run (the artifact is provenance, not a gate), but it IS reported.
+    # chain) for a STATION RUN — one with an out-of-tree run directory (--run-dir or
+    # --resume). The conductor always drives `potluck fix` with --run-dir (§5), so every
+    # conductor-driven run emits one; a bare local `fix` without --run-dir has no
+    # out-of-tree home for the artifact (writing inside the worktree would pollute the
+    # very tree being digested) and is not a persisted station run. Attests the run's
+    # inputs, base, terminal state, and OUTPUT tree. Best-effort here (provenance, not a
+    # gate; a failure warns, never fails an otherwise-complete run) — the later required
+    # reviewgate station_run field fails CLOSED on a missing artifact, so a station run
+    # whose artifact never landed cannot authorize a product push (codex slice-2).
     if _art_dir is not None:
         from . import station_run as sr
         try:
             artifact = sr.build_station_run_artifact(
-                _git_toplevel(), spec, acceptance, Path(".claude/verify.sh"),
+                _git_toplevel(), spec, acceptance, _art_gate,
                 _art_base, result.outcome.value)
             sr.write_station_run_artifact(Path(_art_dir), artifact)
         except Exception as e:  # noqa: BLE001 — provenance emission is best-effort
