@@ -41,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -49,19 +50,29 @@ MIN_PY = (3, 9)
 RECEIPTS_PREFIX = "docs/reviews/"
 EXIT_REFUSE = 2  # fail-closed / refusal: a non-answer is never approval.
 
-# --- §4 station-provenance (COMPILED opt-in, enforced NOWHERE initially) ------
+# --- §4 station-provenance (COMPILED opt-in; derma-demo activated 2026-07-27) --
 # STATION_ENFORCED is a COMPILED map {remote-URL identifier -> frozen legacy boundary
 # commit OID} — the §8b-allowlist posture (like FLOOR_PRINCIPAL / LEGACY_ALLOWLIST):
 # activation and the boundary live in THIS reviewed-and-vendored code, NOT in the
 # pushed content, so a pusher can neither enable/disable enforcement nor move the
-# boundary in the very commit being checked (codex slice-3 BLOCKING-1/2). It is EMPTY
-# here: enforced NOWHERE, so this gate — active for its own landing via the working-tree
-# vendored copy — is inert in every repo (NON-CIRCULAR by construction). A product
-# repo is added, with its frozen boundary OID, in a REVIEWED CODE CHANGE (re-vendored),
-# ONLY once the conductor can feed a station_run. The key matches the push URL by exact
-# string or trailing-substring (a repo's canonical remote); "" boundary = no legacy
-# grandfathering (every landing must carry a station_run).
-STATION_ENFORCED = {}  # e.g. {"github.com/hamley241/derma-demo": "<frozen-boundary-oid>"}
+# boundary in the very commit being checked (codex slice-3 BLOCKING-1/2). The key is a CANONICAL
+# `host/owner/repo` matched on EXACT canonical repo identity, case-insensitive (codex §4(g)-
+# activation: a raw substring under/over-matched); "" boundary = no legacy grandfathering.
+#
+# ACTIVATED for derma-demo (§4(g) amendment, decider ruling 2026-07-27). This is DOOR 2 — the
+# CLIENT-SIDE net that catches a NAIVE station-skipping CLONE push (a hand-built content push
+# with no station provenance) running the hook. It is DISJOINT from the conductor's own path:
+# `safe_push` pushes from an ISOLATED git-dir that bypasses this hook (verified), so Door 2
+# never sees the conductor's landings — those are bound by the conductor-side landing
+# precondition (Door 1, `push_safety.ENFORCED_LANDING_TARGETS`). The boundary `eab75bc…` is
+# derma's catalogue-landing HEAD: the quiz + catalogue flows are its ancestors (legacy-exempt),
+# so nothing already-landed is locked out; a NEW content clone push (a descendant) must carry a
+# resolvable station_run — which only the conductor produces. NOT exhaustive over derma mutation
+# (`--no-verify` / uninstalled clone / web-API / force-push are the declared client-side-hook
+# residual, closed only server-side — §4(g) amendment §2).
+STATION_ENFORCED = {
+    "github.com/hamley241/derma-demo": "eab75bc8847a7e9056fbf3c961df4fa6f723b41c",
+}
 # The station artifact canon reviewgate recomputes (potluck's StationRunArtifact,
 # conductor Step-0 §4f). A different/unknown canon OR schema fails closed. The schema
 # version is pinned to potluck's Literal[1]; a v2 artifact (a new frame) requires a
@@ -342,13 +353,122 @@ def _sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()
 
 
+class _NetHost(object):
+    """A NETWORK-looking remote whose owner/repo did not cleanly resolve — carries the normalized
+    HOST so Door 2 can fail closed SCOPED TO THAT HOST: enforce a station_run only when the host
+    matches an enforced key's host (a malformed remote on a DIFFERENT host stays unenforced, so this
+    same gate — byte-identical in menu/potluck — does not globally trip on their unrelated remotes,
+    codex §4(g)-activation r5). An unparseable authority carries host "" and matches nothing."""
+
+    __slots__ = ("host",)
+
+    def __init__(self, host):
+        self.host = host
+
+# A genuine LOCAL ref form (absolute/relative path, home, file://, Windows drive) — the exact-string
+# fallback applies ONLY to such keys, so a schemeless `host/owner/repo` cannot match a canonical key.
+_LOCAL_REF_RE = re.compile(r"^(?:/|\./|\.\./|~|file://|[A-Za-z]:[\\/])")
+
+
+def _is_local_ref(s):
+    return bool(_LOCAL_REF_RE.match((s or "").strip()))
+
+# owner/repo as the FINAL two path segments (`.git` stripped); an extra segment fails the match.
+_OWNER_REPO_RE = re.compile(r"^/*([^/]+)/([^/]+?)(?:\.git)?/?$")
+# scp-like `user@host:owner/repo` — a colon before a NON-numeric, NON-slash path (not a URL, not a
+# `host:port/path`).
+_SCP_RE = re.compile(r"^(?:[^@/]+@)?([^@:/]+):(?!\d+[/:])(.+)$")
+
+
+def _norm_host(host):
+    """Lowercase, IDNA-normalize (so a Unicode homoglyph label separator like `。`/`．`/`｡` folds to
+    ASCII `.`), THEN strip the DNS-equivalent trailing dot — in THAT order (codex r4: stripping
+    BEFORE IDNA left the ascii dot that IDNA produces from a trailing Unicode separator, an
+    under-match). Returns "" if the host is empty."""
+    h = (host or "").strip().lower()
+    if not h:
+        return ""
+    try:
+        h = h.encode("idna").decode("ascii")
+    except Exception:
+        pass  # keep the lowercased form; a mismatch just means "not the enforced identity"
+    return h.rstrip(".").lower()
+
+
+def _canonical_remote(push_url):
+    """Canonical `host/owner/repo` for a recognized network remote (any https/http/ssh/git/scp form,
+    userinfo + port stripped, host IDNA-normalized). The AUTHORITY is separated by `urlsplit` BEFORE
+    any decode, so an encoded `/`/`@` in userinfo cannot restructure the host (codex r3); the PATH is
+    then percent-decoded and split into the final two segments — an encoded separator decodes to an
+    extra segment and so yields a `_NetHost` (host-scoped fail-closed), never a re-parsed identity.
+    Returns a canonical string; a `_NetHost(host)` for a NETWORK-LOOKING but unresolved form (Door 2
+    then fails closed ONLY if that host matches an enforced key's host); or None for a LOCAL path (no
+    scheme, no scp colon → the exact-string fallback, as tests use)."""
+    import urllib.parse
+    s = (push_url or "").strip()
+    if not s:
+        return None
+    try:
+        parts = urllib.parse.urlsplit(s)
+        scheme = parts.scheme.lower()
+    except ValueError:
+        # urlsplit itself can raise on a malformed authority (e.g. a fullwidth `＠`) — a controlled
+        # result, never an uncontrolled traceback (codex r5): treat as an unparseable network-ish
+        # remote with no resolvable host, which matches no enforced host -> not enforced.
+        return _NetHost("")
+    if scheme in ("http", "https", "ssh", "git", "ftp", "ftps"):
+        # structural: urlsplit separates authority from path BEFORE any decode, so an encoded
+        # userinfo cannot inject `@`/`/` into the host.
+        try:
+            host = _norm_host(parts.hostname or "")
+        except Exception:
+            return _NetHost("")
+        m = _OWNER_REPO_RE.match(urllib.parse.unquote(parts.path or ""))
+        if host and m and parts.path:
+            return "%s/%s/%s" % (host, m.group(1).lower(), m.group(2).lower())
+        return _NetHost(host)                 # network-looking but unresolved -> host-scoped fail-closed
+    scp = _SCP_RE.match(s)
+    if scp:
+        host = _norm_host(scp.group(1))
+        m = _OWNER_REPO_RE.match(urllib.parse.unquote(scp.group(2)))
+        if host and m:
+            return "%s/%s/%s" % (host, m.group(1).lower(), m.group(2).lower())
+        return _NetHost(host)
+    return None                               # no scheme, no scp colon -> a LOCAL path
+
+
 def _station_enforced(push_url):
-    """(enforced, boundary) for `push_url` from the COMPILED STATION_ENFORCED map. A key
-    matches when it is a substring of the push URL (a repo's canonical remote
-    identifier). Enforced NOWHERE while the map is empty; a pusher cannot change the
-    map (it is compiled + vendored). `boundary` "" means no legacy grandfathering."""
+    """(enforced, boundary) for `push_url` from the COMPILED STATION_ENFORCED map. Matching is on
+    EXACT repo IDENTITY, NEVER a raw substring (codex §4(g)-activation): a network remote
+    canonicalizes to `host/owner/repo` (all URL forms, IDNA/port/userinfo-robust) and matches a
+    canonical key case-insensitively; a network-looking-but-UNRESOLVED remote FAILS CLOSED (enforce,
+    no legacy grandfathering) ONLY when its host matches an enforced key's host (so an unresolved
+    remote on a DIFFERENT host stays unenforced — this byte-identical gate must not trip in menu/
+    potluck on their unrelated remotes); a LOCAL path matches a LOCAL-PATH key by EXACT string
+    equality (tests' local remotes). Enforced NOWHERE while the map is EMPTY (a pusher cannot change
+    the compiled+vendored map). `boundary` "" means no legacy grandfathering."""
+    if not STATION_ENFORCED:
+        return False, None
+    canon = _canonical_remote(push_url)
+    if isinstance(canon, _NetHost):
+        # network-looking but unresolved -> fail CLOSED (enforce, "" boundary = no grandfathering)
+        # ONLY when the HOST matches an enforced key's host, so an unresolved remote on a DIFFERENT
+        # host (this byte-identical gate also runs in menu/potluck) stays UNENFORCED (codex r5).
+        for key in STATION_ENFORCED:
+            if key and canon.host and key.strip().lower().split("/", 1)[0] == canon.host:
+                return True, ""
+        return False, None
     for key, boundary in STATION_ENFORCED.items():
-        if key and key in push_url:
+        if not key:
+            continue
+        if canon is not None:
+            if key.strip().lower() == canon:
+                return True, boundary
+        # exact-string fallback ONLY for a LOCAL-PATH KEY (the tests' file remotes) — so a schemeless
+        # `github.com/o/r` (git treats it as a LOCAL relative path) does NOT match a canonical
+        # `host/owner/repo` key (codex r3 over-match), and a canonical key only ever matches a real
+        # canonicalized network remote.
+        elif _is_local_ref(key) and key == push_url.strip():
             return True, boundary
     return False, None
 
@@ -515,9 +635,9 @@ def _authorize_update(tip, remote_oid, zero, exclusions, ref_label, push_url):
         # SHIP receipt must carry a `station_run` field that RESOLVES against recomputed
         # git evidence, or the reviewed content must be a grandfathered pre-boundary
         # landing (ancestor of the COMPILED boundary). `parent` == fields["reviewed_head"]
-        # — the station-output commit. The map is EMPTY, so this is enforced NOWHERE: the
-        # verifier running from the working-tree copy at its OWN 3-repo landing is inert
-        # (non-circular by construction).
+        # — the station-output commit. The map enforces derma-demo only, whose canonical key
+        # does not match an infra repo's push URL, so this gate stays inert in harness_core /
+        # menu / potluck (their own landings authorize via the normal receipt path).
         enforced, boundary = _station_enforced(push_url)
         if enforced:
             if fields.get("station_run"):
