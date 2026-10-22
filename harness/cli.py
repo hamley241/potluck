@@ -409,6 +409,18 @@ class _RunWorktree:
         finally:
             try:
                 self._report_survivors()
+            except BaseException as e:   # noqa: BLE001 -- last resort, see below
+                # The report itself can raise (codex r9): a stat on an odd path,
+                # a subprocess that cannot spawn. A5 requires that an incomplete
+                # cleanup is always SAID, so the last resort says it with no
+                # inspection at all rather than saying nothing. BaseException is
+                # deliberate here and safe: this is the innermost handler, it
+                # re-raises nothing only because the outer `finally` has already
+                # let the original exception through.
+                print(f"Warning: the run's worktree may still be at {self.path}; "
+                      f"the cleanup check itself failed ({type(e).__name__}: {e}). "
+                      f"Run `git worktree prune` in {self.root} and delete the "
+                      f"directory if it is there.", file=sys.stderr)
             finally:
                 self.path = None
 
