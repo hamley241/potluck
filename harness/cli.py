@@ -395,13 +395,22 @@ class _RunWorktree:
         # an exception raised while cleaning up (codex BLOCKING, r7). The removal
         # attempts are wrapped; whatever happens, the survival check runs and the
         # operator is told.
+        # FINALLY, not `except Exception` (codex BLOCKING, r8). Ctrl-C raises
+        # KeyboardInterrupt, which derives from BaseException and so slipped
+        # past an `except Exception` — bypassing the one report A5 requires, in
+        # exactly the interrupted-run case an operator most needs it. A bare
+        # `except BaseException` would swallow the interrupt; `finally` reports
+        # and lets it propagate.
         try:
             self._attempt_removal()
         except Exception as e:                      # noqa: BLE001 -- report, never swallow
             print(f"Warning: the run's worktree cleanup raised "
                   f"{type(e).__name__}: {e}", file=sys.stderr)
-        self._report_survivors()
-        self.path = None
+        finally:
+            try:
+                self._report_survivors()
+            finally:
+                self.path = None
 
     def _attempt_removal(self) -> None:
         import shutil
