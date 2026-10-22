@@ -215,10 +215,60 @@ def test_unplaceable_worktree_refuses_naming_sibling_cause():
                "SIBLING" in err and "../harness_core" in err, err[-400:])
 
 
+def test_crash_between_add_and_record_leaves_nothing():
+    """codex BLOCKING r1 (A5): a crash after `git worktree add` but BEFORE the
+    path was recorded orphaned both the directory and the `.git/worktrees`
+    entry, because `remove()` short-circuits on `self.path is None` and nothing
+    else ever looks for them.
+
+    The window is DURING enter(), so the test must enter it: subprocess.run is
+    wrapped so the real `worktree add` executes and the very next call raises,
+    exactly as a SIGINT between the two statements would. An earlier version of
+    this test checked `wt.path` AFTER enter() returned and passed with the fold
+    reverted -- it was asserting a state both orderings reach."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = _setup(Path(td).resolve())
+        cwd0 = os.getcwd()
+        os.chdir(repo)
+        # enter() does a LOCAL `import subprocess`, which binds the same module
+        # object, so patching the module attribute reaches it.
+        real_run = subprocess.run
+        added: list[str] = []
+
+        def crash_after_add(*a, **kw):
+            out = real_run(*a, **kw)
+            argv = a[0] if a else kw.get("args", [])
+            if "worktree" in argv and "add" in argv:
+                added.append("yes")
+                raise KeyboardInterrupt("simulated crash in the record window")
+            return out
+
+        wt = cli._RunWorktree()
+        try:
+            subprocess.run = crash_after_add
+            try:
+                wt.enter()
+            except KeyboardInterrupt:
+                pass
+        finally:
+            subprocess.run = real_run
+            os.chdir(cwd0)
+
+        _check("crash: the add really happened", bool(added))
+        # THE ASSERTION: in the window, is the path visible to cleanup?
+        _check("crash: path is recorded inside the window",
+               wt.path is not None,
+               "path is None -- remove() will short-circuit and orphan the worktree")
+        wt.remove()
+        ok, detail = _no_worktree_left(repo)
+        _check("crash: nothing orphaned after cleanup", ok, detail)
+
+
 def main() -> bool:
     for t in (test_passed_run_delivers_without_moving_the_branch,
               test_foreign_commit_survives_abandonment,
-              test_unplaceable_worktree_refuses_naming_sibling_cause):
+              test_unplaceable_worktree_refuses_naming_sibling_cause,
+              test_crash_between_add_and_record_leaves_nothing):
         t()
     ok_all = True
     for name, ok, detail in _results:

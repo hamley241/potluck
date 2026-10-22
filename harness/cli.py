@@ -266,16 +266,26 @@ class _RunWorktree:
                   f"toolchain error (exit 2) that is not the run's fault.",
                   file=sys.stderr)
             sys.exit(1)
+        # RECORD BEFORE CREATING (codex BLOCKING, r1). `worktree add` makes a
+        # directory AND a `.git/worktrees` entry; recording `self.path` only
+        # after it returned left a window in which a crash or SIGINT orphaned
+        # both, because `cleanup()` short-circuits on `self.path is None` and
+        # nothing else ever looks for them. Recording first means the window
+        # contains no state cleanup cannot see: `cleanup()` tolerates a path
+        # that was never created (remove fails -> rmtree ignore_errors ->
+        # prune), so claiming the path early is strictly safer than claiming it
+        # late.
+        self.root, self.path, self.base = root, path, base
         proc = subprocess.run(
             ["git", "worktree", "add", "--detach", "--quiet", str(path), base],
             cwd=str(root), capture_output=True, text=True)
         if proc.returncode != 0:
+            self.path = None          # nothing was created; do not prune on it
             os.rmdir(path)
             print(f"Error: could not create the run's worktree (git worktree add "
                   f"exited {proc.returncode}): {proc.stderr.strip()[:300]}",
                   file=sys.stderr)
             sys.exit(1)
-        self.root, self.path, self.base = root, path, base
         self._cwd0 = os.getcwd()
         os.chdir(path / Path(self._cwd0).resolve().relative_to(root))
 
