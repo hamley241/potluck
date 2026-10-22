@@ -704,6 +704,21 @@ def cmd_fix(args):
 _REPLY_PERSIST_MAX = 256 * 1024
 
 
+def _warn_quietly(msg: str) -> None:
+    """Report a non-fatal problem without any chance of altering the exit.
+
+    The handlers that call this exist so a persistence failure cannot replace
+    the run's declared outcome -- and a bare `print` to stderr can itself raise
+    (a closed or broken pipe), reintroducing exactly that (codex MAJOR r2,
+    `capture-warning-can-alter-outcome`). A reporting path that can crash is not
+    a reporting path."""
+    try:
+        print(f"Warning: {msg}; the run's outcome is unaffected.",
+              file=sys.stderr)
+    except Exception:                            # noqa: BLE001 -- last resort
+        pass
+
+
 def _persist_reply_sidecar(args, log_out) -> None:
     """Write the no-change reply beside the checkpoint when --run-dir was given,
     so recovery does not depend on the optional --log-file; if NEITHER artifact
@@ -1018,15 +1033,13 @@ def _cmd_fix(args, run: _RunWorktree):
     try:
         write_log(log_out, args)
     except Exception as e:                       # noqa: BLE001 -- never alter the exit
-        print(f"Warning: could not write the run log ({type(e).__name__}: {e}); "
-              f"the run's outcome below is unaffected.", file=sys.stderr)
+        _warn_quietly(f"could not write the run log ({type(e).__name__}: {e})")
     if reply is not None:
         try:
             _persist_reply_sidecar(args, log_out)
         except Exception as e:                   # noqa: BLE001 -- never alter the exit
-            print(f"Warning: could not persist the doer's reply "
-                  f"({type(e).__name__}: {e}); the run's outcome is unaffected.",
-                  file=sys.stderr)
+            _warn_quietly(f"could not persist the doer's reply "
+                          f"({type(e).__name__}: {e})")
     sys.exit(0 if out["outcome"] == "passed" and not delivery_err else 1)
 
 

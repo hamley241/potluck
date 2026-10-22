@@ -1576,6 +1576,15 @@ class Orchestrator:
         # Orchestrator instance is ever reused across features, per-feature
         # counters would otherwise leak across.
         state = _RunState()
+        # RESET PER RUN (codex MAJOR r2, `stale-no-change-reply-on-orchestrator-
+        # reuse`). The comment above says per-feature counters must not leak
+        # across a reused Orchestrator, which is why `state` is a box rather
+        # than self-attributes -- and `_doer_no_change_reply` is the one field
+        # that broke that rule. It is read when building a ModelUnavailable
+        # result, so a reused instance could attach a PREVIOUS run's reply to an
+        # unrelated escalation: misleading evidence, worse than none, and the
+        # exact opposite of why it is captured.
+        self._doer_no_change_reply = None
         # Exception-handler order encodes the precedence rule: a finer-grained
         # signal is never overwritten by a coarser one. Step-level
         # TimeoutEscalation names WHICH step hung; ABORTED_BUDGET only says
