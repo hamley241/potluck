@@ -67,8 +67,16 @@ def load_config(args) -> HarnessConfig:
 
 
 def write_log(result: dict, args):
+    """Write the --log-file operator-only (0o600). It carries model output that
+    can quote the operator's source (and, on a no-change run, the doer's full
+    reply), so it must not inherit a umask-default world-readable mode. The
+    mode is forced on an EXISTING file too: O_CREAT's mode applies only on
+    creation, so fchmod covers the overwrite case."""
     if hasattr(args, "log_file") and args.log_file:
-        Path(args.log_file).write_text(json.dumps(result, indent=2, default=str))
+        fd = os.open(args.log_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(json.dumps(result, indent=2, default=str))
         print(f"\nFull log written to {args.log_file}")
 
 
@@ -690,6 +698,16 @@ def cmd_fix(args):
         run.remove()
 
 
+def _restore_scope(root) -> str:
+    """What the run's restore covers, stated on EVERY run's output. Disclosure
+    only: the run cannot enumerate repos it was never told about, so it neither
+    restores nor detects edits outside its own worktree -- and says so, so
+    "nothing was restored elsewhere" is a recorded fact, not an assumption."""
+    return (f"only this run's own worktree of {root or 'the target repo'}; "
+            f"edits made anywhere else (another repo, or any path outside that "
+            f"worktree) are neither restored nor detected by this run")
+
+
 def _cmd_fix(args, run: _RunWorktree):
     from . import checkpoint as ck
     # Absolute now: the run executes with cwd inside its own worktree, which is
@@ -883,6 +901,7 @@ def _cmd_fix(args, run: _RunWorktree):
         # human-readable section below is printed only in non-JSON mode.
         "closure_report": (result.closure_report.model_dump(mode="json")
                            if result.closure_report else None),
+        "restore_scope": _restore_scope(run.root),
         "debate_log": result.debate_log,
     }
 
@@ -893,6 +912,7 @@ def _cmd_fix(args, run: _RunWorktree):
         print(f"  {symbol}  |  Rounds: {out['rounds_used']}")
         if out["escalation_reason"]:
             print(f"  Reason: {out['escalation_reason']}")
+        print(f"  Restore scope: {out['restore_scope']}")
         print(f"{'='*60}")
         # Class-closure sweep: only on a PASSED run that found siblings. The
         # presentation keeps the two kinds of text unmissably distinct so a
@@ -923,7 +943,13 @@ def _cmd_fix(args, run: _RunWorktree):
     else:
         print(json.dumps(out, indent=2, default=str))
 
-    write_log(out, args)
+    # The doer's COMPLETE no-change reply goes to the 0o600 --log-file only;
+    # stdout (terminal / --json-output) keeps the debate log's capped preview.
+    # Present only when a no-change reply was captured.
+    log_out = out
+    if result.doer_no_change_reply is not None:
+        log_out = {**out, "doer_no_change_reply": result.doer_no_change_reply}
+    write_log(log_out, args)
     sys.exit(0 if out["outcome"] == "passed" and not delivery_err else 1)
 
 
