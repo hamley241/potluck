@@ -256,7 +256,23 @@ class _RunWorktree:
                   file=sys.stderr)
             sys.exit(1)
         try:
-            path = Path(tempfile.mkdtemp(prefix=f".{root.name}.potluck-run-",
+            # Claim the directory the INSTANT it exists (codex BLOCKING, r3).
+            # mkdtemp CREATES it, so recording self.path after the call left the
+            # same window one step earlier than r1 closed: a crash in between
+            # orphans a directory beside the operator's checkout that remove()
+            # cannot see. self.root is set first so remove() has a cwd to prune
+            # from, and mkdtemp's return is assigned straight onto self.path --
+            # there is no longer a local the claim can lag behind.
+            #
+            # IRREDUCIBLE REMAINDER, stated rather than implied: a kill
+            # between mkdtemp's syscall returning and this assignment still
+            # orphans the directory. No in-process ordering closes that --
+            # it needs a DURABLE record of the intended path written before
+            # creation, so a later run can sweep it. Declared, not built:
+            # the window is now one assignment wide, against a whole
+            # `git worktree add` before r1 and a whole mkdtemp before r3.
+            self.root = root
+            self.path = path = Path(tempfile.mkdtemp(prefix=f".{root.name}.potluck-run-",
                                          dir=root.parent))
         except OSError as e:
             print(f"Error: cannot create the run's worktree beside {root} ({e}). "
@@ -275,7 +291,7 @@ class _RunWorktree:
         # that was never created (remove fails -> rmtree ignore_errors ->
         # prune), so claiming the path early is strictly safer than claiming it
         # late.
-        self.root, self.path, self.base = root, path, base
+        self.base = base
         proc = subprocess.run(
             ["git", "worktree", "add", "--detach", "--quiet", str(path), base],
             cwd=str(root), capture_output=True, text=True)
