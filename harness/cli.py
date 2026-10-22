@@ -402,11 +402,25 @@ class _RunWorktree:
         # above swallow their own failure -- rmtree(ignore_errors=True) by
         # definition -- so without this check a run could leave its worktree
         # behind and say nothing, which is the silence A5 exists to prevent.
-        if Path(self.path).exists():
-            print(f"Warning: the run's worktree could not be removed and is "
-                  f"still at {self.path}. It will be swept by the next run in "
-                  f"this checkout; remove it by hand if you prefer.",
-                  file=sys.stderr)
+        # (2) CHECK THE ADMIN ENTRY TOO (codex BLOCKING, r6). `git worktree
+        # prune` above has its failure discarded, and a stale `.git/worktrees`
+        # entry is invisible to a directory check -- so a cleanup could leave
+        # one and report success. Both halves are checked, and the message says
+        # which survived.
+        left_dir = Path(self.path).exists()
+        listed = subprocess.run(["git", "worktree", "list", "--porcelain"],
+                                cwd=str(self.root), capture_output=True, text=True)
+        left_admin = str(self.path) in (listed.stdout or "")
+        if left_dir or left_admin:
+            what = " and ".join(
+                [s for s in ("the directory" if left_dir else "",
+                             "a .git/worktrees entry" if left_admin else "") if s])
+            # NOTE: no sweep exists (removed in r5), so this is NOT cleaned up
+            # later. Saying otherwise would be a promise the code does not keep.
+            print(f"Warning: the run's worktree could not be fully removed -- "
+                  f"{what} survives at {self.path}. Nothing removes it "
+                  f"automatically: run `git worktree prune` in {self.root} and "
+                  f"delete the directory.", file=sys.stderr)
         self.path = None
 
 
