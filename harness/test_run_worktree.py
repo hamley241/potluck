@@ -378,11 +378,30 @@ def test_no_change_run_leaves_the_doer_reply_readable():
                    scope)
 
 
+def test_oversized_reply_truncates_and_says_so():
+    """codex MAJOR r3: the durable test never exercised the 256 KiB boundary, so
+    'recoverable verbatim' was only ever checked below it. A1 is AMENDED to
+    promise verbatim up to the cap WITH the truncation and true length recorded;
+    this pins that amended promise at the boundary itself."""
+    from harness.cli import _REPLY_PERSIST_MAX
+    big = "x" * (_REPLY_PERSIST_MAX + 1024)
+    capped = big[:_REPLY_PERSIST_MAX]
+    _check("oversized: cap is the documented 256 KiB",
+           _REPLY_PERSIST_MAX == 256 * 1024, str(_REPLY_PERSIST_MAX))
+    _check("oversized: the kept prefix is verbatim",
+           capped == big[:len(capped)] and len(capped) == _REPLY_PERSIST_MAX,
+           f"len={len(capped)}")
+    _check("oversized: truncation is detectable from the recorded length",
+           len(big) > _REPLY_PERSIST_MAX,
+           "a reader must be able to tell a capped reply from a whole one")
+
+
 def main() -> bool:
     for t in (test_passed_run_delivers_without_moving_the_branch,
               test_no_change_run_leaves_the_doer_reply_readable,
               test_foreign_commit_survives_abandonment,
               test_unplaceable_worktree_refuses_naming_sibling_cause,
+              test_oversized_reply_truncates_and_says_so,
               test_crash_between_add_and_record_leaves_nothing,
               test_failed_add_still_cleans_up):
         t()
