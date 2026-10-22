@@ -1185,6 +1185,11 @@ class FeatureResult:
     # was disabled, skipped (any failure), or came back clean. Advisory only --
     # its presence NEVER changes `outcome`.
     closure_report: ClosureReport | None = None
+    # The doer's COMPLETE implement reply on a no-change run (the debate log's
+    # `doer_no_change` event carries only a _MAX_STR-capped preview). None when
+    # no such reply was captured. Kept off debate_log on purpose: cli writes it
+    # only to the operator-only (0o600) --log-file, never to stdout.
+    doer_no_change_reply: str | None = None
 
 
 class DoerClient:
@@ -1472,6 +1477,8 @@ class Orchestrator:
         # a deterministic function so they can assert on which side "wins".
         self._ab_swap = ab_swap or (lambda _id: random.random() < 0.5)
         self.log: list[dict] = []
+        # Full doer reply of a no-change implement (see FeatureResult field).
+        self._doer_no_change_reply: str | None = None
         # Per-message-type re-prompt counters (slice B3). The measuring device
         # for the malformed-reply before/after: seen-by-defect, re-prompts
         # issued, cured vs recurred. Updated ALONGSIDE the `reprompt` log event
@@ -1569,6 +1576,15 @@ class Orchestrator:
         # Orchestrator instance is ever reused across features, per-feature
         # counters would otherwise leak across.
         state = _RunState()
+        # RESET PER RUN (codex MAJOR r2, `stale-no-change-reply-on-orchestrator-
+        # reuse`). The comment above says per-feature counters must not leak
+        # across a reused Orchestrator, which is why `state` is a box rather
+        # than self-attributes -- and `_doer_no_change_reply` is the one field
+        # that broke that rule. It is read when building a ModelUnavailable
+        # result, so a reused instance could attach a PREVIOUS run's reply to an
+        # unrelated escalation: misleading evidence, worse than none, and the
+        # exact opposite of why it is captured.
+        self._doer_no_change_reply = None
         # Exception-handler order encodes the precedence rule: a finer-grained
         # signal is never overwritten by a coarser one. Step-level
         # TimeoutEscalation names WHICH step hung; ABORTED_BUDGET only says
@@ -1597,6 +1613,7 @@ class Orchestrator:
                 rounds_used=state.rounds_used,
                 debate_log=self.log,
                 escalation_reason=f"[{mu.role}] {mu.detail}",
+                doer_no_change_reply=self._doer_no_change_reply,
             )
         except CallBudgetExceeded as cbe:
             # The declared per-run bounded-call budget (§1.3) was hit: a run made
@@ -1722,10 +1739,34 @@ class Orchestrator:
             self._ckpt(Phase.IMPLEMENT, 0, "doer:implement", state, diff, verdict,
                        accepted_issues_by_id, unresolved, response,
                        attempt=_attempt(Phase.IMPLEMENT))
-            await self._run_step(cur, Phase.IMPLEMENT, 0,
-                                 lambda: self._doer_implement(spec, acceptance))
+            reply = await self._run_step(
+                cur, Phase.IMPLEMENT, 0,
+                lambda: self._doer_implement(spec, acceptance))
             diff = await self._capture_diff("initial")
             if not diff.strip():
+                # The doer's reply is the only evidence of WHY nothing changed
+                # (e.g. it judged the spec unsatisfiable), so it is logged before
+                # the unchanged escalation. `reply` is recorded as-is: None
+                # (missing) and "" (empty) stay distinct from no event at all
+                # (not captured). Evidence only -- the outcome and reason below
+                # do not depend on it.
+                #
+                # WHERE IT GOES (decided). The reply can quote the operator's
+                # source, so:
+                #   * the debate log gets a PREVIEW, capped at _MAX_STR with the
+                #     cut recorded in `truncations`, like all model output there.
+                #     The debate log is printed to stdout (terminal or
+                #     --json-output), whose readership is whoever the operator
+                #     points stdout at -- the harness cannot restrict it.
+                #   * the COMPLETE reply rides on FeatureResult and is written
+                #     only to the --log-file, which cli creates/overwrites with
+                #     operator-only (0o600) permissions. Without --log-file the
+                #     suffix past _MAX_STR is not persisted anywhere.
+                # It is deliberately NOT put in station-run.json (a provenance
+                # record built from digests, meant to travel with a landing) nor
+                # the checkpoint (resume state).
+                self._doer_no_change_reply = reply
+                self._log("doer_no_change", reply=reply)
                 raise ModelUnavailable(
                     "doer",
                     "doer:implement produced no changes; a fix run that changed "

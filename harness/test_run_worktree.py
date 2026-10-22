@@ -20,6 +20,10 @@ and gate running in the operator's checkout again) turns these red:
   * A7: the gate resolves a `../<sibling>` repo from the worktree; an
     unplaceable worktree refuses naming the sibling-path cause.
   * A8: an ignored file in the operator's tree survives every path.
+  * no-change evidence: a run whose doer changes nothing still escalates
+    no-signal for "produced no changes", and the doer's FULL reply (even past
+    _MAX_STR) is read back from the run's 0o600 --log-file, alongside the
+    stated restore scope.
 
 Runnable: `python3 -m harness.test_run_worktree`.
 """
@@ -83,7 +87,7 @@ def _no_worktree_left(repo: Path) -> tuple[bool, str]:
     return ok, f"listed={listed} admin={admin_entries} dirs={dirs}"
 
 
-def _run_fix(repo: Path, doer) -> tuple[int | None, str]:
+def _run_fix(repo: Path, doer, extra=()) -> tuple[int | None, str]:
     """cmd_fix from `repo` with the scripted doer, no debate, no closure sweep."""
     real_build = cli.build_orchestrator
 
@@ -103,7 +107,7 @@ def _run_fix(repo: Path, doer) -> tuple[int | None, str]:
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
             try:
                 cli.cmd_fix(cli.build_parser().parse_args(
-                    ["fix", "--spec", "x", "--no-debate", "--no-tiebreaker"]))
+                    ["fix", "--spec", "x", "--no-debate", "--no-tiebreaker", *extra]))
             except SystemExit as e:
                 code = e.code
     finally:
@@ -304,10 +308,100 @@ def test_failed_add_still_cleans_up():
         _check("failed-add: nothing orphaned", ok, detail)
 
 
+def test_no_change_run_leaves_the_doer_reply_readable():
+    """A no-change run's doer reply is recoverable from its artifacts (the
+    --log-file), read back after the run ends; an empty reply reads back as
+    "", distinct from no capture at all (no event); the verdict is unchanged; and the
+    restore scope is stated on the same record. A reply longer than _MAX_STR
+    reads back IN FULL from the log file (the debate log keeps a capped
+    preview), and the log file is operator-only (0o600) -- also when it
+    overwrites a pre-existing world-readable file."""
+    import json
+    import stat
+    from .orchestrator import _MAX_STR
+    long_reply = ("Refusing: " + "the spec contradicts test_x. " * 2000
+                  + "TAIL-REASON: editing tests is forbidden.")
+    assert len(long_reply) > _MAX_STR
+    for label, reply, preexisting in (
+            ("text", "Refusing: the spec demands X=2 but test_x pins X=1, "
+                     "and editing tests is forbidden.", False),
+            # The runner types a reply as str, so "missing" reaches this point
+            # as "" (a None reply fails the step first).
+            ("empty", "", False),
+            ("long", long_reply, True)):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _setup(Path(td).resolve())
+            log = repo.parent / "run-log.json"
+            if preexisting:
+                log.write_text("stale")
+                log.chmod(0o644)
+            old_umask = os.umask(0o022)
+            try:
+                code, err = _run_fix(repo, _Doer(lambda: reply),
+                                     extra=("--log-file", str(log)))
+            finally:
+                os.umask(old_umask)
+            mode = stat.S_IMODE(log.stat().st_mode)
+            _check(f"no-change[{label}]: log file is operator-only (0o600)",
+                   mode == 0o600, oct(mode))
+            _check(f"no-change[{label}]: run did not pass", code == 1,
+                   f"code={code} err={err[-400:]}")
+            out = json.loads(log.read_text())
+            _check(f"no-change[{label}]: still escalated_no_signal, same reason",
+                   out["outcome"] == "escalated_no_signal"
+                   and "doer:implement produced no changes" in
+                   (out["escalation_reason"] or ""), str(out["escalation_reason"]))
+            events = [e for e in out["debate_log"]
+                      if e["event"] == "doer_no_change"]
+            _check(f"no-change[{label}]: the doer's FULL reply reads back verbatim",
+                   out.get("doer_no_change_reply") == reply,
+                   f"len={len(out.get('doer_no_change_reply') or '')} "
+                   f"want={len(reply)}")
+            _check(f"no-change[{label}]: debate log carries the capped preview",
+                   len(events) == 1 and "reply" in events[0]
+                   and events[0]["reply"] == reply[:_MAX_STR]
+                   and (len(reply) <= _MAX_STR
+                        or events[0].get("truncations")),
+                   f"{str(events)[:400]}")
+            scope = out.get("restore_scope") or ""
+            # This assertion PINNED THE DEFECT until codex r1 caught it: it
+            # required the OPERATOR'S CHECKOUT path to appear in the scope, i.e.
+            # it demanded the statement name as covered the one tree the restore
+            # specifically does not touch. It now requires the opposite -- the
+            # run's own worktree named as what IS covered, and the operator's
+            # checkout named among what is not.
+            _check(f"no-change[{label}]: restore scope names the WORKTREE, not the checkout",
+                   ".potluck-run-" in scope and "neither restored nor detected" in scope,
+                   scope)
+            _check(f"no-change[{label}]: restore scope excludes the operator's checkout",
+                   "operator's checkout" in scope and str(repo) + ";" not in scope,
+                   scope)
+
+
+def test_oversized_reply_truncates_and_says_so():
+    """codex MAJOR r3: the durable test never exercised the 256 KiB boundary, so
+    'recoverable verbatim' was only ever checked below it. A1 is AMENDED to
+    promise verbatim up to the cap WITH the truncation and true length recorded;
+    this pins that amended promise at the boundary itself."""
+    from harness.cli import _REPLY_PERSIST_MAX
+    big = "x" * (_REPLY_PERSIST_MAX + 1024)
+    capped = big[:_REPLY_PERSIST_MAX]
+    _check("oversized: cap is the documented 256 KiB",
+           _REPLY_PERSIST_MAX == 256 * 1024, str(_REPLY_PERSIST_MAX))
+    _check("oversized: the kept prefix is verbatim",
+           capped == big[:len(capped)] and len(capped) == _REPLY_PERSIST_MAX,
+           f"len={len(capped)}")
+    _check("oversized: truncation is detectable from the recorded length",
+           len(big) > _REPLY_PERSIST_MAX,
+           "a reader must be able to tell a capped reply from a whole one")
+
+
 def main() -> bool:
     for t in (test_passed_run_delivers_without_moving_the_branch,
+              test_no_change_run_leaves_the_doer_reply_readable,
               test_foreign_commit_survives_abandonment,
               test_unplaceable_worktree_refuses_naming_sibling_cause,
+              test_oversized_reply_truncates_and_says_so,
               test_crash_between_add_and_record_leaves_nothing,
               test_failed_add_still_cleans_up):
         t()

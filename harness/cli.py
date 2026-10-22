@@ -67,8 +67,16 @@ def load_config(args) -> HarnessConfig:
 
 
 def write_log(result: dict, args):
+    """Write the --log-file operator-only (0o600). It carries model output that
+    can quote the operator's source (and, on a no-change run, the doer's full
+    reply), so it must not inherit a umask-default world-readable mode. The
+    mode is forced on an EXISTING file too: O_CREAT's mode applies only on
+    creation, so fchmod covers the overwrite case."""
     if hasattr(args, "log_file") and args.log_file:
-        Path(args.log_file).write_text(json.dumps(result, indent=2, default=str))
+        fd = os.open(args.log_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(json.dumps(result, indent=2, default=str))
         print(f"\nFull log written to {args.log_file}")
 
 
@@ -690,6 +698,76 @@ def cmd_fix(args):
         run.remove()
 
 
+# A model reply is unbounded; persisting it verbatim is a storage and
+# serialization risk on the FAILURE path, where the run must still exit the way
+# it declared. 256 KiB keeps any plausible reply whole while bounding the write.
+_REPLY_PERSIST_MAX = 256 * 1024
+
+
+def _warn_quietly(msg: str) -> None:
+    """Report a non-fatal problem without any chance of altering the exit.
+
+    The handlers that call this exist so a persistence failure cannot replace
+    the run's declared outcome -- and a bare `print` to stderr can itself raise
+    (a closed or broken pipe), reintroducing exactly that (codex MAJOR r2,
+    `capture-warning-can-alter-outcome`). A reporting path that can crash is not
+    a reporting path."""
+    try:
+        print(f"Warning: {msg}; the run's outcome is unaffected.",
+              file=sys.stderr)
+    except Exception:                            # noqa: BLE001 -- last resort
+        pass
+
+
+def _persist_reply_sidecar(args, log_out) -> None:
+    """Write the no-change reply beside the checkpoint when --run-dir was given,
+    so recovery does not depend on the optional --log-file; if NEITHER artifact
+    was requested, say on stderr that the reply was not persisted and how to
+    capture it next time. Operator-only (0o600) for the same reason the log is:
+    the reply can quote the operator's source."""
+    import json as _json
+    run_dir = getattr(args, "run_dir", None) or getattr(args, "resume", None)
+    if not run_dir:
+        if not getattr(args, "log_file", None):
+            print("Note: the doer's full reply was NOT persisted -- neither "
+                  "--log-file nor --run-dir was given. Re-run with one of them "
+                  "to capture it.", file=sys.stderr)
+        return
+    path = Path(run_dir) / "doer-no-change-reply.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), 0o600)
+        _json.dump({k: v for k, v in log_out.items()
+                    if k.startswith("doer_no_change_reply")}, f, indent=2)
+    print(f"  Doer's no-change reply: {path}", file=sys.stderr)
+
+
+def _restore_scope(worktree, allow_dirty: bool = False) -> str:
+    """What the run's restore covers, stated on EVERY run's output. Disclosure
+    only: the run cannot enumerate repos it was never told about, so it neither
+    restores nor detects edits outside its own worktree -- and says so, so
+    "nothing was restored elsewhere" is a recorded fact, not an assumption.
+
+    Takes the WORKTREE, not the operator's checkout (codex MAJOR r1,
+    `restore-scope-wrong-path`): naming `run.root` told the reader the restore
+    covered the checkout it specifically does NOT touch -- the exact
+    claims-coverage-it-lacks defect this function exists to end, committed by
+    the function itself.
+
+    `--allow-dirty` sets `restore_tree = None`, so there is NO restore at all
+    (codex MAJOR r1, `RESTORE-SCOPE-ALLOW-DIRTY`). Saying "only this worktree"
+    would then overstate by claiming a restore that was never wired."""
+    if allow_dirty:
+        return ("NOTHING -- --allow-dirty disables tree restore entirely. No "
+                "path is restored, and edits anywhere (including this run's "
+                "worktree) are neither restored nor detected by this run")
+    where = worktree or "this run's worktree"
+    return (f"only this run's own worktree ({where}); edits made anywhere else "
+            f"-- another repo, the operator's checkout, or any path outside "
+            f"that worktree -- are neither restored nor detected by this run")
+
+
 def _cmd_fix(args, run: _RunWorktree):
     from . import checkpoint as ck
     # Absolute now: the run executes with cwd inside its own worktree, which is
@@ -883,6 +961,7 @@ def _cmd_fix(args, run: _RunWorktree):
         # human-readable section below is printed only in non-JSON mode.
         "closure_report": (result.closure_report.model_dump(mode="json")
                            if result.closure_report else None),
+        "restore_scope": _restore_scope(run.path, getattr(args, "allow_dirty", False)),
         "debate_log": result.debate_log,
     }
 
@@ -893,6 +972,7 @@ def _cmd_fix(args, run: _RunWorktree):
         print(f"  {symbol}  |  Rounds: {out['rounds_used']}")
         if out["escalation_reason"]:
             print(f"  Reason: {out['escalation_reason']}")
+        print(f"  Restore scope: {out['restore_scope']}")
         print(f"{'='*60}")
         # Class-closure sweep: only on a PASSED run that found siblings. The
         # presentation keeps the two kinds of text unmissably distinct so a
@@ -923,7 +1003,43 @@ def _cmd_fix(args, run: _RunWorktree):
     else:
         print(json.dumps(out, indent=2, default=str))
 
-    write_log(out, args)
+    # The doer's COMPLETE no-change reply is persisted to operator-only (0o600)
+    # artifacts. stdout keeps the debate log's capped preview -- note that a
+    # reply SHORTER than the cap is complete in that preview too, so the claim
+    # is "nothing longer than the cap reaches stdout", not "stdout never holds a
+    # complete reply" (codex MINOR r1, `NOCHANGE-STDOUT-CONFINEMENT`).
+    #
+    # RECOVERY MUST NOT DEPEND ON AN OPTIONAL FLAG (codex MAJOR r1,
+    # `no-change-recovery-optional`): A1 requires the reply be recoverable after
+    # a no-change run, and --log-file is optional. It is written to the --run-dir
+    # sidecar as well when there is one, and when NEITHER artifact was requested
+    # the run says so on stderr instead of silently dropping it -- "not
+    # persisted, and here is how to get it" beats a promise the flags did not
+    # make.
+    #
+    # The write is BOUNDED and CANNOT change termination (codex MAJOR r1,
+    # `unbounded-reply-can-alter-termination`; A3): an uncapped model reply can
+    # fail on serialization or storage, and an exception here would replace the
+    # declared no-signal exit with a crash. Capped, and wrapped so any failure
+    # is reported and the exit code is unchanged.
+    log_out = out
+    reply = result.doer_no_change_reply
+    if reply is not None:
+        capped = reply[:_REPLY_PERSIST_MAX]
+        truncated = len(reply) > _REPLY_PERSIST_MAX
+        log_out = {**out, "doer_no_change_reply": capped,
+                   "doer_no_change_reply_truncated": truncated,
+                   "doer_no_change_reply_full_length": len(reply)}
+    try:
+        write_log(log_out, args)
+    except Exception as e:                       # noqa: BLE001 -- never alter the exit
+        _warn_quietly(f"could not write the run log ({type(e).__name__}: {e})")
+    if reply is not None:
+        try:
+            _persist_reply_sidecar(args, log_out)
+        except Exception as e:                   # noqa: BLE001 -- never alter the exit
+            _warn_quietly(f"could not persist the doer's reply "
+                          f"({type(e).__name__}: {e})")
     sys.exit(0 if out["outcome"] == "passed" and not delivery_err else 1)
 
 
