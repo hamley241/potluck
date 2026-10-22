@@ -10,11 +10,25 @@ same timeout on a real converge run (n=3). The constant is now 600. A bare
 constant edit re-opens the moment a fourth doer step is added at a number picked
 by feel, so the invariant is pinned here instead.
 
-WHICH STEPS (derived, never a hand-kept list): every key of
-`timeouts.doer_step_seconds`. The map IS the set of doer steps by construction —
-`step_seconds()` consults it by key — so a new generative step arrives as a new
-key and is governed automatically. A hand-kept list of today's three names is
-exactly what lets a fourth slip in unnoticed.
+WHICH STEPS (derived, never a hand-kept list), in TWO directions, because one
+is not enough:
+
+  * every key of `timeouts.doer_step_seconds` shares the ceiling; and
+  * every `"doer:*"` step literal USED in the package's non-test modules is a key
+    of that map.
+
+The second direction is the load-bearing one and the first alone is a false
+comfort: `resolve_doer_timeout` falls through to `model_call_seconds` (300) for
+an UNMAPPED step, so a new generative step that is simply never added to the map
+inherits 300 silently — and a check that only reads map keys cannot see it,
+because the step is not a key. That is the exact drift this suite claims to
+prevent, and it passed by construction until a cross-provider reviewer named it
+(MAJOR, `timeout-band-step-universe`).
+
+LIMIT OF THE SCAN, stated rather than implied: it finds STRING LITERALS. A step
+name assembled at runtime (`f"doer:{x}"`) would escape it. Every doer step today
+is a literal, and introducing a computed one should be a deliberate act — but
+this check does not prove the absence of one.
 
 WHAT "GENERATIVE" MEANS HERE, honestly: it is NOT derivable from the data. The
 map carries names and integers; nothing in it marks a step as generative. Every
@@ -43,9 +57,14 @@ synthetic configs and require the checker to fail them.
 Runnable: `python3 -m harness.test_timeout_band`.
 """
 
+import pathlib
+import re
 import sys
 
 from harness.config import HarnessConfig
+
+PACKAGE = pathlib.Path(__file__).resolve().parent
+_DOER_LITERAL = re.compile(r'"(doer:[a-z_]+)"')
 
 results: dict[str, bool] = {}
 
@@ -59,6 +78,26 @@ def _off_band(steps: "dict[str, int]") -> "list[str]":
     return sorted(name for name, secs in steps.items() if secs != ceiling)
 
 
+def used_doer_steps(package: pathlib.Path) -> "set[str]":
+    """Every `"doer:*"` literal appearing in the package's NON-TEST modules.
+
+    Test modules are excluded deliberately: they name synthetic steps on purpose
+    (`doer:unknown` to exercise the unmapped fallback, `doer:new_step` to prove
+    this very checker can fail), and those must not be required in the map."""
+    used: set[str] = set()
+    for f in sorted(package.rglob("*.py")):
+        if any(part.startswith(("_", "test_")) for part in f.relative_to(package).parts):
+            continue
+        used.update(_DOER_LITERAL.findall(f.read_text(encoding="utf-8")))
+    return used
+
+
+def unmapped(used: "set[str]", steps: "dict[str, int]") -> "list[str]":
+    """Steps the code USES that the map does not cover — each silently inheriting
+    the 300s default via resolve_doer_timeout's fallback."""
+    return sorted(s for s in used if s not in steps)
+
+
 def main() -> bool:
     cfg = HarnessConfig()
     steps = cfg.timeouts.doer_step_seconds
@@ -70,6 +109,15 @@ def main() -> bool:
         print(f"  off-band steps: {', '.join(_off_band(steps))}")
     results["respond_is_at_the_shared_ceiling"] = (
         steps.get("doer:respond") == max(steps.values()))
+
+    # --- NO used step escapes the map into the 300s fallback (codex MAJOR r1) ---
+    used = used_doer_steps(PACKAGE)
+    results["used_doer_steps_found"] = len(used) > 0
+    missing = unmapped(used, steps)
+    results["every_used_doer_step_is_mapped"] = not missing
+    if missing:
+        print(f"  unmapped doer steps (each silently gets "
+              f"{cfg.timeouts.model_call_seconds}s): {', '.join(missing)}")
 
     # --- the outer-bound guarantee holds for the shipped defaults (§1.3) ---
     # feature_seconds >= outer_min is what keeps the finer step/call signals able
@@ -96,6 +144,12 @@ def main() -> bool:
     results["off_band_names_every_offender"] = (
         _off_band({"a": 600, "b": 300, "c": 120}) == ["b", "c"])
     results["uniform_band_is_clean"] = not _off_band({"a": 600, "b": 600})
+    # the SECOND direction can fail too: a used-but-unmapped step is named
+    results["unmapped_step_is_detected"] = (
+        unmapped({"doer:implement", "doer:ghost"}, {"doer:implement": 600})
+        == ["doer:ghost"])
+    results["fully_mapped_is_clean"] = not unmapped(
+        {"doer:implement"}, {"doer:implement": 600, "doer:spare": 600})
     results["empty_map_is_not_a_violation"] = not _off_band({})
 
     ok_all = True
