@@ -3142,8 +3142,13 @@ async def real_run_gate(gate_path: str = "./.claude/verify.sh") -> str:
 async def real_restore_tree() -> None:
     """Restore the working tree to the pre-implement baseline: discard all
     tracked changes and remove untracked files. The baseline is HEAD with a
-    clean tree (guaranteed by cli's clean-tree precondition), so
+    clean tree (cli creates the run's worktree clean at the base), so
     `git reset --hard` + `git clean -fd` restores it exactly.
+
+    Runs with cwd inside the RUN'S OWN worktree (cli._RunWorktree), never the
+    operator's checkout: the reset touches only that worktree's detached HEAD,
+    index and files -- refs and state the run exclusively controls -- so it can
+    never move the operator's branch or discard a foreign session's work.
 
     Two call sites, distinct in timing:
       * Per-attempt hook, INSIDE the bounded implement step -- runs before every
