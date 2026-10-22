@@ -193,14 +193,171 @@ def _build_checkpointer(run_dir: str, cfg: HarnessConfig, spec: str,
         cfg_digest, base, manifest_id
 
 
+class _RunWorktree:
+    """The run's OWN git worktree, detached at the run's base commit
+    (FU-ref-ownership ruling: potluck must never move a ref the run does not
+    exclusively control). The doer, the gate, the diff, the restore and the
+    checkpoint engine all run with cwd inside it, so every reset they do moves
+    only this worktree's detached HEAD -- a ref the run owns -- and the
+    operator's branch ref, HEAD, index and working tree are never written during
+    the run. A foreign session committing to the operator's branch mid-run is
+    therefore untouched by anything the run does, abandonment included.
+
+    PLACEMENT (the sibling-path trap): the worktree is created as a hidden
+    SIBLING of the operator's checkout (same parent directory). The fleet
+    resolves sibling repos by RELATIVE path -- menu's pyproject declares
+    `harness-core = { path = "../harness_core" }` and the `./test` scripts
+    default CORE to `$REPO/../harness_core` -- so a worktree anywhere else would
+    resolve `../harness_core` to nothing and the gate would fail as a toolchain
+    error (exit 2, no signal) that looks like the run's fault. As a sibling,
+    every `../<repo>` resolves exactly as it does from the operator's checkout.
+    If the parent directory is not writable we refuse, naming this cause, rather
+    than fall back to a location where the gate cannot see its siblings.
+
+    OUTPUT ON SUCCESS (decided): the run's change is APPLIED to the operator's
+    working tree as uncommitted change (`git apply`, working tree only). That
+    keeps potluck's existing contract -- the work is left as uncommitted change
+    in the operator's tree -- and moves no ref. Merely reporting the worktree
+    path was rejected: it breaks that contract for every caller (conductor,
+    /potluck, a human), and it would require the worktree to outlive the run,
+    which is exactly the orphan accumulation this must not cause. `git apply` is
+    all-or-nothing, so if the operator's tree has diverged in an overlapping way
+    nothing is written; the patch is saved outside the tree and its path
+    reported instead. A worktree whose HEAD left the base (the doer COMMITTED)
+    is not applied: the committed part never reached the review diff
+    (`git diff HEAD`), so applying it would deliver unreviewed work.
+
+    OUTPUT ON FAILURE (decided): nothing. Any non-PASSED outcome writes nothing
+    to the operator's tree -- not even a restore, because nothing was ever
+    written there -- and the worktree is removed. A checkpointed run's work
+    survives in its run-dir checkpoint and is reconstructed by `--resume` into a
+    fresh worktree.
+
+    The worktree is removed when the run ends, on every path (cmd_fix's
+    `finally`), together with its `.git/worktrees` administrative entry."""
+
+    def __init__(self):
+        self.root: Path | None = None   # the operator's checkout
+        self.path: Path | None = None   # the run's worktree
+        self.base: str | None = None    # the commit it is detached at
+        self._cwd0: str | None = None
+
+    def enter(self) -> None:
+        """Create the worktree at the operator's HEAD and chdir into it (at the
+        same relative subdirectory the run was invoked from)."""
+        import subprocess
+        import tempfile
+        root = _git_toplevel()
+        try:
+            base = _git_head()
+        except RuntimeError as e:
+            print(f"Error: {e}. potluck fix runs in its own git worktree, so it "
+                  f"needs a git repository with at least one commit.",
+                  file=sys.stderr)
+            sys.exit(1)
+        try:
+            path = Path(tempfile.mkdtemp(prefix=f".{root.name}.potluck-run-",
+                                         dir=root.parent))
+        except OSError as e:
+            print(f"Error: cannot create the run's worktree beside {root} ({e}). "
+                  f"It must be a SIBLING of the checkout: sibling repos are "
+                  f"resolved by relative path (e.g. ../harness_core), and a "
+                  f"worktree placed anywhere else would make the gate fail as a "
+                  f"toolchain error (exit 2) that is not the run's fault.",
+                  file=sys.stderr)
+            sys.exit(1)
+        proc = subprocess.run(
+            ["git", "worktree", "add", "--detach", "--quiet", str(path), base],
+            cwd=str(root), capture_output=True, text=True)
+        if proc.returncode != 0:
+            os.rmdir(path)
+            print(f"Error: could not create the run's worktree (git worktree add "
+                  f"exited {proc.returncode}): {proc.stderr.strip()[:300]}",
+                  file=sys.stderr)
+            sys.exit(1)
+        self.root, self.path, self.base = root, path, base
+        self._cwd0 = os.getcwd()
+        os.chdir(path / Path(self._cwd0).resolve().relative_to(root))
+
+    def leave(self) -> None:
+        if self._cwd0 is not None:
+            os.chdir(self._cwd0)
+            self._cwd0 = None
+
+    def deliver(self) -> str | None:
+        """Apply the run's change (base -> the worktree's final tree, untracked
+        non-ignored files included) to the operator's working tree. Returns None
+        on success, else an error message; writes nothing to the operator's tree
+        on any failure."""
+        import subprocess
+        import tempfile
+        wt = str(self.path)
+
+        def git(*args, cwd=wt, env=None, data=None):
+            return subprocess.run(["git", *args], cwd=cwd, input=data,
+                                  env={**os.environ, **env} if env else None,
+                                  capture_output=True)
+
+        head = git("rev-parse", "HEAD").stdout.decode().strip()
+        if head != self.base:
+            return ("the doer COMMITTED in the run's worktree (HEAD moved off the "
+                    "base), so part of its work never reached the review diff; "
+                    "nothing was applied to your tree")
+        # The station_run/_work_tree_oid recipe: a temp index seeded from HEAD, so
+        # the real index is untouched and untracked-ignored paths stay out.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wenv = {"GIT_INDEX_FILE": os.path.join(tmpdir, "index")}
+            steps = [git("read-tree", "HEAD", env=wenv), git("add", "-A", env=wenv),
+                     git("write-tree", env=wenv)]
+        tree = steps[-1].stdout.decode().strip()
+        diff = git("diff", "--binary", self.base, tree)
+        failed = next((p for p in [*steps, diff] if p.returncode != 0), None)
+        if failed is not None:
+            return f"could not compute the run's change: {failed.stderr.decode()[:300]}"
+        if not diff.stdout:
+            return None
+        applied = git("apply", cwd=str(self.root), data=diff.stdout)
+        if applied.returncode == 0:
+            return None
+        fd, saved = tempfile.mkstemp(prefix="potluck-unapplied-", suffix=".patch")
+        with os.fdopen(fd, "wb") as f:
+            f.write(diff.stdout)
+        return (f"the run's change does not apply to your working tree, which "
+                f"changed during the run ({applied.stderr.decode().strip()[:300]}); "
+                f"nothing was written to it. The change is saved at {saved}")
+
+    def remove(self) -> None:
+        """Remove the worktree and its administrative entry. Never touches the
+        operator's tree or any ref."""
+        import shutil
+        import subprocess
+        self.leave()
+        if self.path is None:
+            return
+        proc = subprocess.run(
+            ["git", "worktree", "remove", "--force", "--force", str(self.path)],
+            cwd=str(self.root), capture_output=True)
+        if proc.returncode != 0:
+            shutil.rmtree(self.path, ignore_errors=True)
+            subprocess.run(["git", "worktree", "prune"], cwd=str(self.root),
+                           capture_output=True)
+        self.path = None
+
+
 def ensure_clean_tree(allow_dirty: bool = False) -> str | None:
     """Clean-tree precondition for `potluck fix`. Returns an actionable error
     message when the working tree is dirty (`git status --porcelain` non-empty)
     and --allow-dirty was NOT passed, else None. Extracted from cmd_fix so the
     precondition is testable without driving the whole CLI.
 
-    A dead implement attempt leaves partial edits in the tree; starting from a
-    known-clean baseline is what lets restore_tree reset to it safely.
+    Re-examined for the run-owned worktree: the run no longer writes the
+    operator's tree, so this is no longer what lets a restore reset safely (the
+    worktree is created clean at HEAD). It is KEPT for two reasons that remain:
+    (1) the worktree is checked out at HEAD, so uncommitted changes would be
+    invisible to the doer and the gate -- the run would silently judge a tree
+    other than the one the operator sees; and (2) on success the change is
+    applied to this tree, and a clean baseline makes the result exactly the
+    run's change, never interleaved with the operator's own uncommitted work.
 
     Safe-default rule: if we cannot PROVE the tree is clean, we refuse. ANY
     failure to run the check refuses -- empty porcelain output is only
@@ -266,7 +423,10 @@ def add_fix_parser(subparsers):
                         "against the outer feature bound (hardening Step-0 §1).")
     p.add_argument("--allow-dirty", action="store_true",
                    help="Run against a dirty working tree; skips the clean-tree "
-                        "precondition AND all tree-restore behavior")
+                        "precondition AND all tree-restore behavior. The run's "
+                        "worktree is checked out at HEAD, so uncommitted changes "
+                        "are NOT visible to the run; on success its change is "
+                        "applied on top of them (refused if they overlap)")
     p.add_argument("--run-dir", type=str, default=None,
                    help="Persist a resumable checkpoint under this directory "
                         "(hardening Step-0 §2). A timed-out run can then be "
@@ -392,9 +552,25 @@ def _resolve_resume_gate(resume_dir: str):
 
 
 def cmd_fix(args):
+    """Run `_cmd_fix` and remove the run's worktree afterwards on EVERY path --
+    pass, escalation, refusal (SystemExit), crash, or Ctrl-C."""
+    run = _RunWorktree()
+    try:
+        _cmd_fix(args, run)
+    finally:
+        run.remove()
+
+
+def _cmd_fix(args, run: _RunWorktree):
     from . import checkpoint as ck
+    # Absolute now: the run executes with cwd inside its own worktree, which is
+    # removed afterwards, so a relative run-dir must not resolve against it.
     resume_dir = getattr(args, "resume", None)
+    if resume_dir:
+        resume_dir = str(Path(resume_dir).resolve())
     run_dir = getattr(args, "run_dir", None)
+    if run_dir:
+        run_dir = str(Path(run_dir).resolve())
     allow_dirty = getattr(args, "allow_dirty", False)
     # conductor §5: an external gate path (outside the working tree) resolved to
     # ABSOLUTE now, before any chdir, so `bash <gate>` runs the same file regardless
@@ -434,11 +610,16 @@ def cmd_fix(args):
             _art_gate = _digest_gate_file(".claude/verify.sh")
         else:
             _art_gate = gate_binding  # external: the frozen copy's digest (the run gate)
-        # The tree must be clean at the checkpoint base for a lossless restore.
+        # The operator's tree must be clean (see ensure_clean_tree). The lossless
+        # restore itself now lands in the run's fresh worktree, detached at the
+        # operator's HEAD, so restore_tree's own "HEAD is not the checkpoint
+        # base" refusal still fires when the operator's branch moved.
         dirty_err = ensure_clean_tree(allow_dirty)
         if dirty_err:
             print(f"Error: {dirty_err}", file=sys.stderr)
             sys.exit(1)
+        _refuse_run_dir_inside_tree(resume_dir)  # against the OPERATOR's tree
+        run.enter()
         checkpointer, *_ = _build_checkpointer(resume_dir, cfg, spec, acceptance,
                                                gate_binding)
         try:
@@ -493,11 +674,14 @@ def cmd_fix(args):
         if dirty_err:
             print(f"Error: {dirty_err}", file=sys.stderr)
             sys.exit(1)
+        if run_dir:
+            # Validate against the OPERATOR's tree, BEFORE freezing into it.
+            _refuse_run_dir_inside_tree(run_dir)
+        run.enter()
 
         checkpointer = None
         gate_path = None
         if run_dir:
-            _refuse_run_dir_inside_tree(run_dir)  # validate BEFORE freezing into it
             # An external gate is FROZEN into the (outside-the-tree) run-dir and the
             # IMMUTABLE copy is run: the digest is provably the executed bytes, a resume
             # re-runs the same gate, and gate_binding is bound into the tamper-evident
@@ -552,6 +736,15 @@ def cmd_fix(args):
         except Exception as e:  # noqa: BLE001 — provenance emission is best-effort
             print(f"warning: station-run artifact not written: {e}", file=sys.stderr)
 
+    # Deliver ONLY a passed run's change into the operator's tree (see
+    # _RunWorktree: on failure nothing is written there). The artifact above
+    # attested the run's own output tree -- the worktree -- before delivery.
+    delivery_err = (run.deliver() if result.outcome.value == "passed" else None)
+    run.leave()
+    if delivery_err:
+        print(f"Error: run passed but its change was NOT delivered: {delivery_err}",
+              file=sys.stderr)
+
     out = {
         "outcome": result.outcome.value,
         "rounds_used": result.rounds_used,
@@ -602,7 +795,7 @@ def cmd_fix(args):
         print(json.dumps(out, indent=2, default=str))
 
     write_log(out, args)
-    sys.exit(0 if out["outcome"] == "passed" else 1)
+    sys.exit(0 if out["outcome"] == "passed" and not delivery_err else 1)
 
 
 # ---------------------------------------------------------------------------
