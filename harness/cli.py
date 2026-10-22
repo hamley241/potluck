@@ -391,6 +391,21 @@ class _RunWorktree:
         self.leave()
         if self.path is None:
             return
+        # The report below is A5's required output, so it must not be skipped by
+        # an exception raised while cleaning up (codex BLOCKING, r7). The removal
+        # attempts are wrapped; whatever happens, the survival check runs and the
+        # operator is told.
+        try:
+            self._attempt_removal()
+        except Exception as e:                      # noqa: BLE001 -- report, never swallow
+            print(f"Warning: the run's worktree cleanup raised "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+        self._report_survivors()
+        self.path = None
+
+    def _attempt_removal(self) -> None:
+        import shutil
+        import subprocess
         proc = subprocess.run(
             ["git", "worktree", "remove", "--force", "--force", str(self.path)],
             cwd=str(self.root), capture_output=True)
@@ -398,6 +413,9 @@ class _RunWorktree:
             shutil.rmtree(self.path, ignore_errors=True)
             subprocess.run(["git", "worktree", "prune"], cwd=str(self.root),
                            capture_output=True)
+
+    def _report_survivors(self) -> None:
+        import subprocess
         # REPORT a cleanup that did not work (codex BLOCKING, r4). Both fallbacks
         # above swallow their own failure -- rmtree(ignore_errors=True) by
         # definition -- so without this check a run could leave its worktree
@@ -408,13 +426,23 @@ class _RunWorktree:
         # one and report success. Both halves are checked, and the message says
         # which survived.
         left_dir = Path(self.path).exists()
+        # UNVERIFIABLE IS NOT ABSENT (codex BLOCKING, r7). If `worktree list`
+        # itself fails we cannot see whether an admin entry survived, and
+        # treating that as "absent" would report a clean cleanup on no evidence
+        # -- fail-open, in the one message whose job is to tell the operator
+        # something was left behind.
         listed = subprocess.run(["git", "worktree", "list", "--porcelain"],
                                 cwd=str(self.root), capture_output=True, text=True)
-        left_admin = str(self.path) in (listed.stdout or "")
+        if listed.returncode != 0:
+            left_admin, admin_word = True, "a .git/worktrees entry (UNVERIFIABLE -- " \
+                                           "`git worktree list` failed)"
+        else:
+            left_admin = str(self.path) in (listed.stdout or "")
+            admin_word = "a .git/worktrees entry"
         if left_dir or left_admin:
             what = " and ".join(
                 [s for s in ("the directory" if left_dir else "",
-                             "a .git/worktrees entry" if left_admin else "") if s])
+                             admin_word if left_admin else "") if s])
             # NOTE: no sweep exists (removed in r5), so this is NOT cleaned up
             # later. Saying otherwise would be a promise the code does not keep.
             print(f"Warning: the run's worktree could not be fully removed -- "
