@@ -54,10 +54,21 @@ class Timeouts:
     # bounds. `--doer-timeout` (potluck fix only) is a UNIFORM override that wins
     # over this map outright (§1.1 precedence); it is threaded in at the call
     # site, so it is NOT stored here.
+    # RECLASSIFIED (cross-provider panel, 2026-10-22): `doer:respond` is a HEAVY
+    # generative step and now shares the 600 ceiling. It had 300 under the comment
+    # "heavy generative doer steps get 600" in test_doer_timeout -- i.e. it was
+    # classified not-heavy. The evidence overturns that: respond was one of the TWO
+    # steps that timed out in the first-customer report ("the single biggest
+    # friction", n=2), the hardening slice then raised the band and left the actual
+    # casualty at its FLOOR, and a sibling session hit the same timeout on a real
+    # converge (n=3). It reasons over the findings and the diff and writes a
+    # substantive reply -- the same shape of work as implement.
+    # Costs nothing: c_max() follows the HEAVIEST step, already 600, so c_max stays
+    # 1205 and outer_min stays 36150 against feature_seconds 36150 (computed).
     doer_step_seconds: dict[str, int] = field(default_factory=lambda: {
         "doer:implement": 600,
         "doer:apply_fixes": 600,
-        "doer:respond": 300,
+        "doer:respond": 600,
     })
     # Per verification-gate run. Build/test can legitimately take a while;
     # tune per project -- this default is deliberately generous.

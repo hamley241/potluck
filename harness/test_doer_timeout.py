@@ -24,7 +24,11 @@ def main() -> bool:
     # Built-in step-adaptive map: heavy generative doer steps get 600.
     results["map_implement_600"] = (t.resolve_doer_timeout("doer:implement") == 600)
     results["map_apply_fixes_600"] = (t.resolve_doer_timeout("doer:apply_fixes") == 600)
-    results["map_respond_300"] = (t.resolve_doer_timeout("doer:respond") == 300)
+    # respond RECLASSIFIED heavy, 300 -> 600 (panel-ruled 2026-10-22 on n=3 real
+    # timeouts). This assertion transcribes the map's CLASSIFICATION, not an
+    # independent correctness property -- T6's precedence contract below is
+    # untouched and still proves override > map > default.
+    results["map_respond_600"] = (t.resolve_doer_timeout("doer:respond") == 600)
 
     # --doer-timeout override WINS for EVERY doer step (uniform), incl. mapped
     # ones and the default -- precedence step 1.
