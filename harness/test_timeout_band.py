@@ -25,10 +25,14 @@ because the step is not a key. That is the exact drift this suite claims to
 prevent, and it passed by construction until a cross-provider reviewer named it
 (MAJOR, `timeout-band-step-universe`).
 
-LIMIT OF THE SCAN, stated rather than implied: it finds STRING LITERALS. A step
-name assembled at runtime (`f"doer:{x}"`) would escape it. Every doer step today
-is a literal, and introducing a computed one should be a deliberate act — but
-this check does not prove the absence of one.
+LIMIT OF THE SCAN, stated rather than implied: it finds STRING LITERALS in
+either quote style, over the full identifier character class. A step name
+assembled at runtime (`f"doer:{x}"`) still escapes it. Every doer step today is a
+literal, and introducing a computed one should be a deliberate act — but this
+check does not prove the absence of one. The narrower first version of this
+regex is why that sentence is now specific about WHICH literals: "it finds string
+literals" was true of a pattern that missed single-quoted ones, which is how a
+stated limit can be accurate and still mislead.
 
 WHAT "GENERATIVE" MEANS HERE, honestly: it is NOT derivable from the data. The
 map carries names and integers; nothing in it marks a step as generative. Every
@@ -64,7 +68,12 @@ import sys
 from harness.config import HarnessConfig
 
 PACKAGE = pathlib.Path(__file__).resolve().parent
-_DOER_LITERAL = re.compile(r'"(doer:[a-z_]+)"')
+# BOTH quote styles and the full identifier character class. The first version
+# matched only double-quoted, lowercase-snake literals — so `'doer:foo'` or
+# `"doer:applyFixes"` escaped the scan entirely (codex MAJOR,
+# `timeout-band-literal-quote-gap`). A scan that defines the universe must not
+# be narrower than the language that writes it.
+_DOER_LITERAL = re.compile(r"""['"](doer:[A-Za-z0-9_]+)['"]""")
 
 results: dict[str, bool] = {}
 
@@ -150,6 +159,13 @@ def main() -> bool:
         == ["doer:ghost"])
     results["fully_mapped_is_clean"] = not unmapped(
         {"doer:implement"}, {"doer:implement": 600, "doer:spare": 600})
+    # the regex itself: both quote styles, and the full identifier class
+    results["scan_finds_double_quoted"] = (
+        _DOER_LITERAL.findall('x = "doer:alpha"') == ["doer:alpha"])
+    results["scan_finds_single_quoted"] = (
+        _DOER_LITERAL.findall("x = 'doer:beta'") == ["doer:beta"])
+    results["scan_finds_camel_and_digits"] = (
+        _DOER_LITERAL.findall('"doer:applyFixes2"') == ["doer:applyFixes2"])
     results["empty_map_is_not_a_violation"] = not _off_band({})
 
     ok_all = True
