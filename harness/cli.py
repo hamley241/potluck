@@ -270,7 +270,14 @@ class _RunWorktree:
             # it needs a DURABLE record of the intended path written before
             # creation, so a later run can sweep it. Declared, not built:
             # the window is now one assignment wide, against a whole
-            # `git worktree add` before r1 and a whole mkdtemp before r3.
+            # `git worktree add` before r1.
+            #
+            # NO TEST PINS THIS ORDERING, reported rather than papered over:
+            # r1's claim already sits between mkdtemp and the add, so the gap
+            # this narrows contains NO I/O and nothing in-process can observe
+            # it. A test was written and DELETED on finding it passed with the
+            # change reverted. The change is kept because it is free and
+            # strictly safer, not because it was demonstrated.
             self.root = root
             self.path = path = Path(tempfile.mkdtemp(prefix=f".{root.name}.potluck-run-",
                                          dir=root.parent))
