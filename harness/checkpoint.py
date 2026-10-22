@@ -165,10 +165,16 @@ def snapshot_tree(repo: Path) -> TreeSnapshot:
     real index at a resumable checkpoint (§2.3). Fails closed on a submodule /
     nested repo (before anything else) and on a non-canonical index.
 
-    `work_tree_oid` covers tracked + untracked + ignored blobs, exec/symlink
-    modes, and binary bytes (`add -A --force` defeats `.gitignore`), captured
-    through a FRESH temp index so the real index is untouched. `index_tree_oid`
-    is `write-tree` on the REAL index (whatever the loop had staged)."""
+    `work_tree_oid` covers tracked + untracked-non-ignored blobs, exec/symlink
+    modes, and binary bytes, captured through a FRESH temp index so the real
+    index is untouched. `index_tree_oid` is `write-tree` on the REAL index
+    (whatever the loop had staged).
+
+    Ignored-file boundary (INTENTIONAL, matching `real_restore_tree`): ignored
+    paths (`.venv`, `.env`, `__pycache__`, ...) are NOT captured. They are out of
+    scope for the review diff and for hygiene, so they are out of scope for the
+    snapshot too -- and restore_tree, which re-materialises only what is
+    captured here, therefore never deletes or rewrites them."""
     repo = Path(repo)
     _refuse_submodule_or_nested(repo)
     _refuse_noncanonical_index(repo)
@@ -177,12 +183,7 @@ def snapshot_tree(repo: Path) -> TreeSnapshot:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_index = _fresh_index_path(tmpdir)
-        wenv = {"GIT_INDEX_FILE": tmp_index}
-        # Initialize the temp index (NOT a bare empty file, round-3 MINOR), then
-        # stage the ENTIRE working tree into it and write its tree.
-        _git(["read-tree", "--empty"], repo, env=wenv)
-        _git(["add", "-A", "--force"], repo, env=wenv)
-        work_tree_oid = _git(["write-tree"], repo, env=wenv).stdout.decode().strip()
+        work_tree_oid = _work_tree_oid(repo, tmp_index)
 
     # The REAL index's tree projection (the checkpoint-time staged state).
     index_tree_oid = _git(["write-tree"], repo).stdout.decode().strip()
@@ -194,6 +195,22 @@ def snapshot_tree(repo: Path) -> TreeSnapshot:
         index_tree_oid=index_tree_oid,
         tree_snapshot_digest=digest,
     )
+
+
+def _work_tree_oid(repo: Path, tmp_index: str) -> str:
+    """The tree OID of the working tree's tracked + untracked-non-ignored content,
+    staged into the FRESH temp index at `tmp_index` (the real index is untouched).
+    snapshot_tree and restore_tree's verification BOTH use this, so the restore
+    is verified over exactly the scope the snapshot captured.
+
+    The temp index is SEEDED FROM HEAD (`read-tree HEAD`, the station_run
+    precedent), NOT empty: `.gitignore` affects UNTRACKED files only, so a file
+    TRACKED yet matching `.gitignore` is retained, while an untracked ignored path
+    is left out. An empty seed without `--force` would mis-drop the former."""
+    wenv = {"GIT_INDEX_FILE": tmp_index}
+    _git(["read-tree", "HEAD"], repo, env=wenv)
+    _git(["add", "-A"], repo, env=wenv)
+    return _git(["write-tree"], repo, env=wenv).stdout.decode().strip()
 
 
 def _tree_digest(repo: Path, tree_oid: str) -> str:
@@ -236,6 +253,21 @@ def restore_tree(repo: Path, tree: TreeSnapshot) -> None:
       3. materialize work_tree_oid into the empty tree via a fresh temp index;
       4. reestablish the REAL index to index_tree_oid;
       5. verify BOTH (content AND index-semantics), refuse on either mismatch.
+
+    Ignored-file boundary (INTENTIONAL, the `real_restore_tree` ruling): restore
+    PRESERVES ignored paths -- it never deletes or rewrites one. Step (2) uses
+    `clean -fd`, never `-x`; step (3) uses `checkout-index` WITHOUT `-f`, which
+    fails rather than remove an obstructing path; and an ignored path that would
+    obstruct a snapshot entry is refused up front, before anything is touched.
+    `-x` would delete `.venv`, `node_modules`, and `.env`.
+
+    What this does and does not guarantee: the snapshot never captured ignored
+    paths (see snapshot_tree), so restore is exact over the SAME scope it always
+    claimed -- tracked + untracked-non-ignored content, plus the real index --
+    and step (5) verifies exactly that scope, recomputed the same way it was
+    captured. It guarantees NOTHING about ignored paths beyond leaving them
+    untouched: whatever ignored files are present at resume (possibly differing
+    from checkpoint time) stay byte-for-byte as they are.
     """
     repo = Path(repo)
 
@@ -254,49 +286,43 @@ def restore_tree(repo: Path, tree: TreeSnapshot) -> None:
             "restore refused: the working tree is not clean at the base commit "
             "(refusing to overwrite uncommitted work)"
         )
-    # codex round-10 (MAJOR fold): `status --porcelain` above omits ignored files,
-    # but step (2)'s `clean -fdx` DELETES them -- so a post-timeout edit to an
-    # ignored path (e.g. a `.env`) would pass the "clean" gate and then be silently
-    # destroyed on restore, breaking §2.3's "nothing uncommitted is lost". Refuse
-    # if any ignored file is present (`clean -fdX --dry-run`, capital X = ignored
-    # only). The snapshot's own ignored blobs are re-materialised in step (3), so a
-    # pristine resume tree loses nothing; a tree carrying live ignored work is
-    # refused, not clobbered. (Mock phase-1 repos carry none, per obs-017.)
-    ign = _git(["clean", "-fdX", "--dry-run"], repo)
-    if ign.stdout.strip():
-        raise CheckpointError(
-            "restore refused: ignored files are present that `clean -fdx` would "
-            "delete during restore (refusing to destroy uncommitted ignored work "
-            "-- remove them explicitly to resume)"
-        )
+    # Ignored paths are preserved, not deleted (see the docstring), so the old
+    # "ignored files present" refusal is gone. What remains is one obstruction
+    # case: an ignored path that sits where a snapshot entry must go (a file at
+    # the entry's path or a parent of it, or a directory holding ignored files at
+    # an entry's path). Refuse that HERE, before reset/empty touch anything, so
+    # the refusal leaves the tree exactly as it was.
+    _refuse_ignored_obstruction(repo, tree.work_tree_oid)
     _git(["reset", "--hard", "--quiet", tree.repo_base_commit], repo)
 
     # (2) Empty the working tree WITHOUT touching the real index. `ls-files -z`
     # + a shell `xargs -0 rm -f --` (the option terminator, round-5 MINOR, so a
-    # leading-`-` pathname can't be read as a flag), then `clean -fdx` for
-    # untracked/ignored. The real index stays at base; no base path of one shape
-    # can obstruct a snapshot entry of another (the D/F fix).
+    # leading-`-` pathname can't be read as a flag), after `clean -fd` for
+    # untracked-non-ignored. The real index stays at base; no base path of one
+    # shape can obstruct a snapshot entry of another (the D/F fix).
     _empty_worktree_keep_index(repo)
 
-    # (3) Materialize the working-tree snapshot into the now-empty tree via a
+    # (3) Materialize the working-tree snapshot into the now-emptied tree via a
     # fresh temp index. Working tree == snapshot; the REAL index is untouched.
+    # NO `-f`: with -f, checkout-index removes whatever obstructs an entry
+    # (including a directory of ignored files); without it, it fails closed.
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_index = _fresh_index_path(tmpdir)
         wenv = {"GIT_INDEX_FILE": tmp_index}
         _git(["read-tree", "--empty"], repo, env=wenv)
         _git(["read-tree", tree.work_tree_oid], repo, env=wenv)
-        _git(["checkout-index", "-a", "-f"], repo, env=wenv)
+        _git(["checkout-index", "-a"], repo, env=wenv)
 
     # (4) Reestablish the REAL index to the checkpoint-time staged state.
     _git(["read-tree", tree.index_tree_oid], repo)
 
     # (5) Verify BOTH -- content (working tree) AND index-semantics (real index).
+    # The working tree is recomputed by the SAME function that captured it, so
+    # the comparison covers exactly the snapshot's scope (ignored paths excluded
+    # at both ends). HEAD is the base commit here (checked in step 1).
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_index = _fresh_index_path(tmpdir)
-        wenv = {"GIT_INDEX_FILE": tmp_index}
-        _git(["read-tree", "--empty"], repo, env=wenv)
-        _git(["add", "-A", "--force"], repo, env=wenv)
-        got_work = _git(["write-tree"], repo, env=wenv).stdout.decode().strip()
+        got_work = _work_tree_oid(repo, tmp_index)
     if got_work != tree.work_tree_oid:
         raise CheckpointError(
             "restore refused: recomputed working-tree oid "
@@ -315,11 +341,44 @@ def restore_tree(repo: Path, tree: TreeSnapshot) -> None:
         )
 
 
+def _refuse_ignored_obstruction(repo: Path, work_tree_oid: str) -> None:
+    """Refuse (before anything is touched) if a present ignored path collides
+    with a snapshot entry: equal paths, an ignored path that is a parent of an
+    entry, or an entry that is a parent of an ignored path. Materialising such an
+    entry would have to remove the ignored path, which restore never does."""
+    entries = set(_git(["ls-tree", "-r", "-z", "--name-only", work_tree_oid],
+                       repo).stdout.split(b"\0")) - {b""}
+    # Parent prefixes of every entry, so `a/b/c` collides with an ignored `a/b`.
+    parents = {e[:i] for e in entries for i in range(len(e)) if e[i:i + 1] == b"/"}
+    ignored = _git(["ls-files", "-z", "--others", "--ignored",
+                    "--exclude-standard"], repo).stdout.split(b"\0")
+    for path in ignored:
+        if not path:
+            continue
+        hit = path in entries or path in parents or any(
+            path[:i] in entries
+            for i in range(len(path)) if path[i:i + 1] == b"/")
+        if hit:
+            raise CheckpointError(
+                "restore refused: an ignored path obstructs a snapshot entry "
+                f"({path.decode(errors='replace')!r}); restore never deletes "
+                "ignored files -- move it aside explicitly to resume"
+            )
+
+
 def _empty_worktree_keep_index(repo: Path) -> None:
-    """Delete every tracked file from disk (leaving the real index at base) then
-    remove untracked/ignored, so the tree is empty for the D/F-safe materialize
-    (§2.3 step 2). `xargs -0 rm -f --` carries the option terminator so a
+    """Remove untracked-non-ignored files, then delete every tracked file from
+    disk (leaving the real index at base), so the tree is empty of everything the
+    snapshot covers for the D/F-safe materialize (§2.3 step 2). Ignored paths
+    are left in place. `xargs -0 rm -f --` carries the option terminator so a
     pathname beginning with `-` is never read as a flag."""
+    # Remove untracked-non-ignored only. `-x` is deliberately NOT used, as in
+    # `real_restore_tree`: it would delete `.venv`, `node_modules`, and `.env`.
+    # The snapshot does not capture ignored paths, so leaving them costs the
+    # restore no exactness over what it claims to restore. This runs FIRST, while
+    # the tracked `.gitignore` files are still on disk: after the rm below they
+    # are gone, and a `clean` then would see `.venv` as untracked and delete it.
+    _git(["clean", "-fd", "--quiet"], repo)
     ls = _git(["ls-files", "-z"], repo)
     if ls.stdout.strip(b"\0"):
         # Pipe NUL-delimited paths into `xargs -0 rm -f --`. The `--` is the
@@ -335,12 +394,19 @@ def _empty_worktree_keep_index(repo: Path) -> None:
                 "restore refused: emptying the working tree failed: "
                 f"{proc.stderr.decode(errors='replace')[:500]}"
             )
-    # Remove untracked AND ignored (-x): the snapshot captured ignored files, so
-    # restore must clear them and re-materialize the snapshot's version for an
-    # EXACT tree. (This differs from the hygiene helper, which omits -x to
-    # protect .venv/.env -- there the goal is a pristine base, here it is an
-    # exact snapshot; blast radius is the mock repo under resume.)
-    _git(["clean", "-fdx", "--quiet"], repo)
+        # The emptied parent dirs of tracked files stay (`rm` leaves them, and
+        # `clean` ran before they were empty) and would obstruct a D/F
+        # entry now that step (3) has no `-f`. Remove them deepest-first with
+        # `rmdir`, which only ever removes an EMPTY directory: one still holding
+        # ignored files is left alone.
+        root = os.fsencode(str(repo))
+        dirs = {p[:i] for p in ls.stdout.split(b"\0")
+                for i in range(len(p)) if p[i:i + 1] == b"/"}
+        for d in sorted(dirs, key=lambda p: p.count(b"/"), reverse=True):
+            try:
+                os.rmdir(os.path.join(root, d))
+            except OSError:
+                pass
 
 
 # --- identity ----------------------------------------------------------------

@@ -4,10 +4,12 @@ Real git against throwaway temp repos (the engine is deliberately synchronous
 local plumbing, so it needs no event loop). Covers the ratified tripwires:
 
   T3b -- restore is lossless + verified + DELETION-correct + D/F-safe: a snapshot
-         over a tree with binary + ignored + deleted + mode-changed + symlink
+         over a tree with binary + deleted + mode-changed + symlink
          files AND a directory/file transition (base `a/x` -> file `a`, base file
          `b` -> `b/y`) restores to a tree whose recomputed write-tree == the
-         committed work_tree_oid; the REAL index is reestablished + verified; a
+         committed work_tree_oid (ignored files are NOT captured, and a
+         restore in a tree CARRYING ignored files proceeds and leaves them
+         byte-intact); the REAL index is reestablished + verified; a
          corrupted snapshot refuses; a submodule/nested `.git` REFUSES at
          checkpoint; a NON-canonical index (skip-worktree/intent-to-add) REFUSES;
          a tracked path beginning with `-` does not break the empty step.
@@ -73,7 +75,7 @@ def _build_base_and_midrun(root: Path):
     # --- mid-run mutations ---
     (root / "del.txt").unlink()                    # deleted
     os.chmod(root / "mode.sh", 0o755)              # mode change (100644 -> 100755)
-    (root / "ignored.txt").write_text("ignored content\n")  # ignored (captured via --force)
+    (root / "ignored.txt").write_text("ignored content\n")  # ignored (NOT captured)
     (root / "bin.dat").write_bytes(b"\x00\x01\x02NUL\x00binary\xff")  # binary untracked
     os.symlink("b", root / "link")                 # symlink (before b becomes a dir)
     # D/F transition: a/x (dir a) -> file a
@@ -89,6 +91,19 @@ def _build_base_and_midrun(root: Path):
     os.chmod(root / "mode.sh", 0o755)
     _git(["add", "--", "mode.sh"], root)
 
+    return ck.snapshot_tree(root)
+
+
+def _build_midrun_from_head(root: Path):
+    """Re-apply the mid-run mutations of _build_base_and_midrun on top of the
+    current HEAD (which already holds that base) and snapshot."""
+    (root / "del.txt").unlink()
+    (root / "a" / "x").unlink()
+    (root / "a").rmdir()
+    (root / "a").write_text("now a file\n")
+    (root / "mode.sh").write_text("#!/bin/sh\necho hi\n")
+    os.chmod(root / "mode.sh", 0o755)
+    _git(["add", "--", "mode.sh"], root)
     return ck.snapshot_tree(root)
 
 
@@ -125,8 +140,9 @@ def main() -> bool:
         # D/F transitions materialized: a is a file, b is a dir with b/y.
         results["df_a_is_file"] = (root / "a").is_file()
         results["df_b_is_dir"] = (root / "b").is_dir() and (root / "b" / "y").is_file()
-        # Ignored + binary + symlink survived.
-        results["ignored_restored"] = (root / "ignored.txt").read_text() == "ignored content\n"
+        # Binary + symlink survived; the ignored file was never captured, so a
+        # restore into a tree without it does not conjure it back.
+        results["ignored_not_captured"] = not (root / "ignored.txt").exists()
         results["binary_restored"] = (root / "bin.dat").read_bytes()[:4] == b"\x00\x01\x02N"
         results["symlink_restored"] = (root / "link").is_symlink()
         # Mode change survived (mode.sh is executable).
@@ -175,26 +191,59 @@ def main() -> bool:
         results["restore_refuses_dirty"] = _refuses(
             lambda: ck.restore_tree(root, snap))
 
-    # ===== T3b (codex round-10 MAJOR): ignored file present -> restore REFUSES =
-    # `status --porcelain` calls the tree clean, but restore's `clean -fdx` would
-    # DELETE the ignored file -- so a post-timeout edit to an ignored path must be
-    # refused, not silently destroyed.
+    # ===== T3b: ignored files present -> restore PROCEEDS and PRESERVES them ==
+    # The `real_restore_tree` ruling: restore never deletes ignored paths (no
+    # `clean -x`). A tree carrying a `.venv/` and a `.env` -- written AFTER the
+    # checkpoint, with content the snapshot never saw -- resumes, and both are
+    # byte-for-byte intact afterwards. (Formerly this refused: codex round-10.)
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "repo"
         root.mkdir()
         snap = _build_base_and_midrun(root)
         _git(["reset", "--hard", "-q", snap.repo_base_commit], root)
-        _git(["clean", "-fdxq"], root)               # pristine base
-        # ignored.txt is ignored by the base .gitignore; write live post-timeout
-        # work into it. `status --porcelain` stays empty, but restore must refuse.
-        (root / "ignored.txt").write_text("LIVE=post-timeout-work\n")
+        _git(["clean", "-fdq"], root)                # base; ignored.txt survives
+        with open(root / ".gitignore", "a") as f:
+            f.write(".venv/\n.env\n")
+        _git(["commit", "-qam", "ignore venv/env"], root)
+        snap = _build_midrun_from_head(root)
+        _git(["reset", "--hard", "-q", snap.repo_base_commit], root)
+        _git(["clean", "-fdq"], root)
+        (root / ".venv" / "bin").mkdir(parents=True)
+        venv_bytes = b"#!venv\x00\xff python\n"
+        (root / ".venv" / "bin" / "python").write_bytes(venv_bytes)
+        (root / ".env").write_bytes(b"SECRET=post-checkpoint\n")
+        (root / "ignored.txt").write_bytes(b"LIVE=post-timeout-work\n")
         clean_status = _git(["status", "--porcelain"], root).decode().strip()
         results["ignored_leaves_status_clean"] = (clean_status == "")
-        results["restore_refuses_ignored_present"] = _refuses(
+        results["restore_proceeds_ignored_present"] = not _refuses(
             lambda: ck.restore_tree(root, snap))
-        # ...and the live ignored work is intact (not clobbered).
-        results["ignored_work_preserved_on_refusal"] = (
-            (root / "ignored.txt").read_text() == "LIVE=post-timeout-work\n")
+        results["ignored_venv_preserved"] = (
+            (root / ".venv" / "bin" / "python").read_bytes() == venv_bytes)
+        results["ignored_env_preserved"] = (
+            (root / ".env").read_bytes() == b"SECRET=post-checkpoint\n")
+        results["ignored_work_preserved"] = (
+            (root / "ignored.txt").read_bytes() == b"LIVE=post-timeout-work\n")
+        results["restore_with_ignored_is_exact"] = (
+            (root / "a").is_file() and not (root / "del.txt").exists()
+            and _git(["write-tree"], root).decode().strip() == snap.index_tree_oid)
+
+    # ===== T3b: an ignored path OBSTRUCTING a snapshot entry -> REFUSES =====
+    # Materialising the entry would have to remove the ignored path, which
+    # restore never does: refuse up front, with the ignored content intact.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "repo"
+        root.mkdir()
+        snap = _build_base_and_midrun(root)          # snapshot has a FILE `a`
+        _git(["reset", "--hard", "-q", snap.repo_base_commit], root)
+        _git(["clean", "-fdxq"], root)
+        (root / "a" / "x.pyc").write_bytes(b"cache")  # base has dir `a/`
+        _git(["config", "core.excludesFile", str(Path(d) / "excl")], root)
+        (Path(d) / "excl").write_text("*.pyc\n")
+        results["restore_refuses_ignored_obstruction"] = _refuses(
+            lambda: ck.restore_tree(root, snap))
+        results["ignored_obstruction_intact"] = (
+            (root / "a" / "x.pyc").read_bytes() == b"cache"
+            and (root / "a" / "x").is_file())
 
     # ================= T3b: submodule / nested .git REFUSES at checkpoint =
     with tempfile.TemporaryDirectory() as d:

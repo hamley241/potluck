@@ -34,6 +34,37 @@ SUCCEEDED would have left it just as silently.
 run record and on the failure path, so "nothing was restored elsewhere" is explicit rather than
 assumed. Doer confinement to the target tree is the larger follow-up.
 
+## FU-doer-commit-defeats-detection — a doer that COMMITS defeats both the no-change check and the rollback
+
+**The gap, observed live 2026-10-22.** A `potluck fix` run reported
+`escalated_no_signal` / *"doer:implement produced no changes"* and ran **no gate** — while the
+doer had in fact written a 5-file, +222/-71 change and **committed it**. potluck's no-change
+detection compares the WORKING TREE against the baseline; a doer that commits moves its work
+into HEAD, so the tree is clean and the run concludes nothing happened.
+
+**The dangerous half is the rollback.** `real_restore_tree` runs `git reset --hard` with NO ref,
+resetting to HEAD. If the doer moved HEAD, the "restore to the pre-implement baseline" resets to
+the DOER'S COMMIT — so the restore cements the work instead of discarding it. Confirmed: the
+commit was still on the branch after the escalation, and the branch HEAD had moved off its base.
+
+**Why it matters more than a mis-report.** The run says "nothing happened" while a substantial
+unreviewed, ungated change sits committed. A less careful operator takes the escalation at its
+word and the change ships unnoticed on the next push, or is attributed to whoever commits next.
+It also means an escalated run is NOT safely abandonable, which is the property the restore
+exists to provide.
+
+**Not the doer misbehaving.** Committing finished work is reasonable; potluck simply never
+specified the contract. The three earlier runs in this fleet did NOT commit, so the behaviour is
+not deterministic and cannot be relied on either way.
+
+**Design direction.** Detect against the BASE COMMIT, not the working tree: compare
+`git rev-parse HEAD` to the captured `repo_base_commit` as well as diffing the tree, so a moved
+HEAD counts as a change. Restore to the captured base explicitly (`git reset --hard <base>`)
+rather than to bare HEAD. State the doer contract either way.
+
+**Trip condition: before any unattended run.** An unattended run that escalates and silently
+leaves committed work is the worst shape this failure can take.
+
 ## FU-doer-noop-undiagnosable — an empty-diff escalation records nothing to diagnose from
 
 **The gap.** Two `potluck fix` runs dispatched 2 doer calls each and produced no diff,

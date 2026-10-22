@@ -221,15 +221,19 @@ _PRIOR = {
 }
 
 
-async def _git_integration() -> dict:
+async def _git_integration(carry_ignored: bool = False) -> dict:
     """The seam: a full orchestrator resume over the REAL git-backed store
     (GitCheckpointStore + snapshot/restore over an actual temp git repo). A
     timeout at APPLY_FIXES leaves a real checkpoint + tree; resume restores the
-    tree losslessly and re-enters, and the resumed apply_fixes edit lands."""
+    tree losslessly and re-enters, and the resumed apply_fixes edit lands.
+
+    `carry_ignored`: the repo carries a gitignored `.venv/` and `.env` (as every
+    real fleet repo does), the latter rewritten between the checkpoint and the
+    resume. The resume must proceed, and both must survive byte-for-byte."""
     import os
     import subprocess
     import tempfile
-    from harness.checkpoint import GitCheckpointStore, Checkpointer
+    from harness.checkpoint import CheckpointError, GitCheckpointStore, Checkpointer
 
     def git(args, cwd):
         subprocess.run(["git", *args], cwd=str(cwd), check=True,
@@ -244,8 +248,15 @@ async def _git_integration() -> dict:
         git(["config", "user.email", "t@t"], repo)
         git(["config", "user.name", "t"], repo)
         (repo / "seed.txt").write_text("seed\n")
+        if carry_ignored:
+            (repo / ".gitignore").write_text(".venv/\n.env\n")
         git(["add", "-A"], repo)
         git(["commit", "-qm", "base"], repo)
+        venv_bytes = b"#!/venv/python\x00\xff\n"
+        if carry_ignored:
+            (repo / ".venv" / "bin").mkdir(parents=True)
+            (repo / ".venv" / "bin" / "python").write_bytes(venv_bytes)
+            (repo / ".env").write_bytes(b"SECRET=at-checkpoint\n")
 
         class GitDoer(DoerClient):
             def __init__(self, calls, fail=False):
@@ -308,11 +319,20 @@ async def _git_integration() -> dict:
 
         # Operator cleans the dead attempt's tree back to base (restore's
         # precondition), then we resume.
-        git(["clean", "-fdxq"], repo)
+        # With ignored files carried, the operator cleans WITHOUT -x (as
+        # real_restore_tree does) and edits `.env` after the checkpoint.
+        git(["clean", "-fdq" if carry_ignored else "-fdxq"], repo)
+        if carry_ignored:
+            (repo / ".env").write_bytes(b"SECRET=after-checkpoint\n")
         c2 = []
         orch2, cp2 = mk(c2, fail=False)
         resume_ckpt = cp2.load_and_verify()
-        cp2.restore(resume_ckpt.tree)
+        try:
+            cp2.restore(resume_ckpt.tree)
+            out["restore_proceeded"] = True
+        except CheckpointError:
+            out["restore_proceeded"] = False
+            return out
         # The restore reestablished the pre-apply tree exactly (work.txt back).
         out["tree_restored"] = ((repo / "work.txt").read_text() == "implemented\n")
         r2 = await orch2.run_feature("s", "a", resume=resume_ckpt)
@@ -322,6 +342,13 @@ async def _git_integration() -> dict:
         # The resumed apply_fixes edit actually landed.
         out["apply_fixes_edit_landed"] = (
             (repo / "work.txt").read_text() == "implemented\nfixed\n")
+        if carry_ignored:
+            venv = repo / ".venv" / "bin" / "python"
+            env = repo / ".env"
+            out["ignored_intact"] = (
+                venv.exists() and venv.read_bytes() == venv_bytes
+                and env.exists()
+                and env.read_bytes() == b"SECRET=after-checkpoint\n")
     return out
 
 
@@ -545,6 +572,16 @@ async def main() -> bool:
     results["git_reentered_apply_fixes"] = g["reentered_apply_fixes"]
     results["git_skipped_prior"] = g["skipped_prior_on_resume"]
     results["git_apply_fixes_edit_landed"] = g["apply_fixes_edit_landed"]
+
+    # (e2) the fleet case: the same resume in a repo CARRYING ignored files
+    #      (`.venv/`, `.env`). It must proceed -- not refuse on their presence --
+    #      and leave them byte-for-byte intact. Every earlier test repo was
+    #      pristine, which is how the delete-and-refuse restore survived review.
+    gi = await _git_integration(carry_ignored=True)
+    results["ignored_resume_proceeds"] = gi["restore_proceeded"]
+    results["ignored_resume_tree_restored"] = gi.get("tree_restored", False)
+    results["ignored_resume_passed"] = gi.get("resumed_pass", False)
+    results["ignored_resume_files_intact"] = gi.get("ignored_intact", False)
 
     # Reviewer raises one blocking issue.
     blocking = {"issues": [{"id": "C1", "severity": "blocking",
