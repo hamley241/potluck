@@ -364,8 +364,17 @@ def test_no_change_run_leaves_the_doer_reply_readable():
                         or events[0].get("truncations")),
                    f"{str(events)[:400]}")
             scope = out.get("restore_scope") or ""
-            _check(f"no-change[{label}]: restore scope stated, names its limit",
-                   str(repo) in scope and "neither restored nor detected" in scope,
+            # This assertion PINNED THE DEFECT until codex r1 caught it: it
+            # required the OPERATOR'S CHECKOUT path to appear in the scope, i.e.
+            # it demanded the statement name as covered the one tree the restore
+            # specifically does not touch. It now requires the opposite -- the
+            # run's own worktree named as what IS covered, and the operator's
+            # checkout named among what is not.
+            _check(f"no-change[{label}]: restore scope names the WORKTREE, not the checkout",
+                   ".potluck-run-" in scope and "neither restored nor detected" in scope,
+                   scope)
+            _check(f"no-change[{label}]: restore scope excludes the operator's checkout",
+                   "operator's checkout" in scope and str(repo) + ";" not in scope,
                    scope)
 
 
