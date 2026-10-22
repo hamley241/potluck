@@ -264,11 +264,52 @@ def test_crash_between_add_and_record_leaves_nothing():
         _check("crash: nothing orphaned after cleanup", ok, detail)
 
 
+def test_failed_add_still_cleans_up():
+    """codex BLOCKING r2: a NONZERO `git worktree add` is not a guarantee that
+    nothing was created -- it can leave a partial directory and/or an admin
+    entry. An earlier fold cleared `self.path` on that branch, which made
+    remove() short-circuit on exactly the wreckage it exists to clear. Here the
+    add is forced to fail AFTER really creating the worktree, which is the shape
+    that branch has to survive."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = _setup(Path(td).resolve())
+        cwd0 = os.getcwd()
+        os.chdir(repo)
+        real_run = subprocess.run
+
+        def add_fails_after_creating(*a, **kw):
+            out = real_run(*a, **kw)
+            argv = a[0] if a else kw.get("args", [])
+            if "worktree" in argv and "add" in argv:
+                out.returncode = 1          # real worktree exists; add "failed"
+                if hasattr(out, "stderr") and out.stderr is None:
+                    out.stderr = ""
+            return out
+
+        wt = cli._RunWorktree()
+        try:
+            subprocess.run = add_fails_after_creating
+            try:
+                wt.enter()
+            except SystemExit:
+                pass
+        finally:
+            subprocess.run = real_run
+            os.chdir(cwd0)
+
+        _check("failed-add: path still claimed for cleanup", wt.path is not None,
+               "cleared -> remove() short-circuits on the wreckage")
+        wt.remove()
+        ok, detail = _no_worktree_left(repo)
+        _check("failed-add: nothing orphaned", ok, detail)
+
+
 def main() -> bool:
     for t in (test_passed_run_delivers_without_moving_the_branch,
               test_foreign_commit_survives_abandonment,
               test_unplaceable_worktree_refuses_naming_sibling_cause,
-              test_crash_between_add_and_record_leaves_nothing):
+              test_crash_between_add_and_record_leaves_nothing,
+              test_failed_add_still_cleans_up):
         t()
     ok_all = True
     for name, ok, detail in _results:

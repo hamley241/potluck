@@ -280,8 +280,13 @@ class _RunWorktree:
             ["git", "worktree", "add", "--detach", "--quiet", str(path), base],
             cwd=str(root), capture_output=True, text=True)
         if proc.returncode != 0:
-            self.path = None          # nothing was created; do not prune on it
-            os.rmdir(path)
+            # Do NOT clear self.path here (codex BLOCKING, r2). A nonzero
+            # `worktree add` is not a guarantee that nothing was created: it can
+            # leave a partial directory and/or a `.git/worktrees` entry behind.
+            # Clearing the path would make remove() short-circuit on exactly the
+            # wreckage it exists to clear -- the same orphan the r1 fold closed,
+            # reintroduced on the failure path. remove() already tolerates a path
+            # that was never created, so leaving it claimed is strictly safer.
             print(f"Error: could not create the run's worktree (git worktree add "
                   f"exited {proc.returncode}): {proc.stderr.strip()[:300]}",
                   file=sys.stderr)
