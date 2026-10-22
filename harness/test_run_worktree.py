@@ -304,12 +304,44 @@ def test_failed_add_still_cleans_up():
         _check("failed-add: nothing orphaned", ok, detail)
 
 
+def test_sweep_clears_orphans_but_not_live_worktrees():
+    """codex BLOCKING r4: A5 as written ("no orphan on any path") is
+    unachievable in-process -- a SIGKILL bypasses every finally. What is
+    achievable is that orphans never ACCUMULATE: each run sweeps the leavings of
+    earlier ones. The discriminating part is the second assertion: a sweep that
+    also removed a LIVE worktree would be far worse than the orphan it clears,
+    so a concurrent run's worktree must survive."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = _setup(Path(td).resolve())
+        prefix = f".{repo.name}.potluck-run-"
+
+        # an ORPHAN from a hard-killed earlier run: a directory git does not list
+        orphan = repo.parent / f"{prefix}orphaned"
+        orphan.mkdir()
+        (orphan / "leftover").write_text("x\n")
+
+        # a LIVE worktree, as a concurrent run would have
+        live = repo.parent / f"{prefix}concurrent"
+        _git(repo, "worktree", "add", "--detach", "--quiet", str(live), "HEAD")
+
+        swept = cli._sweep_orphaned_run_worktrees(repo)
+
+        _check("sweep: the orphan is gone", not orphan.exists(), f"swept={swept}")
+        _check("sweep: a LIVE worktree is untouched", live.is_dir(),
+               "a concurrent run's worktree was destroyed -- worse than the orphan")
+        ok, _ = _no_worktree_left(repo)
+        _check("sweep: the live worktree is still listed by git", not ok,
+               "git no longer lists the concurrent worktree")
+        _git(repo, "worktree", "remove", "--force", str(live))
+
+
 def main() -> bool:
     for t in (test_passed_run_delivers_without_moving_the_branch,
               test_foreign_commit_survives_abandonment,
               test_unplaceable_worktree_refuses_naming_sibling_cause,
               test_crash_between_add_and_record_leaves_nothing,
-              test_failed_add_still_cleans_up):
+              test_failed_add_still_cleans_up,
+              test_sweep_clears_orphans_but_not_live_worktrees):
         t()
     ok_all = True
     for name, ok, detail in _results:
