@@ -154,7 +154,7 @@ class TreeSnapshot(BaseModel):
     real index is captured because restoring the working tree alone leaves the
     resumed repo's index corrupt, diverging potluck's diff/gate (round-4 MAJOR)."""
     repo_base_commit: str      # HEAD the run began from (restore resets here first)
-    work_tree_oid: str         # tree OID of tracked+untracked+ignored working content
+    work_tree_oid: str         # tree OID of tracked+untracked-non-ignored working content
     index_tree_oid: str        # tree OID of the REAL staged index at checkpoint time
     tree_snapshot_digest: str  # canonical digest over `git ls-tree -r work_tree_oid`
 
