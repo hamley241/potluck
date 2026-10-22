@@ -193,43 +193,6 @@ def _build_checkpointer(run_dir: str, cfg: HarnessConfig, spec: str,
         cfg_digest, base, manifest_id
 
 
-def _sweep_orphaned_run_worktrees(root: Path) -> list[str]:
-    """Remove `.<repo>.potluck-run-*` siblings that git no longer lists as
-    worktrees, plus any stale administrative entries. Returns what it swept.
-
-    This is what makes A5 true ACROSS runs rather than within one: a hard kill
-    (SIGKILL, power loss) bypasses `finally` and no in-process ordering can
-    prevent that, but the next run in this checkout clears the leavings. Live
-    worktrees -- including a CONCURRENT run's -- appear in `git worktree list`
-    and are never swept."""
-    import shutil
-    import subprocess
-    live = set()
-    listed = subprocess.run(["git", "worktree", "list", "--porcelain"],
-                            cwd=str(root), capture_output=True, text=True)
-    for line in (listed.stdout or "").splitlines():
-        if line.startswith("worktree "):
-            live.add(Path(line[len("worktree "):]).resolve())
-    swept: list[str] = []
-    prefix = f".{root.name}.potluck-run-"
-    try:
-        siblings = list(root.parent.iterdir())
-    except OSError:
-        return swept
-    for d in siblings:
-        if not d.name.startswith(prefix) or not d.is_dir():
-            continue
-        if d.resolve() in live:
-            continue                      # a live run's worktree -- never ours to remove
-        shutil.rmtree(d, ignore_errors=True)
-        if not d.exists():
-            swept.append(d.name)
-    if swept:
-        subprocess.run(["git", "worktree", "prune"], cwd=str(root),
-                       capture_output=True)
-    return swept
-
-
 class _RunWorktree:
     """The run's OWN git worktree, detached at the run's base commit
     (FU-ref-ownership ruling: potluck must never move a ref the run does not
@@ -293,17 +256,24 @@ class _RunWorktree:
                   file=sys.stderr)
             sys.exit(1)
         try:
-            # SWEEP first (codex BLOCKING, r4). A5 as specified -- "no orphan on
-            # any path" -- is UNACHIEVABLE in-process: a SIGKILL bypasses every
-            # `finally`, so no ordering inside this process can promise it. What
-            # IS achievable is that orphans never accumulate: each run removes
-            # the leavings of earlier ones. The prefix below is the durable
-            # record this needs, so no extra bookkeeping file is required.
+            # NO SWEEP OF EARLIER ORPHANS, and the reason is recorded because
+            # one was written, reviewed and REMOVED (codex BLOCKING, r5). A
+            # sweep must tell an orphan from a live concurrent run, and on the
+            # filesystem it cannot: a concurrent run's directory exists from
+            # `mkdtemp` but is not in `git worktree list` until `worktree add`
+            # registers it, so a sweep would delete a LIVE run inside that
+            # window -- far worse than the orphan it clears. Meanwhile a
+            # SIGKILL-orphaned worktree that WAS registered stays listed, so the
+            # sweep preserves exactly what it was meant to remove. Wrong in both
+            # directions, from one TOCTOU race.
             #
-            # Only directories git does NOT list as worktrees are swept, so a
-            # CONCURRENT run's worktree -- which git does list -- is never
-            # touched.
-            _sweep_orphaned_run_worktrees(root)
+            # DECLARED GAP, blast radius: a hard kill (SIGKILL, power loss)
+            # bypasses every `finally` and leaves a `.<repo>.potluck-run-*`
+            # directory beside the checkout, plus possibly a `.git/worktrees`
+            # entry. Nothing removes it automatically; `git worktree prune` and
+            # deleting the directory are the manual remedy. It costs disk and
+            # tidiness, never correctness: the operator's refs, tree and commits
+            # are untouched, which is what this whole change is for.
 
             # Claim the directory the INSTANT it exists (codex BLOCKING, r3).
             # mkdtemp CREATES it, so recording self.path after the call left the
