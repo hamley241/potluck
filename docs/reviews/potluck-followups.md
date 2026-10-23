@@ -80,3 +80,32 @@ no changes".
 
 **Design direction.** Capture the doer's reply on the no-change path at minimum. Related to the
 §2 doer-usage gap: text-mode `claude -p` returns neither usage nor a capturable envelope.
+
+## FU-nofollow-temp-writes — a link installed after the preflight scan can still be followed
+
+**Status: DECLARED by codex at round 2 of the import slice's review (SHIP), non-BLOCKING.** Recorded
+rather than folded, because the review budget was 3 rounds and the finding is a concurrency
+hardening, not a reachable defect in the slice's own paths.
+
+**The gap.** `cli._refuse_links_into_import` walks every existing entry under each output destination
+(`--run-dir`, `--export-dir`, `--log-file`) before anything is written and refuses, by name, a
+symlink whose `realpath` is the import or inside it. codex confirmed that closes the **pre-existing**
+case for every write this slice makes — the gate copy, the checkpoint writes, `persist_run_inputs`
+and the station-run write are all immediate children of the resolved run directory, so the scan's
+lack of traversal through nested directory symlinks leaves no bypass there. The import marker has its
+own no-follow write on top.
+
+**What remains: a link installed AFTER the scan**, by a concurrent writer, can still be followed by
+those ordinary temporary-file writes. The scan is a point-in-time check; the writes are not
+self-protecting.
+
+**Remedy, as ruled:** use no-follow temporary-file creation **consistently** — the
+`unlink` + `O_CREAT|O_EXCL|O_NOFOLLOW` discipline that `export._write_atomic` and
+`cli._write_nofollow` already use — for every write into a caller-supplied directory, rather than
+relying on the preflight scan alone.
+
+**Trip condition: before any unattended run that takes a caller-supplied run-dir from an untrusted
+or shared location**, and in any case when part 3 adds delivery's own writes. Two instances of this
+exact class have now been found by review rather than by a gate (part 1's `_write_atomic`, part 2's
+import marker), so the next write into a caller-supplied path should start no-follow rather than
+be retrofitted.
