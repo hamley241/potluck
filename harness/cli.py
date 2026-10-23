@@ -83,7 +83,8 @@ def write_log(result: dict, args):
 def build_orchestrator(cfg: HarnessConfig,
                        allow_dirty: bool = False,
                        checkpointer=None,
-                       gate_path: str | None = None) -> Orchestrator:
+                       gate_path: str | None = None,
+                       import_restore=None) -> Orchestrator:
     """Wire a cfg into a production Orchestrator (real doer/reviewer/tiebreaker,
     real gate, config-bound get_diff, real tree restore). Pure: cfg ->
     Orchestrator, no argparse and no I/O, so a test can build the exact object
@@ -102,11 +103,17 @@ def build_orchestrator(cfg: HarnessConfig,
     gate_path (conductor §5) runs the gate from an external, absolute path instead
     of the in-tree default; None keeps `real_run_gate`'s `./.claude/verify.sh`. The
     Orchestrator invokes the gate callable with no arguments, so an external path is
-    bound here (partial) rather than passed at the call site."""
+    bound here (partial) rather than passed at the call site.
+
+    import_restore (ruling 001 part 2) REPLACES the baseline restore for a run that
+    imported an attested result: it resets to HEAD and then re-establishes the
+    digest-verified imported state, so a retry never discards the previous round's
+    work. Restoration stays wired; only its baseline changes. --allow-dirty still
+    drops it, exactly as it drops the ordinary restore."""
     doer = RealDoerClient()
     reviewer = ReviewerClient(cfg)
     tiebreaker = TiebreakerClient(cfg) if cfg.debate.use_tiebreaker else None
-    restore_tree = None if allow_dirty else real_restore_tree
+    restore_tree = None if allow_dirty else (import_restore or real_restore_tree)
     run_gate = (real_run_gate if gate_path is None
                 else functools.partial(real_run_gate, gate_path))
     orch = Orchestrator(cfg, doer, reviewer, tiebreaker, run_gate,
@@ -381,6 +388,48 @@ class _RunWorktree:
                     f"{failed.stderr.decode()[:300]}"), None, b""
         return None, tree, diff.stdout
 
+    def apply_import(self, patch: bytes, want_digest: str, want_base: str) -> str | None:
+        """Apply an imported cumulative patch to this worktree (fresh, detached at the
+        operator's HEAD) and require the resulting full tree to digest to the imported
+        result's attested `output_tree_digest`. Returns None, or an error naming why.
+
+        The worktree's base must BE the imported manifest's `base_commit` (ruling 001:
+        every round starts at the original base and exports its cumulative patch
+        against that same base). Checked FIRST: a moved HEAD -- even an empty commit,
+        which leaves every tree digest unchanged -- would otherwise import cleanly and
+        chain a different base into the next export.
+        `git apply` is all-or-nothing, and it runs here, never in the operator's tree."""
+        from . import station_run as sr
+        if self.base != want_base:
+            return (f"the run's starting HEAD {self.base} is not the imported result's "
+                    f"base_commit {want_base}; every round must start at the original "
+                    f"base")
+        if patch:
+            applied = self._git("apply", "--binary", "-", data=patch)
+            if applied.returncode != 0:
+                return (f"the imported patch does not apply to the fresh worktree at "
+                        f"{self.base}: {applied.stderr.decode().strip()[:300]}")
+        got = sr._output_tree_digest(self.path)
+        if got != want_digest:
+            return (f"the imported patch produces tree digest {got}, not the imported "
+                    f"result's attested output_tree_digest {want_digest}")
+        return None
+
+    def import_restore(self, patch: bytes, want_digest: str, want_base: str):
+        """The restore for an importing run: reset this worktree to HEAD, then
+        re-establish the digest-verified imported state. Raises on any failure, which
+        the orchestrator attributes to the restore."""
+        async def _restore() -> None:
+            for args in (("reset", "--hard", "--quiet"), ("clean", "-fd", "--quiet")):
+                proc = self._git(*args)
+                if proc.returncode != 0:
+                    raise RuntimeError(f"git {args[0]} failed: "
+                                       f"{proc.stderr.decode()[:300]}")
+            err = self.apply_import(patch, want_digest, want_base)
+            if err is not None:
+                raise RuntimeError(f"could not re-establish the imported state: {err}")
+        return _restore
+
     def deliver(self) -> str | None:
         """Apply the run's change (base -> the worktree's final tree, untracked
         non-ignored files included) to the operator's working tree. Returns None
@@ -598,6 +647,13 @@ def add_fix_parser(subparsers):
                         "with --export-dir.")
     p.add_argument("--export-round", type=int, default=0,
                    help="The round number recorded in the export manifest.")
+    p.add_argument("--import-dir", type=str, default=None,
+                   help="Start from a previous round's exported result instead of "
+                        "committed HEAD: the export is verified fail-closed, its "
+                        "cumulative patch applied to the run's fresh worktree at HEAD, "
+                        "and the resulting tree must equal its attested "
+                        "output_tree_digest before the doer runs. The directory is "
+                        "only read. Not supported with --resume.")
     p.add_argument("--json-output", action="store_true")
     p.add_argument("--log-file", type=str, default=None)
     p.set_defaults(func=cmd_fix)
@@ -823,9 +879,11 @@ def _prepare_export_dir(export_dir: str, run_dir: str | None,
 
 def _export(run: _RunWorktree, export_dir: str, run_dir: str, spec: str,
             acceptance: str, gate_bytes: bytes | None, task_id: str,
-            round_index: int) -> tuple[str | None, str | None]:
+            round_index: int,
+            imported_result_digest: str | None = None) -> tuple[str | None, str | None]:
     """Write a PASSED run's export. Returns (error, manifest digest); on error no
-    manifest is published, so the directory is not acceptable."""
+    manifest is published, so the directory is not acceptable. An importing run
+    passes the MANIFEST digest of the result it imported, chaining the rounds."""
     import uuid
     from . import checkpoint as ck
     from . import export as ex
@@ -854,7 +912,7 @@ def _export(run: _RunWorktree, export_dir: str, run_dir: str, spec: str,
                     if pushed.returncode == 0 else None)
         digest = ex.write_export(
             Path(export_dir), task_id=task_id, run_id=uuid.uuid4().hex,
-            round_index=round_index,
+            round_index=round_index, imported_result_digest=imported_result_digest,
             repository={"name": run.root.name,
                         "push_url_raw": push_url,
                         "root_commits": sorted(roots.stdout.decode().split())},
@@ -869,6 +927,46 @@ def _export(run: _RunWorktree, export_dir: str, run_dir: str, spec: str,
         # promised export_failed JSON and human summary.
         return f"could not write the export to {export_dir}: {e}", None
     return None, digest
+
+
+# Written into an importing run's run-dir, so a later `--resume` of it is refused by
+# name even when --import-dir is not passed again.
+_IMPORT_MARKER_NAME = "imported-result.json"
+
+
+def _overlaps(a: str, b: str) -> bool:
+    """True if resolved paths `a` and `b` are the same, or one contains the other."""
+    pa, pb = Path(a).resolve(), Path(b).resolve()
+    return pa == pb or pa in pb.parents or pb in pa.parents
+
+
+def _load_import(import_dir: str, outputs: "dict[str, str | None]"
+                 ) -> "tuple[bytes, str, str, str]":
+    """Accept an --import-dir before the run starts (exits on refusal). Returns (patch,
+    attested output_tree_digest, manifest digest, base_commit). Only READS the directory.
+
+    `outputs` names every destination this run writes (flag -> path or None). Any that
+    overlaps the import is refused HERE, before anything is written: checking only
+    equality with --export-dir left --run-dir free to pass the outside-the-tree check
+    and then write its checkpoint, run inputs, import marker and station-run.json INTO
+    the import -- clearing and replacing the previously accepted export's artifact."""
+    from . import export as ex
+    for flag, dest in outputs.items():
+        if dest is not None and _overlaps(dest, import_dir):
+            print(f"Error: --import-dir and {flag} overlap ({import_dir} vs {dest}); the "
+                  f"import is an input and is never written to.", file=sys.stderr)
+            sys.exit(1)
+    # The cumulative patch is verified against the manifest's declared digest HERE:
+    # load_export checks every payload's bytes, so this is where that check lives.
+    try:
+        manifest, digest = ex.load_export(Path(import_dir))
+        # Read after verification; a substitution in between cannot pass, because the
+        # applied tree must still digest to the attested output_tree_digest.
+        patch = (Path(import_dir) / ex.PATCH_FILENAME).read_bytes()
+    except (ex.ExportError, OSError) as e:
+        print(f"Error: import refused (fail-closed): {e}", file=sys.stderr)
+        sys.exit(1)
+    return (patch, manifest["output_tree_digest"], digest, manifest["base_commit"])
 
 
 def _cmd_fix(args, run: _RunWorktree):
@@ -902,8 +1000,24 @@ def _cmd_fix(args, run: _RunWorktree):
     if export_dir is not None:
         export_dir = str(Path(export_dir).resolve())
     _gate_bytes = None  # the exact gate bytes behind _art_gate, for the export
+    # Ruling 001 part 2: a run told to import starts from a previous round's attested
+    # output tree instead of committed HEAD. Resolved now, before any chdir.
+    import_dir = getattr(args, "import_dir", None)
+    if import_dir is not None:
+        import_dir = str(Path(import_dir).resolve())
+    import_digest = None  # the imported result's manifest digest, chained on export
 
     if resume_dir:
+        # DECIDED: an importing resume is REFUSED by name, not built. A resume restores
+        # the checkpoint, but its retries would also need the import re-verified from
+        # the run-dir record, and export of a resumed run is not built (below), so a
+        # resumed importing run could never chain its result. Refusing is the safe half:
+        # a resume that silently restarted from HEAD would discard the previous round.
+        if import_dir is not None or (Path(resume_dir) / _IMPORT_MARKER_NAME).exists():
+            print("Error: --resume of an importing run is not supported (resume of a "
+                  "run that imported an attested result is not built yet); re-run the "
+                  "round fresh with --import-dir.", file=sys.stderr)
+            sys.exit(1)
         if export_dir is not None:
             print("Error: --export-dir is not supported with --resume (export of a "
                   "resumed run is not built yet).", file=sys.stderr)
@@ -986,6 +1100,11 @@ def _cmd_fix(args, run: _RunWorktree):
                       file=sys.stderr)
                 sys.exit(1)
             _refuse_gate_inside_tree(gate_file)
+        if import_dir is not None:
+            log_file = getattr(args, "log_file", None)
+            import_patch, import_tree_digest, import_digest, import_base = _load_import(
+                import_dir, {"--run-dir": run_dir, "--export-dir": export_dir,
+                             "--log-file": log_file and str(Path(log_file).resolve())})
         if export_dir is not None:
             _prepare_export_dir(export_dir, run_dir, getattr(args, "export_task", None))
         _require_gate(gate_file)
@@ -1000,6 +1119,18 @@ def _cmd_fix(args, run: _RunWorktree):
             # Validate against the OPERATOR's tree, BEFORE freezing into it.
             _refuse_run_dir_inside_tree(run_dir)
         run.enter()
+        import_restore = None
+        if import_dir is not None:
+            # In the fresh worktree at the operator's HEAD, before the doer and before
+            # any checkpoint snapshot -- so every snapshot carries the imported state.
+            import_err = run.apply_import(import_patch, import_tree_digest,
+                                          import_base)
+            if import_err is not None:
+                print(f"Error: import refused (fail-closed): {import_err}",
+                      file=sys.stderr)
+                sys.exit(1)
+            import_restore = run.import_restore(import_patch, import_tree_digest,
+                                                import_base)
 
         checkpointer = None
         gate_path = None
@@ -1024,6 +1155,12 @@ def _cmd_fix(args, run: _RunWorktree):
                 run_dir, cfg, spec, acceptance, gate_binding)
             ck.persist_run_inputs(run_dir, spec, acceptance, cfg_digest, base,
                                   manifest_id)
+            marker = Path(run_dir) / _IMPORT_MARKER_NAME
+            if import_digest is not None:
+                marker.write_text(json.dumps({"imported_result_digest": import_digest,
+                                              "import_dir": import_dir}, indent=2))
+            else:
+                marker.unlink(missing_ok=True)  # a reused run-dir's stale marker
             _art_dir = run_dir
             _art_base = base
             from . import station_run as _sr
@@ -1037,7 +1174,8 @@ def _cmd_fix(args, run: _RunWorktree):
 
         async def _run():
             orch = build_orchestrator(cfg, allow_dirty=allow_dirty,
-                                      checkpointer=checkpointer, gate_path=gate_path)
+                                      checkpointer=checkpointer, gate_path=gate_path,
+                                      import_restore=import_restore)
             return await orch.run_feature(spec, acceptance)
 
         result = asyncio.run(_run())
@@ -1075,7 +1213,7 @@ def _cmd_fix(args, run: _RunWorktree):
         if result.outcome.value == "passed":
             delivery_err, export_digest = _export(
                 run, export_dir, run_dir, spec, acceptance, _gate_bytes,
-                args.export_task, getattr(args, "export_round", 0))
+                args.export_task, getattr(args, "export_round", 0), import_digest)
         run.leave()
         if delivery_err:
             print(f"Error: run passed but its result was NOT exported: {delivery_err}",

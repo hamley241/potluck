@@ -35,6 +35,19 @@ runs:
    result's attested `output_tree_digest`**, naming both digests;
 5. only then dispatches the doer.
 
+**The ruling wins on step 3's base.** "At the operator's committed HEAD" is only correct while that
+HEAD *is* the original base: the ruling has round 1 create its worktree "at the original base" and
+export its cumulative patch "against that same base. Rounds never stack." So the import also refuses,
+fail-closed and naming both commits, unless the fresh worktree's starting HEAD equals the imported
+manifest's `base_commit`. The tree-digest check cannot catch this alone: an empty commit moves HEAD
+without changing any tree, and the next export would then record a different base. Tested in
+`harness/test_import.py` (`test_moved_head_refused`).
+
+**No output destination may overlap the import.** `--run-dir`, `--export-dir` and `--log-file` are
+each refused by name if equal to, inside, or containing the import directory, before anything is
+written (`test_run_dir_overlapping_import_refused`): a run-dir equal to the import would otherwise
+clear and replace its `station-run.json`.
+
 The point is not convenience. It makes round r+1's input *definitionally* round r's gate-passed,
 review-targeted output, and it catches a corrupted or hand-edited export **before any model call is
 spent on it**. A test must assert the doer was **not** called when a check refuses.
@@ -51,6 +64,16 @@ that silently discards the previous round's work is the defect this whole contra
 reintroduced one layer down. Part 1 refused `--export-dir` with `--resume` as an undeclared gap; this
 slice must either make resume work for an importing run or **refuse it by name**, and say which it
 chose and why.
+
+**Chosen: retry restores, resume is refused by name.** A retry within an importing run (the
+orchestrator's per-attempt and post-failure restore) resets the worktree to HEAD and then re-applies
+and re-verifies the imported patch against the attested `output_tree_digest`, so a retry starts from
+the imported state. `--resume` of an importing run is **refused**: the run-dir is marked
+(`imported-result.json`), so the refusal fires whether or not `--import-dir` is passed again. Why:
+export of a resumed run is still not built (part 1), so a resumed importing run could never chain its
+result; and its retries would need the import re-verified from the run-dir record, which is unbuilt.
+Refusing is the half that cannot silently discard the previous round. Tested in
+`harness/test_import.py` (`test_retry_restores_imported_state`, `test_resume_refused_by_name`).
 
 ## What must not change
 
