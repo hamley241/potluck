@@ -30,7 +30,7 @@ manifest, the cumulative patch, the run's `station-run.json`, and the exact spec
 inputs. Payload names are manifest-relative and every payload's digest appears in the manifest.
 
 **A6.** The manifest names the original task base commit, the output tree identity and digest, the
-cumulative patch digest, the station artifact digest, the repository identity, the run and round, and
+cumulative patch digest, the station artifact digest, the repository identity, the task, run and round, and
 the imported-result field as an **explicit absence**.
 
 **A7.** The export writes **nothing** to the operator's working tree: a test compares the operator
@@ -46,8 +46,9 @@ digests. (Constructed: flip one byte.)
 bytes, and an untracked-non-ignored file; ignored paths stay out. Verified by applying it to a fresh
 checkout of the base and comparing the resulting tree digest with the manifest's.
 
-**A11.** A PASSED run whose export cannot be completed **fails** rather than reporting success.
-(Constructed: make the export directory unwritable.)
+**A11.** A PASSED run whose export cannot be completed **fails** rather than reporting success:
+the exit code, the JSON result and the human summary all say so, while the station's own outcome
+is kept separately. (Constructed: make the export directory unwritable.)
 
 **A12.** A **non-PASSED** run writes nothing to the operator's tree and leaves no acceptable export.
 

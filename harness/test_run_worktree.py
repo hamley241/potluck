@@ -87,8 +87,9 @@ def _no_worktree_left(repo: Path) -> tuple[bool, str]:
     return ok, f"listed={listed} admin={admin_entries} dirs={dirs}"
 
 
-def _run_fix(repo: Path, doer, extra=()) -> tuple[int | None, str]:
-    """cmd_fix from `repo` with the scripted doer, no debate, no closure sweep."""
+def _run_fix(repo: Path, doer, extra=(), stdout=None) -> tuple[int | None, str]:
+    """cmd_fix from `repo` with the scripted doer, no debate, no closure sweep.
+    stdout goes to `stdout` when given (a StringIO), else is discarded."""
     real_build = cli.build_orchestrator
 
     def build(cfg, **kw):
@@ -101,7 +102,7 @@ def _run_fix(repo: Path, doer, extra=()) -> tuple[int | None, str]:
     gate_pwd = repo.parent / "gate_pwd"
     os.environ["POTLUCK_TEST_GATE_PWD"] = str(gate_pwd)
     cli.build_orchestrator = build
-    err, out, code = io.StringIO(), io.StringIO(), None
+    err, out, code = io.StringIO(), stdout if stdout is not None else io.StringIO(), None
     try:
         os.chdir(repo)
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):

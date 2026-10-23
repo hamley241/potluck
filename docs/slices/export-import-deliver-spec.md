@@ -33,7 +33,8 @@ A `potluck fix` run that is told to export **does not apply anything to the oper
 tree**. On **PASSED** it writes a portable result into a caller-supplied directory that is outside
 the target's git tree:
 
-* a **versioned manifest** naming: this run and round, the repository identity, the **original task
+* a **versioned manifest** naming: the task, this run and round (as the ruling requires), the
+  repository identity, the **original task
   base commit**, the cumulative patch digest, the output tree identity and digest, and the station
   artifact digest. It also names the **imported-result digest**, which in this slice is always its
   explicit absence — the field exists now so part 2 does not reshape the manifest.

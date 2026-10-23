@@ -349,25 +349,24 @@ class _RunWorktree:
             os.chdir(self._cwd0)
             self._cwd0 = None
 
-    def deliver(self) -> str | None:
-        """Apply the run's change (base -> the worktree's final tree, untracked
-        non-ignored files included) to the operator's working tree. Returns None
-        on success, else an error message; writes nothing to the operator's tree
-        on any failure."""
+    def _git(self, *args, cwd=None, env=None, data=None):
         import subprocess
+        return subprocess.run(["git", *args], cwd=cwd or str(self.path), input=data,
+                              env={**os.environ, **env} if env else None,
+                              capture_output=True)
+
+    def change(self) -> tuple[str | None, str | None, bytes]:
+        """(error, output tree OID, binary patch base -> that tree). The output tree
+        is the worktree's final state, untracked non-ignored files included. A
+        worktree whose HEAD left the base is refused here, so it can neither be
+        delivered nor exported."""
         import tempfile
-        wt = str(self.path)
-
-        def git(*args, cwd=wt, env=None, data=None):
-            return subprocess.run(["git", *args], cwd=cwd, input=data,
-                                  env={**os.environ, **env} if env else None,
-                                  capture_output=True)
-
+        git = self._git
         head = git("rev-parse", "HEAD").stdout.decode().strip()
         if head != self.base:
             return ("the doer COMMITTED in the run's worktree (HEAD moved off the "
                     "base), so part of its work never reached the review diff; "
-                    "nothing was applied to your tree")
+                    "nothing was applied to your tree"), None, b""
         # The station_run/_work_tree_oid recipe: a temp index seeded from HEAD, so
         # the real index is untouched and untracked-ignored paths stay out.
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -378,15 +377,27 @@ class _RunWorktree:
         diff = git("diff", "--binary", self.base, tree)
         failed = next((p for p in [*steps, diff] if p.returncode != 0), None)
         if failed is not None:
-            return f"could not compute the run's change: {failed.stderr.decode()[:300]}"
-        if not diff.stdout:
+            return (f"could not compute the run's change: "
+                    f"{failed.stderr.decode()[:300]}"), None, b""
+        return None, tree, diff.stdout
+
+    def deliver(self) -> str | None:
+        """Apply the run's change (base -> the worktree's final tree, untracked
+        non-ignored files included) to the operator's working tree. Returns None
+        on success, else an error message; writes nothing to the operator's tree
+        on any failure."""
+        import tempfile
+        err, _tree, patch = self.change()
+        if err is not None:
+            return err
+        if not patch:
             return None
-        applied = git("apply", cwd=str(self.root), data=diff.stdout)
+        applied = self._git("apply", cwd=str(self.root), data=patch)
         if applied.returncode == 0:
             return None
         fd, saved = tempfile.mkstemp(prefix="potluck-unapplied-", suffix=".patch")
         with os.fdopen(fd, "wb") as f:
-            f.write(diff.stdout)
+            f.write(patch)
         return (f"the run's change does not apply to your working tree, which "
                 f"changed during the run ({applied.stderr.decode().strip()[:300]}); "
                 f"nothing was written to it. The change is saved at {saved}")
@@ -574,6 +585,19 @@ def add_fix_parser(subparsers):
                         "identity is re-verified fail-closed, the git tree is "
                         "restored losslessly, and the failed call re-runs with "
                         "backoff (hardening Step-0 §2). Ignores --spec/--run-dir.")
+    p.add_argument("--export-dir", type=str, default=None,
+                   help="Do NOT apply the run's change to this working tree. On "
+                        "PASSED, write a portable result into this directory (which "
+                        "must be OUTSIDE the git tree): a binary cumulative patch from "
+                        "the base, station-run.json, the exact spec/acceptance/gate "
+                        "inputs, and export-manifest.json, published last. A passed "
+                        "run whose export cannot be completed fails. Requires --run-dir "
+                        "and --export-task.")
+    p.add_argument("--export-task", type=str, default=None,
+                   help="The task identifier recorded in the export manifest. Required "
+                        "with --export-dir.")
+    p.add_argument("--export-round", type=int, default=0,
+                   help="The round number recorded in the export manifest.")
     p.add_argument("--json-output", action="store_true")
     p.add_argument("--log-file", type=str, default=None)
     p.set_defaults(func=cmd_fix)
@@ -768,6 +792,85 @@ def _restore_scope(worktree, allow_dirty: bool = False) -> str:
             f"that worktree -- are neither restored nor detected by this run")
 
 
+def _prepare_export_dir(export_dir: str, run_dir: str | None,
+                        task_id: str | None) -> None:
+    """Validate an --export-dir before the run starts (exits on refusal): it needs a
+    --run-dir (where station-run.json is emitted) and an --export-task (the manifest
+    names its task), must live OUTSIDE the operator's git tree, and any stale manifest
+    is removed so no earlier export survives as this run's result."""
+    from . import export as ex
+    if not run_dir:
+        print("Error: --export-dir requires --run-dir (the exported station-run.json "
+              "is emitted there).", file=sys.stderr)
+        sys.exit(1)
+    if not task_id:
+        print("Error: --export-dir requires --export-task (the export manifest names "
+              "the task it belongs to).", file=sys.stderr)
+        sys.exit(1)
+    d = Path(export_dir).resolve()
+    root = _git_toplevel()
+    if d == root or root in d.parents:
+        print(f"Error: --export-dir ({d}) is INSIDE the git working tree ({root}). "
+              f"An export must live OUTSIDE the tree it describes.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        ex.clear_export(d)
+    except OSError as e:
+        print(f"Error: cannot clear a stale export manifest in {d}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def _export(run: _RunWorktree, export_dir: str, run_dir: str, spec: str,
+            acceptance: str, gate_bytes: bytes | None, task_id: str,
+            round_index: int) -> tuple[str | None, str | None]:
+    """Write a PASSED run's export. Returns (error, manifest digest); on error no
+    manifest is published, so the directory is not acceptable."""
+    import uuid
+    from . import checkpoint as ck
+    from . import export as ex
+    from . import station_run as sr
+    err, tree, patch = run.change()
+    if err is not None:
+        return err, None
+    try:
+        if gate_bytes is None:
+            raise OSError("the run's gate bytes were not captured")
+        roots = run._git("rev-list", "--max-parents=0", run.base, cwd=str(run.root))
+        if roots.returncode != 0:
+            raise OSError(f"cannot read the repository's root commits: "
+                          f"{roots.stderr.decode()[:300]}")
+        # codex r1 MAJOR: a basename plus root commits cannot distinguish a repository
+        # from a FORK checked out under the same directory name, and part 3's delivery
+        # must check the EXPECTED repository. So the manifest records the raw push URL
+        # exactly as git reports it, labelled raw. It is deliberately NOT canonicalised
+        # here: the fleet's one canonicaliser (host/owner/repo, https-only, port-refusing)
+        # lives in the conductor's push_safety, which potluck does not depend on, and a
+        # second copy of a security-relevant parser is the drift reviewgate is vendored
+        # byte-identically to prevent. The consumer canonicalises with that one
+        # implementation; the station reports what it observed.
+        pushed = run._git("remote", "get-url", "--push", "origin", cwd=str(run.root))
+        push_url = (pushed.stdout.decode().strip()
+                    if pushed.returncode == 0 else None)
+        digest = ex.write_export(
+            Path(export_dir), task_id=task_id, run_id=uuid.uuid4().hex,
+            round_index=round_index,
+            repository={"name": run.root.name,
+                        "push_url_raw": push_url,
+                        "root_commits": sorted(roots.stdout.decode().split())},
+            base_commit=run.base, output_tree_oid=tree,
+            output_tree_digest=ck._tree_digest(run.path, tree), patch=patch,
+            station_run_bytes=(Path(run_dir) / sr.STATION_RUN_FILENAME).read_bytes(),
+            spec=spec, acceptance=acceptance, gate_bytes=gate_bytes)
+    except (OSError, ck.CheckpointError, ex.ExportError) as e:
+        # ExportError too (codex r2 MINOR): `_write_atomic` raises it when a temp
+        # NAME cannot be cleared -- e.g. `cumulative.patch.tmp` is a directory --
+        # and it is not an OSError, so it escaped as a traceback instead of the
+        # promised export_failed JSON and human summary.
+        return f"could not write the export to {export_dir}: {e}", None
+    return None, digest
+
+
 def _cmd_fix(args, run: _RunWorktree):
     from . import checkpoint as ck
     # Absolute now: the run executes with cwd inside its own worktree, which is
@@ -793,8 +896,18 @@ def _cmd_fix(args, run: _RunWorktree):
     _art_dir = None
     _art_base = None
     _art_gate = None
+    # Ruling 001 part 1: a run told to export writes a portable result here instead
+    # of delivering into the operator's tree. Resolved now, before any chdir.
+    export_dir = getattr(args, "export_dir", None)
+    if export_dir is not None:
+        export_dir = str(Path(export_dir).resolve())
+    _gate_bytes = None  # the exact gate bytes behind _art_gate, for the export
 
     if resume_dir:
+        if export_dir is not None:
+            print("Error: --export-dir is not supported with --resume (export of a "
+                  "resumed run is not built yet).", file=sys.stderr)
+            sys.exit(1)
         # --- resume path (hardening Step-0 §2): spec/acceptance come from the
         #     persisted run inputs, NOT --spec; the identity is re-verified
         #     fail-closed and the tree restored losslessly before re-entry. ---
@@ -873,6 +986,8 @@ def _cmd_fix(args, run: _RunWorktree):
                       file=sys.stderr)
                 sys.exit(1)
             _refuse_gate_inside_tree(gate_file)
+        if export_dir is not None:
+            _prepare_export_dir(export_dir, run_dir, getattr(args, "export_task", None))
         _require_gate(gate_file)
         # Clean-tree precondition (before the banner): a dead implement attempt
         # leaves partial edits behind, so we start from a known-clean baseline
@@ -898,9 +1013,13 @@ def _cmd_fix(args, run: _RunWorktree):
             if gate_file is not None:
                 gate_path, gate_binding = _freeze_gate(gate_file, run_dir)
                 _art_gate = gate_binding
+                if export_dir is not None:
+                    _gate_bytes = Path(gate_path).read_bytes()
             else:
                 gate_binding = ck.INTREE_GATE_BINDING
                 _art_gate = _digest_gate_file(".claude/verify.sh")
+                if export_dir is not None:
+                    _gate_bytes = Path(".claude/verify.sh").read_bytes()
             checkpointer, cfg_digest, base, manifest_id = _build_checkpointer(
                 run_dir, cfg, spec, acceptance, gate_binding)
             ck.persist_run_inputs(run_dir, spec, acceptance, cfg_digest, base,
@@ -946,11 +1065,27 @@ def _cmd_fix(args, run: _RunWorktree):
     # Deliver ONLY a passed run's change into the operator's tree (see
     # _RunWorktree: on failure nothing is written there). The artifact above
     # attested the run's own output tree -- the worktree -- before delivery.
-    delivery_err = (run.deliver() if result.outcome.value == "passed" else None)
-    run.leave()
-    if delivery_err:
-        print(f"Error: run passed but its change was NOT delivered: {delivery_err}",
-              file=sys.stderr)
+    #
+    # A run told to EXPORT is never delivered: on PASSED its result is written to
+    # the export directory instead, and a passed run whose export cannot be
+    # completed fails (the export is the round's product).
+    export_digest = None
+    if export_dir is not None:
+        delivery_err = None
+        if result.outcome.value == "passed":
+            delivery_err, export_digest = _export(
+                run, export_dir, run_dir, spec, acceptance, _gate_bytes,
+                args.export_task, getattr(args, "export_round", 0))
+        run.leave()
+        if delivery_err:
+            print(f"Error: run passed but its result was NOT exported: {delivery_err}",
+                  file=sys.stderr)
+    else:
+        delivery_err = (run.deliver() if result.outcome.value == "passed" else None)
+        run.leave()
+        if delivery_err:
+            print(f"Error: run passed but its change was NOT delivered: {delivery_err}",
+                  file=sys.stderr)
 
     out = {
         "outcome": result.outcome.value,
@@ -964,14 +1099,37 @@ def _cmd_fix(args, run: _RunWorktree):
         "restore_scope": _restore_scope(run.path, getattr(args, "allow_dirty", False)),
         "debate_log": result.debate_log,
     }
+    # An export run reports its export explicitly. A PASSED station whose export
+    # failed is NOT a passed run: `outcome` says export_failed, and the station's own
+    # verdict is kept separately in `station_outcome`.
+    if export_dir is not None:
+        out["station_outcome"] = result.outcome.value
+        if delivery_err:
+            out["outcome"] = "export_failed"
+            out["export_status"] = "failed"
+            out["export_error"] = delivery_err
+        else:
+            out["export_status"] = ("exported" if export_digest is not None
+                                    else "not_exported")
+        if export_digest is not None:
+            out["export_manifest_digest"] = export_digest
 
     if not (hasattr(args, "json_output") and args.json_output):
         outcome = out["outcome"]
-        symbol = "PASSED" if outcome == "passed" else f"ESCALATED ({outcome})"
+        if outcome == "passed":
+            symbol = "PASSED"
+        elif outcome == "export_failed":
+            symbol = "FAILED (station passed, export failed)"
+        else:
+            symbol = f"ESCALATED ({outcome})"
         print(f"\n{'='*60}")
         print(f"  {symbol}  |  Rounds: {out['rounds_used']}")
         if out["escalation_reason"]:
             print(f"  Reason: {out['escalation_reason']}")
+        if out.get("export_error"):
+            print(f"  Export: NOT exported: {out['export_error']}")
+        elif out.get("export_manifest_digest"):
+            print(f"  Export manifest: {out['export_manifest_digest']}")
         print(f"  Restore scope: {out['restore_scope']}")
         print(f"{'='*60}")
         # Class-closure sweep: only on a PASSED run that found siblings. The
@@ -987,7 +1145,7 @@ def _cmd_fix(args, run: _RunWorktree):
         # stays in --json-output for structured consumers that can tell the keys
         # apart.
         cr = out["closure_report"]
-        if out["outcome"] == "passed" and cr and cr["candidates"]:
+        if result.outcome.value == "passed" and cr and cr["candidates"]:
             print("\nCLASS-CLOSURE SWEEP")
             print(f"  Bug class (model-supplied, unverified): {cr['bug_class']}")
             print("  Harness-verified grep matches -- candidates for you to "
