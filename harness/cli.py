@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
+import hashlib
 import json
 import os
 import sys
@@ -934,10 +935,48 @@ def _export(run: _RunWorktree, export_dir: str, run_dir: str, spec: str,
 _IMPORT_MARKER_NAME = "imported-result.json"
 
 
+def _write_nofollow(path: Path, data: bytes) -> None:
+    """Write `data` to `path`, following NO symlink at that name: the name is unlinked
+    (removing the LINK, never its target) and recreated O_CREAT|O_EXCL|O_NOFOLLOW."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
 def _overlaps(a: str, b: str) -> bool:
     """True if resolved paths `a` and `b` are the same, or one contains the other."""
     pa, pb = Path(a).resolve(), Path(b).resolve()
     return pa == pb or pa in pb.parents or pb in pa.parents
+
+
+def _refuse_links_into_import(import_dir: str, outputs: "dict[str, str | None]") -> None:
+    """Refuse a write destination that REACHES the import through a symlink, even when
+    the directories are disjoint (codex r1 MAJOR). `_overlaps` compares paths, so a
+    pre-created `run1/imported-result.json -> export0/station-run.json` passed it, and
+    the marker write then followed the link and truncated the accepted input artifact
+    before the doer ran. Every existing entry under a destination is checked; the writes
+    this slice adds are also made no-follow, so this is the outer of two defences."""
+    imp = Path(import_dir).resolve()
+    for flag, dest in outputs.items():
+        if dest is None:
+            continue
+        d = Path(dest)
+        if not d.exists() and not d.is_symlink():
+            continue
+        candidates = [d] + (sorted(d.rglob("*")) if d.is_dir() else [])
+        for entry in candidates:
+            if not entry.is_symlink():
+                continue
+            target = Path(os.path.realpath(entry))
+            if target == imp or imp in target.parents:
+                print(f"Error: {flag} contains a symlink that reaches the import "
+                      f"({entry} -> {target}); the import is an input and is never "
+                      f"written to.", file=sys.stderr)
+                sys.exit(1)
 
 
 def _load_import(import_dir: str, outputs: "dict[str, str | None]"
@@ -956,13 +995,24 @@ def _load_import(import_dir: str, outputs: "dict[str, str | None]"
             print(f"Error: --import-dir and {flag} overlap ({import_dir} vs {dest}); the "
                   f"import is an input and is never written to.", file=sys.stderr)
             sys.exit(1)
-    # The cumulative patch is verified against the manifest's declared digest HERE:
-    # load_export checks every payload's bytes, so this is where that check lives.
+    _refuse_links_into_import(import_dir, outputs)
+    # load_export verifies every payload's bytes against the manifest -- but we then
+    # READ the patch again, and the bytes we apply must be the bytes that were
+    # accepted. codex r1 MAJOR: a substitution between the two reads bypassed the
+    # digest check, and the tree-digest argument that used to sit here does NOT close
+    # it -- a substituted patch can produce the attested tree PLUS AN IGNORED FILE,
+    # which `_output_tree_digest` excludes by design while the doer and the gate can
+    # still consume it. `import_restore` would reapply those bytes on every retry too.
+    # So the captured bytes are re-verified against the accepted manifest here.
     try:
         manifest, digest = ex.load_export(Path(import_dir))
-        # Read after verification; a substitution in between cannot pass, because the
-        # applied tree must still digest to the attested output_tree_digest.
         patch = (Path(import_dir) / ex.PATCH_FILENAME).read_bytes()
+        got = hashlib.sha256(patch).hexdigest()
+        want = manifest["payloads"][ex.PATCH_FILENAME]
+        if got != want:
+            raise ex.ExportError(
+                f"{ex.PATCH_FILENAME} changed after the export was accepted "
+                f"(manifest {want}, bytes now {got}); nothing was applied")
     except (ex.ExportError, OSError) as e:
         print(f"Error: import refused (fail-closed): {e}", file=sys.stderr)
         sys.exit(1)
@@ -1157,8 +1207,11 @@ def _cmd_fix(args, run: _RunWorktree):
                                   manifest_id)
             marker = Path(run_dir) / _IMPORT_MARKER_NAME
             if import_digest is not None:
-                marker.write_text(json.dumps({"imported_result_digest": import_digest,
-                                              "import_dir": import_dir}, indent=2))
+                # No-follow (codex r1 MAJOR): a planted link here pointed into the
+                # import and `write_text` followed it, truncating the accepted input.
+                _write_nofollow(marker, json.dumps(
+                    {"imported_result_digest": import_digest,
+                     "import_dir": import_dir}, indent=2).encode())
             else:
                 marker.unlink(missing_ok=True)  # a reused run-dir's stale marker
             _art_dir = run_dir

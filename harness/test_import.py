@@ -320,6 +320,78 @@ def test_run_dir_overlapping_import_refused():
             _check(f"overlap: no worktree survives ({label})", ok, detail)
 
 
+def test_patch_substituted_after_acceptance():
+    """codex r1 MAJOR: load_export verifies the payloads, then _load_import READ the
+    patch again -- so a substitution between the two reads was applied unverified. The
+    tree-digest check does not close it: a substituted patch can produce the attested
+    tree PLUS an ignored file, which the digest excludes by design and the doer and gate
+    can still consume. import_restore would reapply those bytes on every retry."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td).resolve()
+        repo, out0 = _round0(tmp)
+        real_load = ex.load_export
+        swapped = {}
+
+        def load_then_swap(d):
+            out = real_load(d)
+            patch = Path(d) / ex.PATCH_FILENAME
+            swapped["before"] = hashlib.sha256(patch.read_bytes()).hexdigest()
+            # Accepted, then replaced: the attested tree plus an ignored path.
+            patch.write_bytes(patch.read_bytes() + b"\n")
+            swapped["after"] = hashlib.sha256(patch.read_bytes()).hexdigest()
+            return out
+
+        doer = _Doer(lambda: (Path("round1.txt").write_text("r1\n"), "done")[1])
+        try:
+            ex.load_export = load_then_swap
+            code, err = _run_fix(repo, doer, ["--import-dir", str(out0),
+                                              "--run-dir", str(tmp / "run1"),
+                                              "--export-dir", str(tmp / "export1"),
+                                              "--export-task", "t"])
+        finally:
+            ex.load_export = real_load
+        _check("substitution: the bytes actually applied are re-verified",
+               code == 1 and "changed after the export was accepted" in err
+               and swapped.get("after", "") in err,
+               f"code={code} err={err[-400:]}")
+        _check("substitution: the doer never ran", not doer.cwds, f"{doer.cwds}")
+        _check("substitution: nothing reached the operator's tree",
+               not (repo / "round1.txt").exists())
+
+
+def test_link_into_import_refused():
+    """codex r1 MAJOR: `_overlaps` compares PATHS, so disjoint directories passed it --
+    but a pre-created `run-dir/imported-result.json -> <import>/station-run.json` was
+    followed by the marker write, truncating the accepted input artifact before the doer
+    ran."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td).resolve()
+        repo, out0 = _round0(tmp)
+        before = _dir_state(out0)
+        run1 = tmp / "run1"
+        run1.mkdir()
+        os.symlink(out0 / sr.STATION_RUN_FILENAME, run1 / cli._IMPORT_MARKER_NAME)
+        doer = _Doer(lambda: (Path("round1.txt").write_text("r1\n"), "done")[1])
+        code, err = _run_fix(repo, doer, ["--import-dir", str(out0),
+                                          "--run-dir", str(run1),
+                                          "--export-dir", str(tmp / "export1"),
+                                          "--export-task", "t"])
+        _check("link: a symlink from the run-dir into the import is refused by name",
+               code == 1 and "reaches the import" in err,
+               f"code={code} err={err[-400:]}")
+        _check("link: the accepted export's bytes are untouched",
+               _dir_state(out0) == before)
+        try:
+            still_ok, why = ex.load_export(out0)[1] is not None, ""
+        except ex.ExportError as e:
+            # Must REPORT, not raise: without the fold the marker write truncates the
+            # accepted station-run.json and this assertion would abort the whole suite
+            # instead of recording the failure it exists to catch.
+            still_ok, why = False, str(e)
+        _check("link: the import stays acceptable afterwards", still_ok, why)
+        _check("link: the doer never ran", not doer.cwds, f"{doer.cwds}")
+
+
 def test_moved_head_refused():
     """Ruling 001: every round starts at the original base. An empty commit leaves the
     tree digest unchanged, so only the base check can refuse it -- before the doer."""
@@ -368,6 +440,8 @@ def test_doer_commit_still_refused():
 def main() -> bool:
     for t in (test_import_and_chain, test_refusals, test_retry_restores_imported_state,
               test_resume_refused_by_name, test_run_dir_overlapping_import_refused,
+              test_patch_substituted_after_acceptance,
+              test_link_into_import_refused,
               test_moved_head_refused, test_doer_commit_still_refused):
         t()
     ok_all = True
