@@ -11,8 +11,9 @@ On PASSED it writes, into a caller-supplied directory outside the target's git t
   * `spec.txt`, `acceptance.txt`, `gate.sh` — the EXACT inputs whose sha256 are the
     artifact's spec/acceptance/gate digests;
   * `export-manifest.json` — versioned, naming task, run and round, repository identity,
-    the original base commit, the imported-result digest (always an explicit `null`
-    in this slice; import is part 2), the cumulative patch digest, the output tree
+    the original base commit, the imported-result digest (the manifest digest of the
+    result an importing run started from, else an explicit `null`), the cumulative
+    patch digest, the output tree
     OID and digest, the station artifact digest, and every payload's digest under a
     manifest-relative name.
 
@@ -98,10 +99,11 @@ def write_export(out_dir: Path, *, task_id: str, run_id: str, round_index: int,
                  repository: dict,
                  base_commit: str, output_tree_oid: str, output_tree_digest: str,
                  patch: bytes, station_run_bytes: bytes, spec: str, acceptance: str,
-                 gate_bytes: bytes) -> str:
+                 gate_bytes: bytes, imported_result_digest: str | None = None) -> str:
     """Write every payload, then publish the manifest LAST. Returns the manifest digest.
     Spec/acceptance are encoded exactly as `checkpoint.digest_text` hashes them, so each
-    payload's digest is the station artifact's binding for it."""
+    payload's digest is the station artifact's binding for it. `imported_result_digest`
+    is the manifest digest of the result an importing run started from, else None."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     payloads = {
@@ -121,7 +123,8 @@ def write_export(out_dir: Path, *, task_id: str, run_id: str, round_index: int,
         "round": round_index,
         "repository": repository,
         "base_commit": base_commit,
-        "imported_result_digest": None,  # explicit absence: import is part 2
+        # The previous round's MANIFEST digest, or an explicit null for a non-importing run.
+        "imported_result_digest": imported_result_digest,
         "cumulative_patch_digest": _sha(patch),
         "output_tree_oid": output_tree_oid,
         "output_tree_digest": output_tree_digest,
