@@ -808,6 +808,7 @@ class _Lifecycle:
         self.late = False
         self.interrupted_phase: str | None = None
         self.committed = False
+        self._late_recorded = False
         self.task = None
         self.loop = None
         self.progress = None
@@ -849,6 +850,13 @@ class _Lifecycle:
         self.committed = True
         return self.signal is not None and not self.late
 
+    def amend_late(self) -> None:
+        """Record a late signal the terminal `done` record missed."""
+        if self.progress is None or not self.late or self._late_recorded:
+            return
+        self.progress.amend_terminal(late_signal=self.signal)
+        self._late_recorded = True
+
     def finish(self, aborted: bool) -> None:
         if self.progress is None:
             return
@@ -858,8 +866,12 @@ class _Lifecycle:
         else:
             # Read when the record is written, not now: a first signal landing
             # while the heartbeat is joined or the record written is still in it.
-            self.progress.finish("done", fields=lambda: (
-                {"late_signal": self.signal} if self.late else {}))
+            def fields():
+                if self.late:
+                    self._late_recorded = True
+                    return {"late_signal": self.signal}
+                return {}
+            self.progress.finish("done", fields=fields)
 
 
 _LIFE = _Lifecycle()
@@ -931,6 +943,11 @@ def cmd_fix(args):
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+    # A first signal can land after finish() last read its fields and before the
+    # handlers above were restored. The handler can only set the flag (it must not
+    # take the writer's lock), so the record is amended here, in ordinary flow,
+    # once no further signal can reach it (codex review r1 MAJOR).
+    _LIFE.amend_late()
     if aborted:
         if error is not None and not isinstance(error, SystemExit):
             print(f"potluck: while stopping: {type(error).__name__}: {error}",

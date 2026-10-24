@@ -36,6 +36,14 @@ FINALIZING_DEADLINE_SECONDS = 600
 _CALL_FIELDS = ("step", "call_index", "call_started_at", "call_deadline_seconds")
 
 
+def _existing_seq(path: Path) -> int:
+    try:
+        seq = json.loads(path.read_text()).get("seq", 0)
+    except (OSError, ValueError, AttributeError):
+        return 0
+    return seq if isinstance(seq, int) and seq > 0 else 0
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -52,7 +60,9 @@ class ProgressWriter:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._seq = 0
+        # Seeded from any record already in the run dir (a --resume), so `seq`
+        # strictly increases across every write to this path, not per process.
+        self._seq = _existing_seq(self.path)
         self._terminal = False
         self._state: dict = {
             "run_manifest_id": run_manifest_id,
@@ -106,6 +116,16 @@ class ProgressWriter:
                 if fields is None or fields() == now:
                     break
             self._terminal = True
+
+    def amend_terminal(self, **fields) -> None:
+        """Rewrite the terminal record with `fields` added. Only for a fact that
+        became true after `finish()` wrote it (a late signal). Never call it from a
+        signal handler: the handler can interrupt a holder of this lock."""
+        with self._lock:
+            if not self._terminal:
+                return
+            self._state.update(fields)
+            self._write_locked()
 
     # --- state changes (each one is written immediately) ---
 

@@ -151,12 +151,71 @@ def test_writer_failed_rename_keeps_last_record():
             w.call_started("gate", 2, 60)
         finally:
             os.replace = real_replace
+        # Read the bytes ON DISK right after the failed update, before anything else
+        # writes (codex review r1: inspecting `before` alone, after finish(), let a
+        # later successful write repair a destroyed record and stay green).
+        after = (rd / pg.FILENAME).read_bytes()
+        names = sorted(p.name for p in rd.iterdir())
         w.finish("done")
         # Fails if a failed write truncates/partially writes progress.json, leaves
         # its temp file, or raises into the run it reports on.
         _check("writer: a failed rename leaves the previous record whole, no temp",
-               before and json.loads(before)["phase"] == "starting"
-               and sorted(p.name for p in rd.iterdir()) == [pg.FILENAME])
+               after == before and json.loads(after)["phase"] == "starting"
+               and names == [pg.FILENAME], f"{names}")
+
+
+def test_seq_continues_across_writers():
+    with tempfile.TemporaryDirectory() as td:
+        rd = Path(td)
+        w1 = pg.ProgressWriter(rd, run_manifest_id="m", limits={}, heartbeat_seconds=3600)
+        w1.start()
+        w1.set(worktree="/a")
+        w1.finish("done")
+        last = _read(rd / pg.FILENAME)["seq"]
+        # A --resume constructs a second writer over the same run dir.
+        w2 = pg.ProgressWriter(rd, run_manifest_id="m", limits={}, heartbeat_seconds=3600)
+        w2.start()
+        first = _read(rd / pg.FILENAME)["seq"]
+        w2.finish("done")
+        # Fails if a new writer restarts seq at 1 (codex review r1 MINOR), so a
+        # supervisor would read a resumed run's first record as older than the last.
+        _check("writer: seq strictly increases across writers on one run dir",
+               last >= 3 and first == last + 1, f"last={last} first={first}")
+
+
+def test_late_signal_after_finish_is_amended():
+    from harness import cli
+    with tempfile.TemporaryDirectory() as td:
+        rd = Path(td)
+        life = cli._Lifecycle()
+        life.progress = pg.ProgressWriter(rd, run_manifest_id="m", limits={},
+                                          heartbeat_seconds=3600)
+        life.progress.start()
+        life.settle()                      # past the commit boundary
+        life.finish(False)                 # the done record, no signal yet
+        life.on_signal(signal.SIGTERM, None)   # lands in the window after finish()
+        missed = _read(rd / pg.FILENAME)
+        # Control: fails if the window does not exist (the record already carries
+        # the signal), which would make the assertion below vacuous.
+        _check("late-window: the done record misses a signal landing after finish()",
+               missed.get("phase") == "done" and "late_signal" not in missed, f"{missed}")
+        life.amend_late()
+        amended = _read(rd / pg.FILENAME)
+        # Fails if amend_late does not record the late signal (codex review r1 MAJOR),
+        # or rewrites anything but the terminal record.
+        _check("late-window: amend_late records it on the terminal record",
+               amended.get("phase") == "done" and amended.get("late_signal") == "SIGTERM"
+               and amended["seq"] == missed["seq"] + 1, f"{amended}")
+        life.amend_late()
+        # Fails if amending is not idempotent (each call would add a write).
+        _check("late-window: amending twice writes once",
+               _read(rd / pg.FILENAME)["seq"] == amended["seq"])
+    # Fails if cmd_fix does not amend after restoring the handlers: amending
+    # before restoration would leave the same window open.
+    import inspect
+    src = inspect.getsource(cli.cmd_fix)
+    _check("late-window: cmd_fix amends after restoring the handlers",
+           0 < src.find("signal.signal(sig, handler)") < src.find("_LIFE.amend_late()"))
 
 
 def test_heartbeat_while_loop_thread_blocked():
@@ -212,6 +271,7 @@ def test_lifecycle_fields_and_phases():
                        "n_max": cfg.n_max()}
         final = _read(rd / pg.FILENAME)
         ic = seen.get("in_call", {})
+        # Fails if reporting progress changes a no-signal run's outcome (A12).
         _check("lifecycle: run passed unchanged", code == 0, f"code={code} {err[-300:]}")
         # Fails if implement's admission is not reported as in_call with its own
         # timeout, index and step.
@@ -251,6 +311,7 @@ def test_lifecycle_fields_and_phases():
                and all("phase_started_at" in r and "phase_deadline_seconds" in r
                        for r in records if r["phase"] != "done"))
         seqs = [r["seq"] for r in records]
+        # Fails if two writers race (no shared lock) or a write reuses a seq.
         _check("lifecycle: seq strictly increases across the whole run",
                all(b > a for a, b in zip(seqs, seqs[1:])), f"{seqs}")
         # Fails if a no-signal run records a signal or misses its last call.
@@ -306,6 +367,7 @@ def test_late_signal_keeps_publication():
                final["phase"] == "done" and final.get("late_signal") == "SIGTERM"
                and "interrupted_phase" not in final, f"{final}")
         ok, detail = _no_worktree_left(repo)
+        # Fails if a late signal skips cmd_fix's worktree removal.
         _check("late: worktree removed", ok, detail)
 
 
@@ -384,6 +446,8 @@ def test_sigterm_in_call_aborts():
                                   ("abort+export+2nd-signal", True, True)):
         r = _abort_run(export, second)
         f = r["final"]
+        # Precondition, and fails if the station never reports in_call for the real
+        # implement -- every check below would then test a different abort point.
         _check(f"{label}: SIGTERM was sent while in_call on doer:implement",
                r["seen"].get("phase") == "in_call"
                and r["seen"].get("step") == "doer:implement" and r["stub_pids"],
@@ -651,6 +715,8 @@ def main() -> bool:
     for t in (test_exit_3_has_one_producer,
               test_writer_atomic_seq_phases_deadlines,
               test_writer_failed_rename_keeps_last_record,
+              test_seq_continues_across_writers,
+              test_late_signal_after_finish_is_amended,
               test_heartbeat_while_loop_thread_blocked,
               test_lifecycle_fields_and_phases,
               test_bare_fix_writes_no_progress,
