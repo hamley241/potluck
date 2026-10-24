@@ -54,8 +54,12 @@ def _check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def _git(repo: Path, *args: str) -> str:
+    # GIT_OPTIONAL_LOCKS=0: an observation must not WRITE what it observes. `git status`
+    # opportunistically refreshes the index, which would make an index-bytes comparison
+    # in `_operator_state` differ between two readings of an unchanged repository.
     return subprocess.run(["git", *args], cwd=repo, check=True,
-                          capture_output=True, text=True).stdout.strip()
+                          capture_output=True, text=True,
+                          env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}).stdout.strip()
 
 
 def _setup(tmp: Path) -> Path:

@@ -109,3 +109,29 @@ or shared location**, and in any case when part 3 adds delivery's own writes. Tw
 exact class have now been found by review rather than by a gate (part 1's `_write_atomic`, part 2's
 import marker), so the next write into a caller-supplied path should start no-follow rather than
 be retrofitted.
+
+## FU-partial-application-label-overclaims — the refusal HEADER asserts what the footer no longer does
+
+**Status: DECLARED by codex at round 4 of the delivery slice's review (SHIP), non-BLOCKING.** Filed
+rather than folded because round 4 was already a declared overrun of a cap of 3, and I had told the
+reviewer that anything further and non-blocking would be filed. Fixing a one-line string because it
+looks cheap is exactly the drift a declared cap exists to prevent.
+
+**The gap.** `cli._REFUSAL_LABEL["partial_application"]` reads *"PARTIAL APPLICATION -- git apply
+wrote some files and then failed; its write phase is not transactional"*. That kind covers **two**
+shapes: a write that demonstrably happened, and a **re-verification that failed**, where whether
+anything was written is genuinely UNKNOWN. The footer was fixed to distinguish them; the **label one
+line above still asserts that files were written**, on both paths.
+
+**Also named:** `test_unverifiable_after_failure_claims_nothing` asserts the footer does not claim
+"Files WERE written", but does **not** assert anything about the header, so the suite would not catch
+this. Any fix must add that assertion, or it closes the message and leaves the test blind.
+
+**Remedy.** Either a kind-neutral label (*"PARTIAL APPLICATION -- git apply failed during its
+non-transactional write phase"*) with the specifics left to the footer, or two kinds. Extend the
+regression to assert the header on both paths.
+
+**Trip condition: the next touch of the delivery refusal path**, and in any case before the conductor
+relies on these messages to classify a failure — which is the next slice in the ruling's sequence. The
+contract is one layer short of the honesty it claims, and it is the third instance in this contract of
+a message asserting more than it knows.
