@@ -15,16 +15,17 @@ human_only_paths = [
 
 [timeouts]
 # model_call_seconds inherits the code default (300); heavy doer steps get 600
-# from the built-in step-adaptive map (hardening Step-0 §1.1). `round_seconds`
+# (implement 1200, ruling 002 R3) from the built-in step-adaptive map
+# (hardening Step-0 §1.1). `round_seconds`
 # removed (dead key — §7 config hygiene).
 gate_seconds = 300
-feature_seconds = 36150  # = outer_min (C_max 1205 × N_max 30), §1.3 conservative backstop
+feature_seconds = 72150  # = outer_min (C_max 2405 × N_max 30), §1.3 conservative backstop
 
 [debate]
 max_rounds = 2
 use_tiebreaker = true
 
 [escalation]
-retries_before_counting = 1
+retries_before_counting = 0  # one attempt per bounded call (ruling 002 R3)
 timeout_count_threshold = 3
 consecutive_same_step_threshold = 2

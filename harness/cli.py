@@ -142,6 +142,9 @@ def _effective_config_dict(cfg: HarnessConfig) -> dict:
         "fixed_call_budget": cfg.call_budget.fixed_call_budget,
         "per_round_call_budget": cfg.call_budget.per_round_call_budget,
         "max_rounds": cfg.debate.max_rounds,
+        # Ruling 002 R3: the retry policy is a run commitment, so a resume across
+        # a change of it is refused by identity, exactly as a changed timeout is.
+        "retries_before_counting": cfg.escalation.retries_before_counting,
     }
 
 

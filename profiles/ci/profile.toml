@@ -9,21 +9,21 @@ human_only_paths = []
 
 [timeouts]
 # Tighter than interactive -- CI should fail fast, not wait 30 min. CI runs the
-# MOCK suite (no real doer calls), so the built-in 600s doer-step ceilings never
+# MOCK suite (no real doer calls), so the built-in doer-step ceilings never
 # fire here. feature_seconds must satisfy the §1.3 outer bound: with debate off
-# (max_rounds=0) N_max = fixed_call_budget = 14, and C_max = 600×2+5 = 1205, so
-# outer_min = 16870. Set to exactly that -- still a fail-fast backstop for the
+# (max_rounds=0) N_max = fixed_call_budget = 14, and C_max = 1200×2+5 = 2405
+# (doer:implement 1200s, ruling 002 R3), so outer_min = 33670. Set to exactly that -- still a fail-fast backstop for the
 # ~4 bounded calls a debate-disabled CI run actually makes. `round_seconds`
 # removed (dead key — §7 config hygiene).
 model_call_seconds = 90
 gate_seconds = 600
-feature_seconds = 16870
+feature_seconds = 33670
 
 [debate]
 max_rounds = 0
 use_tiebreaker = false
 
 [escalation]
-retries_before_counting = 1
+retries_before_counting = 0  # one attempt per bounded call (ruling 002 R3)
 timeout_count_threshold = 2
 consecutive_same_step_threshold = 2

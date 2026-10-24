@@ -45,3 +45,11 @@ making.
    change is wrong.
 3. The existing config-hardening suites stay green and unedited.
 4. `.claude/verify.sh` stays green.
+
+---
+
+**Superseded in part, 2026-10-23 — ruling 002 R3 (slice: the lease).** The `doer:implement` and
+`feature_seconds` values stated above were facts when this slice landed and are no longer current:
+`doer:implement` is now **1200s** (`apply_fixes` and `respond` stay 600), so `c_max` is **2405**,
+`outer_min` and the default/personal/phi `feature_seconds` are **72150**, and the ci profile's
+`feature_seconds` is **33670**. The text above is left unchanged as the record of this slice.

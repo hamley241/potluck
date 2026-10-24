@@ -48,7 +48,8 @@ class Timeouts:
     # 120s on real work -- the first-customer failure. Slow providers are common.
     model_call_seconds: int = 300
     # Step-adaptive ABSOLUTE per-doer-call bounds (hardening Step-0 §1.1). The
-    # heavy generative doer steps -- which emit a whole code diff -- get 600s;
+    # heavy generative doer steps -- which emit a whole code diff -- get 600s
+    # (implement 1200s since ruling 002 R3, below);
     # bounded responses inherit the 300s default. `resolve_doer_timeout` reads
     # this. Reviewer/tiebreak/gate steps are NOT doer steps and use their own
     # bounds. `--doer-timeout` (potluck fix only) is a UNIFORM override that wins
@@ -63,10 +64,13 @@ class Timeouts:
     # casualty at its FLOOR, and a sibling session hit the same timeout on a real
     # converge (n=3). It reasons over the findings and the diff and writes a
     # substantive reply -- the same shape of work as implement.
-    # Costs nothing: c_max() follows the HEAVIEST step, already 600, so c_max stays
-    # 1205 and outer_min stays 36150 against feature_seconds 36150 (computed).
+    # At the time this cost nothing: c_max() follows the HEAVIEST step, then 600.
+    # RAISED (ruling 002 R3, the lease): `doer:implement` 600 -> 1200 -- one 1200s
+    # attempt replaces two 600s attempts (potluck now resolves
+    # retries_before_counting = 0). c_max = 1200*2+5 = 2405, outer_min = 72150
+    # against feature_seconds 72150 (computed). apply_fixes/respond stay 600.
     doer_step_seconds: dict[str, int] = field(default_factory=lambda: {
-        "doer:implement": 600,
+        "doer:implement": 1200,
         "doer:apply_fixes": 600,
         "doer:respond": 600,
     })
@@ -75,13 +79,13 @@ class Timeouts:
     gate_seconds: int = 300
     # Outer bound on a single feature across all rounds/retries. Set to the
     # computed outer_min = C_max x N_max (hardening Step-0 §1.3): with the default
-    # 600s heaviest step, R=1, delay=5 -> C_max=1205, and N_max=30 -> 36150s
-    # (~10 h). This is a CONSERVATIVE DOMINATING backstop, not an expected
+    # 1200s heaviest step (doer:implement, ruling 002 R3), R=1, delay=5 ->
+    # C_max=2405, and N_max=30 -> 72150s (~20 h). This is a CONSERVATIVE DOMINATING backstop, not an expected
     # runtime (a heavy real 2-round run dispatches ~11 bounded calls); the real
     # protection is the per-step timeout + the pre-dispatch call-budget admission.
     # Delegated default, disclosed in the first run's report, Goutham-overridable
     # (raise/lower alongside the call budget). validate() enforces >= outer_min.
-    feature_seconds: int = 36150
+    feature_seconds: int = 72150
     # The `--doer-timeout` UNIFORM override (potluck fix only). None = unset.
     # When set, it wins over the built-in map for EVERY doer step (§1.1). Set by
     # the CLI edge post-load; validate() is re-run afterward (§1.2) so a value
@@ -274,7 +278,11 @@ class HarnessConfig:
     timeouts: Timeouts = field(default_factory=Timeouts)
     debate: DebateConfig = field(default_factory=DebateConfig)
     call_budget: CallBudget = field(default_factory=CallBudget)
-    escalation: EscalationConfig = field(default_factory=EscalationConfig)
+    # potluck makes exactly ONE attempt per bounded call (ruling 002 R3): a
+    # timed-out call is not transparently retried. potluck-scoped -- harness_core's
+    # EscalationConfig default stays 1 because menu consumes it.
+    escalation: EscalationConfig = field(
+        default_factory=lambda: EscalationConfig(retries_before_counting=0))
     models: Models = field(default_factory=Models)
     diff: DiffConfig = field(default_factory=DiffConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)

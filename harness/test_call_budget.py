@@ -85,16 +85,17 @@ async def main() -> bool:
 
     # --- arithmetic: the ratified formula --------------------------------
     c = HarnessConfig()
-    # C_max = heaviest base (600) * (1+R=1) + delay(5)*R = 1205 at defaults.
-    results["c_max_default"] = (c.timeouts.c_max() == 600 * 2 + 5)
+    # C_max = heaviest base (1200, doer:implement per ruling 002 R3) * (1+R=1)
+    # + delay(5)*R = 2405 at defaults.
+    results["c_max_default"] = (c.timeouts.c_max() == 1200 * 2 + 5 == 2405)
     # N_max = fixed(14) + max_rounds(2) * per_round(8) = 30.
     results["n_max_default"] = (c.n_max() == 14 + 2 * 8)
     results["outer_min_is_product"] = (
         c.outer_min() == c.timeouts.c_max() * c.n_max())
-    # Backoff knobs move C_max: R=2, delay=10, base 600 -> 600*3 + 10*2 = 1820.
+    # Backoff knobs move C_max: R=2, delay=10, base 1200 -> 1200*3 + 10*2 = 3620.
     c.timeouts.max_resume_retries = 2
     c.timeouts.backoff_delay_seconds = 10
-    results["backoff_moves_c_max"] = (c.timeouts.c_max() == 600 * 3 + 10 * 2)
+    results["backoff_moves_c_max"] = (c.timeouts.c_max() == 1200 * 3 + 10 * 2)
     # max_rounds moves N_max.
     c.debate.max_rounds = 3
     results["max_rounds_moves_n_max"] = (c.n_max() == 14 + 3 * 8)

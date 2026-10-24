@@ -21,8 +21,9 @@ def main() -> bool:
     # Default raised 120 -> 300 (§1.1): an UNMAPPED step gets the default.
     results["default_is_300"] = (t.model_call_seconds == 300
                                  and t.resolve_doer_timeout("doer:unknown") == 300)
-    # Built-in step-adaptive map: heavy generative doer steps get 600.
-    results["map_implement_600"] = (t.resolve_doer_timeout("doer:implement") == 600)
+    # Built-in step-adaptive map: heavy generative doer steps get 600, except
+    # implement, raised to 1200 by ruling 002 R3 (the lease).
+    results["map_implement_1200"] = (t.resolve_doer_timeout("doer:implement") == 1200)
     results["map_apply_fixes_600"] = (t.resolve_doer_timeout("doer:apply_fixes") == 600)
     # respond RECLASSIFIED heavy, 300 -> 600 (panel-ruled 2026-10-22 on n=3 real
     # timeouts). This assertion transcribes the map's CLASSIFICATION, not an
