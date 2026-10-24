@@ -248,8 +248,22 @@ def test_retry_restores_imported_state():
         # delivery of an imported candidate was a third delivery path with none of the
         # ruling's required safeguards -- so the run now exports, and the result is
         # delivered explicitly by its manifest digest. The retry claim is unchanged.
-        code, err = _run_fix(repo, doer, ["--import-dir", str(out0),
-                                          "--doer-timeout", "1", *_exporting(tmp)])
+        # AMENDED (ruling 002 R3, the lease): potluck now makes ONE attempt per
+        # bounded call, so there is no in-call retry by default. The restore-before-
+        # each-attempt wiring this test proves still runs whenever a retry policy
+        # allows one, so the run opts back into retries_before_counting = 1.
+        real_build = cli.build_orchestrator
+
+        def build_with_retry(cfg, **kw):
+            orch = real_build(cfg, **kw)
+            orch.cfg.escalation.retries_before_counting = 1
+            return orch
+        cli.build_orchestrator = build_with_retry
+        try:
+            code, err = _run_fix(repo, doer, ["--import-dir", str(out0),
+                                              "--doer-timeout", "1", *_exporting(tmp)])
+        finally:
+            cli.build_orchestrator = real_build
         _check("retry: the run passes after a timed-out attempt", code == 0,
                f"code={code} err={err[-600:]}")
         _check("retry: both attempts start from the imported tree digest (A14)",

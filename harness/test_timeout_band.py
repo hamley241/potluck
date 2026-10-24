@@ -58,6 +58,12 @@ HOW TO MAKE IT RED: add a key to `doer_step_seconds` with a different value, or
 raise one step above the others. The self-checks below do exactly that against
 synthetic configs and require the checker to fail them.
 
+AMENDED (ruling 002 R3, the lease, 2026-10-23): `doer:implement` rises to 1200
+and the others stay 600 -- "the evidence covers implement only". That is the
+explicit distinction the paragraph above asks for, so it is carried in the DATA
+of this suite (`_RULED_ABOVE_BAND`), naming its authority: the band is pinned over
+every OTHER doer step, and the exception must stay at or above it.
+
 Runnable: `python3 -m harness.test_timeout_band`.
 """
 
@@ -74,6 +80,9 @@ PACKAGE = pathlib.Path(__file__).resolve().parent
 # `timeout-band-literal-quote-gap`). A scan that defines the universe must not
 # be narrower than the language that writes it.
 _DOER_LITERAL = re.compile(r"""['"](doer:[A-Za-z0-9_]+)['"]""")
+
+# Doer steps a ruling explicitly lifts ABOVE the shared band, with the authority.
+_RULED_ABOVE_BAND = {"doer:implement": "ruling 002 R3 (the lease)"}
 
 results: dict[str, bool] = {}
 
@@ -110,14 +119,19 @@ def unmapped(used: "set[str]", steps: "dict[str, int]") -> "list[str]":
 def main() -> bool:
     cfg = HarnessConfig()
     steps = cfg.timeouts.doer_step_seconds
+    band = {k: v for k, v in steps.items() if k not in _RULED_ABOVE_BAND}
 
     # --- the band holds over the SHIPPED defaults ---
-    results["doer_steps_exist"] = len(steps) > 0
-    results["every_doer_step_shares_one_ceiling"] = not _off_band(steps)
-    if _off_band(steps):
-        print(f"  off-band steps: {', '.join(_off_band(steps))}")
+    results["doer_steps_exist"] = len(band) > 0
+    results["every_doer_step_shares_one_ceiling"] = not _off_band(band)
+    if _off_band(band):
+        print(f"  off-band steps: {', '.join(_off_band(band))}")
     results["respond_is_at_the_shared_ceiling"] = (
-        steps.get("doer:respond") == max(steps.values()))
+        band.get("doer:respond") == max(band.values()))
+    # The ruled exception sits at or above the band, never below it. Fails if
+    # implement is lowered beneath the shared ceiling.
+    results["ruled_exceptions_not_below_band"] = all(
+        steps.get(k, 0) >= max(band.values()) for k in _RULED_ABOVE_BAND)
 
     # --- NO used step escapes the map into the 300s fallback (codex MAJOR r1) ---
     used = used_doer_steps(PACKAGE)

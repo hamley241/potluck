@@ -71,7 +71,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import NamedTuple
 
-from .config import DiffConfig, HarnessConfig
+from .config import DiffConfig, HarnessConfig, PromptConfig
 # PORTED to harness_core 2026-07-18 (engine extraction, step 1).
 # The local harness/runner.py and its test_runner.py remain until
 # step 4 per the HC1 copy-then-delete ruling — a module and its
@@ -1031,13 +1031,21 @@ def _assemble_prompt(backend, framing: str, diff: str, *, step: str,
                 final_bytes=packed.final_bytes,
                 kept_file_count=len(packed.kept_paths),
                 omitted=[{"path": p, "bytes": b} for p, b in packed.omitted])
+    _log_prompt_size(prompt, step=step, backend_name=backend.name,
+                     delivery=delivery, prompt_cfg=prompt_cfg, log=log)
+    return prompt
+
+
+def _log_prompt_size(prompt: str, *, step: str, backend_name: str,
+                     delivery: str, prompt_cfg, log) -> None:
+    """Log `prompt_size` (and `prompt_large` above the threshold) for the exact
+    prompt sent. Record only: it never alters the prompt or the outcome."""
     size = len(prompt.encode("utf-8"))
-    log("prompt_size", step=step, backend=backend.name, delivery=delivery,
+    log("prompt_size", step=step, backend=backend_name, delivery=delivery,
         bytes=size)
     if size > prompt_cfg.large_prompt_warn_bytes:
-        log("prompt_large", step=step, backend=backend.name, delivery=delivery,
+        log("prompt_large", step=step, backend=backend_name, delivery=delivery,
             bytes=size, threshold=prompt_cfg.large_prompt_warn_bytes)
-    return prompt
 
 
 # Depth cap for _truncate_walk. Log payloads are shallow by construction
@@ -1233,6 +1241,11 @@ class RealDoerClient(DoerClient):
 
     def __init__(self, claude_cmd: str = "claude"):
         self._cmd = claude_cmd
+        # Rewired to the Orchestrator's _log and cfg.prompt in
+        # Orchestrator.__init__ so implement's prompt_size reaches the debate log
+        # (ruling 002 R5); a no-op until then for standalone construction.
+        self._prompt_log = _noop_prompt_log
+        self._prompt_cfg = PromptConfig()
 
     async def implement(self, spec: str, acceptance: str) -> str:
         prompt = (
@@ -1248,6 +1261,9 @@ class RealDoerClient(DoerClient):
             f"unrequested surface, no refactoring beyond what the change needs. "
             f"Make the change now."
         )
+        _log_prompt_size(prompt, step="doer:implement", backend_name=self._cmd,
+                         delivery="stdin", prompt_cfg=self._prompt_cfg,
+                         log=self._prompt_log)
         return await run_subprocess(
             [self._cmd] + self._EDIT_FLAGS, stdin_text=prompt
         )
@@ -1490,6 +1506,8 @@ class Orchestrator:
         # here (not in cli wiring) because the clients are handed to us already
         # constructed, and self.log must exist first.
         self.reviewer._prompt_log = self._log
+        self.doer._prompt_log = self._log
+        self.doer._prompt_cfg = self.cfg.prompt
         if self.tiebreaker is not None:
             self.tiebreaker._prompt_log = self._log
 

@@ -201,10 +201,12 @@ The loop:
 3. **Human escalation on genuine deadlock** — after the cap, the tiebreaker
    adjudicates each still-blocking issue; anything it can't resolve in the doer's
    favor is surfaced to you, never silently decided for a model.
-4. **Timeout-with-escalation on hangs** — every external wait is time-boxed; one
-   timeout retries transparently, repeated timeouts escalate (scattered slowness
-   vs. the same step hanging repeatedly are distinguished). A timeout is **never**
-   a verdict — a timed-out review is "no signal", not "approved".
+4. **Timeout-with-escalation on hangs** — every external wait is time-boxed and
+   makes **one attempt per admitted call** (ruling 002 R3): a timeout escalates as
+   "no signal" rather than retrying invisibly. A retry, where wanted, is an explicit,
+   counted `--resume` of the failed step; a malformed reply's bounded re-prompt is a
+   separate mechanism and is unchanged. A timeout is **never** a verdict — a
+   timed-out review is "no signal", not "approved".
 
 All four are verified in `harness/test_orchestrator.py` (10 cases, no real model
 calls); model resolution in `harness/test_resolve.py` (16 cases); subprocess
