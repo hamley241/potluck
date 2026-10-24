@@ -510,13 +510,64 @@ def test_cleanup_is_skipped_when_the_checkout_restore_fails():
                "Nothing was written" not in err, err[-300:])
 
 
+def test_unverifiable_after_failure_claims_nothing():
+    """codex r3 (non-blocking, folded as a declared overrun): `partial_application` also
+    covers a FAILED re-verification, where whether anything was written is UNKNOWN. The
+    footer asserted "Files WERE written" and pointed at digests that do not exist on that
+    path -- this slice's own defect, restated one layer along."""
+    import harness.station_run as _sr
+    from harness import checkpoint as ck
+    from harness.test_run_worktree import _setup
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td).resolve()
+        repo = _setup(tmp)
+        (repo / "a.txt").write_text("a\n")
+        (repo / "sub").mkdir(); (repo / "sub" / "b.txt").write_text("b\n")
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "base")
+        _git(repo, "remote", "add", "origin", _URL)
+
+        def touch_both():
+            Path("a.txt").write_text("a2\n")
+            Path("sub/b.txt").write_text("b2\n")
+            return "done"
+
+        out0 = tmp / "export0"
+        code, err = _run_fix(repo, _Doer(touch_both), _export_args(tmp, out0))
+        assert code == 0, err[-300:]
+        m, d = ex.load_export(out0)
+        (repo / "sub").chmod(0o500)
+        real, calls = _sr._output_tree_digest, {"n": 0}
+
+        def fail_after_apply(path):
+            calls["n"] += 1
+            if calls["n"] > 1:        # the baseline read succeeds; the post-failure one does not
+                raise ck.CheckpointError("injected: the checkout cannot be re-verified")
+            return real(path)
+
+        try:
+            _sr._output_tree_digest = fail_after_apply
+            code, err, _out = _deliver(repo, out0, d)
+        finally:
+            _sr._output_tree_digest = real
+            (repo / "sub").chmod(0o700)
+        _check("unverifiable: refused as a partial application", code == 1
+               and "PARTIAL APPLICATION" in err, err[-300:])
+        _check("unverifiable: says the state is UNKNOWN and claims nothing about it",
+               "UNKNOWN" in err and "claims nothing" in err, err[-400:])
+        _check("unverifiable: does NOT assert that files were written",
+               "Files WERE written" not in err, err[-300:])
+        _check("unverifiable: does NOT claim nothing was written",
+               "Nothing was written" not in err, err[-300:])
+
+
 def main() -> bool:
     for t in (test_refusals, test_patch_conflict_is_all_or_nothing,
               test_round_trip_and_once, test_import_without_export_refused,
               test_plain_run_still_delivers_directly,
               test_write_phase_failure_is_not_reported_as_nothing_written,
               test_failed_restore_does_not_clean_ignored_operator_files,
-              test_cleanup_is_skipped_when_the_checkout_restore_fails):
+              test_cleanup_is_skipped_when_the_checkout_restore_fails,
+              test_unverifiable_after_failure_claims_nothing):
         t()
     ok_all = True
     for name, ok, detail in _results:

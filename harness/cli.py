@@ -1727,9 +1727,22 @@ def cmd_deliver(args):
         # not by the review. What is known instead is the digests above and whether the
         # restore succeeded.
         if r.kind == "partial_application":
-            lines += ["  Files WERE written before the failure, and the lines above say "
-                      "what the checkout digests to now. No ref was written, the index "
-                      "was not used as scratch, and there was no rebase or overwrite."]
+            # `partial_application` covers TWO shapes, and conflating them would restate
+            # this slice's own defect in a new place (codex r3, non-blocking): a write
+            # that demonstrably happened, and a re-verification that FAILED -- where
+            # whether anything was written is genuinely UNKNOWN and there is no current
+            # digest to point at. The footer must preserve that uncertainty.
+            if "re_verification" in r.observed:
+                lines += ["  Whether anything was written is UNKNOWN: the checkout "
+                          "could not be re-verified after the failure, so this refusal "
+                          "claims nothing about its current state -- inspect it before "
+                          "retrying. No ref was written and the index was not used as "
+                          "scratch."]
+            else:
+                lines += ["  Files WERE written before the failure, and the lines above "
+                          "say what the checkout digests to now. No ref was written, "
+                          "the index was not used as scratch, and there was no rebase "
+                          "or overwrite."]
         else:
             lines += ["  Nothing was written: HEAD, every ref, the index and the working "
                       "tree are as they were. No rebase, no overwrite."]
