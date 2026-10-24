@@ -215,6 +215,9 @@ class BudgetedStepRunner(StepRunner):
         # OR a non-timeout error -- is still counted. Timeout-only bumping left
         # that window open (cumulative dispatches could exceed N_max on resume).
         self.on_admit = None
+        # progress.ProgressWriter | None (ruling 002 R2): told when each call
+        # starts and ends, and of every call-factory invocation.
+        self.progress = None
 
     @property
     def calls_dispatched(self) -> int:
@@ -240,7 +243,22 @@ class BudgetedStepRunner(StepRunner):
         # before its DONE checkpoint (codex round-4 BLOCKING).
         if self.on_admit is not None:
             self.on_admit(self._calls_dispatched)
-        return await super().run(step_name, coro_factory, timeout_seconds)
+        progress = self.progress
+        if progress is None:
+            return await super().run(step_name, coro_factory, timeout_seconds)
+
+        def counted():
+            progress.attempt(step_name)
+            return coro_factory()
+
+        progress.call_started(step_name, self._calls_dispatched, timeout_seconds)
+        try:
+            result = await super().run(step_name, counted, timeout_seconds)
+        except BaseException:
+            progress.call_ended()
+            raise
+        progress.call_ended(step_name if result.ok else None)
+        return result
 
 # Per-string truncation cap. Sized to preserve typical reviewer/doer reasoning
 # in full (a code snippet + a paragraph of prose) while bounding worst-case
@@ -2925,6 +2943,10 @@ class Orchestrator:
 
     def _log(self, event: str, event_version: int = 1, **kw) -> None:
         self.log.append(_pack_event(event, event_version, **kw))
+        # Ruling 002 R5: implement's prompt size also goes in progress.json.
+        if (event == "prompt_size" and kw.get("step") == "doer:implement"
+                and self.runner.progress is not None):
+            self.runner.progress.set(implement_prompt_bytes=kw["bytes"])
 
 
 # --- parsing (tolerant: models may wrap JSON in prose/fences) ---

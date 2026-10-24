@@ -26,6 +26,7 @@ import functools
 import hashlib
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -85,7 +86,8 @@ def build_orchestrator(cfg: HarnessConfig,
                        allow_dirty: bool = False,
                        checkpointer=None,
                        gate_path: str | None = None,
-                       import_restore=None) -> Orchestrator:
+                       import_restore=None,
+                       progress=None) -> Orchestrator:
     """Wire a cfg into a production Orchestrator (real doer/reviewer/tiebreaker,
     real gate, config-bound get_diff, real tree restore). Pure: cfg ->
     Orchestrator, no argparse and no I/O, so a test can build the exact object
@@ -110,7 +112,10 @@ def build_orchestrator(cfg: HarnessConfig,
     imported an attested result: it resets to HEAD and then re-establishes the
     digest-verified imported state, so a retry never discards the previous round's
     work. Restoration stays wired; only its baseline changes. --allow-dirty still
-    drops it, exactly as it drops the ordinary restore."""
+    drops it, exactly as it drops the ordinary restore.
+
+    progress (ruling 002 R2) is the run's ProgressWriter, told of each call's
+    start and end; None (a bare `fix` with no run directory) reports nothing."""
     doer = RealDoerClient()
     reviewer = ReviewerClient(cfg)
     tiebreaker = TiebreakerClient(cfg) if cfg.debate.use_tiebreaker else None
@@ -120,6 +125,7 @@ def build_orchestrator(cfg: HarnessConfig,
     orch = Orchestrator(cfg, doer, reviewer, tiebreaker, run_gate,
                         bound_get_diff(cfg.diff), restore_tree=restore_tree,
                         checkpointer=checkpointer)
+    orch.runner.progress = progress
     if allow_dirty:
         orch._log("tree_hygiene_disabled", allow_dirty=True)
     return orch
@@ -193,15 +199,21 @@ def _refuse_run_dir_inside_tree(run_dir: str) -> None:
         sys.exit(1)
 
 
+def _run_identity(cfg: HarnessConfig, spec: str, acceptance: str):
+    """(config digest, base commit, run manifest id) for this run's inputs."""
+    from . import checkpoint as ck
+    cfg_digest = ck.config_digest(_effective_config_dict(cfg))
+    base = _git_head()
+    return cfg_digest, base, ck.compute_manifest_id(spec, acceptance, cfg_digest, base)
+
+
 def _build_checkpointer(run_dir: str, cfg: HarnessConfig, spec: str,
                         acceptance: str, gate_binding_digest: str):
     """Construct a git-backed Checkpointer for `run_dir` bound to this run's
     identity inputs (hardening Step-0 §2), including the gate binding (conductor §5)."""
     from . import checkpoint as ck
     _refuse_run_dir_inside_tree(run_dir)
-    cfg_digest = ck.config_digest(_effective_config_dict(cfg))
-    base = _git_head()
-    manifest_id = ck.compute_manifest_id(spec, acceptance, cfg_digest, base)
+    cfg_digest, base, manifest_id = _run_identity(cfg, spec, acceptance)
     # Root the snapshot/restore engine at the git WORKING-TREE ROOT, not cwd
     # (codex round-7): from a subdirectory, a cwd-scoped store would miss sibling
     # nested repos (the mandatory submodule refusal) and sibling D-F transitions
@@ -773,14 +785,161 @@ def _resolve_resume_gate(resume_dir: str):
     return None, ck.INTREE_GATE_BINDING
 
 
+# Ruling 002 R1: the exit status of a run stopped by SIGTERM/SIGINT before its
+# commit boundary. No other path exits with it.
+ABORT_EXIT_STATUS = 3
+
+
+class _Aborted(BaseException):
+    """Raised on the loop thread when a latched signal stops the run before the
+    commit boundary. BaseException so no `except Exception` swallows it."""
+
+
+class _Lifecycle:
+    """The process-wide abort latch (ruling 002 R1) and the run's progress
+    writer (R2). The commit boundary is entry to `finalizing`: a signal latched
+    before it stops the run; one received after it is only recorded."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self.signal: str | None = None
+        self.late = False
+        self.interrupted_phase: str | None = None
+        self.committed = False
+        self.task = None
+        self.loop = None
+        self.progress = None
+
+    def on_signal(self, signum, _frame) -> None:
+        # Runs on the main (loop) thread between bytecodes. A repeated signal
+        # sets nothing new, so it cannot interrupt a teardown in progress.
+        if self.signal is not None:
+            return
+        self.signal = signal.Signals(signum).name
+        if self.committed:
+            self.late = True
+            return
+        self.interrupted_phase = (self.progress.phase if self.progress is not None
+                                  else "starting")
+        task, loop = self.task, self.loop
+        if task is not None:
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass  # the loop already closed; the boundary check stops the run
+
+    def check(self) -> None:
+        if self.signal is not None and not self.late:
+            raise _Aborted
+
+    def commit(self) -> None:
+        """Cross the commit boundary, or raise if a signal was latched before it.
+        `committed` is set FIRST so a signal arriving during this check is late."""
+        self.committed = True
+        self.check()
+        if self.progress is not None:
+            self.progress.finalizing()
+
+    def settle(self) -> bool:
+        """Close the latch at the end of the run, on EVERY exit path (a startup
+        refusal, a crash, a failed cleanup): True if a signal was latched before
+        the commit boundary, so the run is aborted. Any later signal is late."""
+        self.committed = True
+        return self.signal is not None and not self.late
+
+    def finish(self, aborted: bool) -> None:
+        if self.progress is None:
+            return
+        if aborted:
+            self.progress.finish("aborted", signal=self.signal,
+                                 interrupted_phase=self.interrupted_phase)
+        else:
+            # Read when the record is written, not now: a first signal landing
+            # while the heartbeat is joined or the record written is still in it.
+            self.progress.finish("done", fields=lambda: (
+                {"late_signal": self.signal} if self.late else {}))
+
+
+_LIFE = _Lifecycle()
+
+
+def _start_progress(run_dir: str, cfg: HarnessConfig, spec: str,
+                    acceptance: str) -> None:
+    """Start `progress.json` and its heartbeat for a run with a run directory,
+    before the run's worktree is created (ruling 002 R2)."""
+    from . import progress
+    *_, manifest_id = _run_identity(cfg, spec, acceptance)
+    limits = {**_effective_config_dict(cfg), "c_max": cfg.timeouts.c_max(),
+              "n_max": cfg.n_max()}
+    _LIFE.progress = progress.ProgressWriter(run_dir, run_manifest_id=manifest_id,
+                                             limits=limits)
+    _LIFE.progress.start()
+
+
+def _run_feature(main):
+    """`asyncio.run(main())` under the abort latch, then cross the commit
+    boundary. A signal latched at any point before the boundary raises _Aborted,
+    so finalization never starts."""
+    async def _guarded():
+        _LIFE.task, _LIFE.loop = asyncio.current_task(), asyncio.get_running_loop()
+        try:
+            _LIFE.check()
+            return await main()
+        finally:
+            _LIFE.task = None
+
+    _LIFE.check()
+    try:
+        result = asyncio.run(_guarded())
+    except (asyncio.CancelledError, _Aborted):
+        if _LIFE.signal is None:
+            raise
+        raise _Aborted from None
+    _LIFE.commit()
+    return result
+
+
 def cmd_fix(args):
     """Run `_cmd_fix` and remove the run's worktree afterwards on EVERY path --
-    pass, escalation, refusal (SystemExit), crash, or Ctrl-C."""
+    pass, escalation, refusal (SystemExit), crash, Ctrl-C or SIGTERM. A signal
+    before the commit boundary exits ABORT_EXIT_STATUS after that removal."""
     run = _RunWorktree()
+    _LIFE.reset()
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous[sig] = signal.signal(sig, _LIFE.on_signal)
+        except ValueError:
+            pass  # not the main thread: no handler can be installed
+    error = None
     try:
-        _cmd_fix(args, run)
+        try:
+            _cmd_fix(args, run)
+        finally:
+            run.remove()
+    except _Aborted:
+        pass
+    except BaseException as e:
+        # A startup refusal, a crash or a failed cleanup: a signal latched before
+        # it still makes this an abort, so the latch decides below.
+        error = e
+    try:
+        aborted = _LIFE.settle()
+        _LIFE.finish(aborted)
     finally:
-        run.remove()
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    if aborted:
+        if error is not None and not isinstance(error, SystemExit):
+            print(f"potluck: while stopping: {type(error).__name__}: {error}",
+                  file=sys.stderr)
+        print(f"potluck: stopped by {_LIFE.signal} during {_LIFE.interrupted_phase}; "
+              f"nothing was published or delivered.", file=sys.stderr)
+        sys.exit(ABORT_EXIT_STATUS)
+    if error is not None:
+        raise error
 
 
 # A model reply is unbounded; persisting it verbatim is a storage and
@@ -1107,7 +1266,9 @@ def _cmd_fix(args, run: _RunWorktree):
             print(f"Error: {dirty_err}", file=sys.stderr)
             sys.exit(1)
         _refuse_run_dir_inside_tree(resume_dir)  # against the OPERATOR's tree
+        _start_progress(resume_dir, cfg, spec, acceptance)
         run.enter()
+        _LIFE.progress.set(worktree=str(run.path))
         checkpointer, *_ = _build_checkpointer(resume_dir, cfg, spec, acceptance,
                                                gate_binding)
         try:
@@ -1126,10 +1287,11 @@ def _cmd_fix(args, run: _RunWorktree):
 
         async def _run():
             orch = build_orchestrator(cfg, allow_dirty=allow_dirty,
-                                      checkpointer=checkpointer, gate_path=gate_path)
+                                      checkpointer=checkpointer, gate_path=gate_path,
+                                      progress=_LIFE.progress)
             return await orch.run_feature(spec, acceptance, resume=resume_ckpt)
 
-        result = asyncio.run(_run())
+        result = _run_feature(_run)
     else:
         # --- fresh path (optionally checkpointed via --run-dir) ---
         if args.spec_file:
@@ -1181,7 +1343,10 @@ def _cmd_fix(args, run: _RunWorktree):
         if run_dir:
             # Validate against the OPERATOR's tree, BEFORE freezing into it.
             _refuse_run_dir_inside_tree(run_dir)
+            _start_progress(run_dir, cfg, spec, acceptance)
         run.enter()
+        if _LIFE.progress is not None:
+            _LIFE.progress.set(worktree=str(run.path))
         import_restore = None
         if import_dir is not None:
             # In the fresh worktree at the operator's HEAD, before the doer and before
@@ -1241,10 +1406,11 @@ def _cmd_fix(args, run: _RunWorktree):
         async def _run():
             orch = build_orchestrator(cfg, allow_dirty=allow_dirty,
                                       checkpointer=checkpointer, gate_path=gate_path,
-                                      import_restore=import_restore)
+                                      import_restore=import_restore,
+                                      progress=_LIFE.progress)
             return await orch.run_feature(spec, acceptance)
 
-        result = asyncio.run(_run())
+        result = _run_feature(_run)
 
     # §4f: emit the station-run artifact (the producer half of the station-provenance
     # chain) for a STATION RUN — one with an out-of-tree run directory (--run-dir or
