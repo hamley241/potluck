@@ -401,11 +401,122 @@ def test_write_phase_failure_is_not_reported_as_nothing_written():
                str(out0) in err and ex.load_export(out0)[1] == d)
 
 
+def test_failed_restore_does_not_clean_ignored_operator_files():
+    """codex r2 MAJOR: the cleanup after a partial apply must be CONDITIONAL. My premise
+    for cleaning -- the baseline proved there were no untracked-non-ignored files, so
+    anything untracked now is the partial apply's -- holds only under the ORIGINAL ignore
+    rules. Here the patch drops a rule from .gitignore and then fails, and the checkout
+    restore fails too, so an unconditional `clean -fd` would run under the half-applied
+    rules and delete an operator file that was ignored at the baseline."""
+    from harness.test_run_worktree import _setup
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td).resolve()
+        repo = _setup(tmp)
+        (repo / ".gitignore").write_text("secret.env\n")
+        (repo / "a.txt").write_text("a\n")
+        (repo / "sub").mkdir()
+        (repo / "sub" / "b.txt").write_text("b\n")
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "base with an ignore rule")
+        _git(repo, "remote", "add", "origin", _URL)
+
+        def drop_the_rule():
+            Path(".gitignore").write_text("# rule removed\n")
+            Path("a.txt").write_text("a2\n")
+            Path("sub/b.txt").write_text("b2\n")
+            return "done"
+
+        out0 = tmp / "export0"
+        code, err = _run_fix(repo, _Doer(drop_the_rule), _export_args(tmp, out0))
+        _check("failed-restore: the round exported", code == 0, f"{code} {err[-300:]}")
+        m, d = ex.load_export(out0)
+        # An operator file that is IGNORED at the baseline, touched by no patch path.
+        (repo / "secret.env").write_text("TOKEN=operator\n")
+        (repo / "sub").chmod(0o500)   # apply fails here, and so does checkout-index
+        try:
+            code, err, _out = _deliver(repo, out0, d)
+        finally:
+            (repo / "sub").chmod(0o700)
+        _check("failed-restore: refused as a partial application", code == 1
+               and "PARTIAL APPLICATION" in err, err[-400:])
+        _check("failed-restore: THE IGNORED OPERATOR FILE SURVIVES",
+               (repo / "secret.env").exists()
+               and (repo / "secret.env").read_text() == "TOKEN=operator\n",
+               "secret.env was deleted by the cleanup")
+        _check("failed-restore: the result is retained", ex.load_export(out0)[1] == d)
+        # OBSERVED, and worth recording: in THIS fixture `checkout-index` SUCCEEDS, so
+        # the skip branch is not what saved the file. `git apply` unlinks and recreates
+        # (needing directory write, which fails), while `checkout-index` writes through
+        # an existing file (which succeeds) -- and it restored `.gitignore` before
+        # reaching the unwritable path, so `clean -fd` ran under the ORIGINAL rules and
+        # left the ignored file alone. The conditional skip is tested directly below, by
+        # injecting the failure that directory permissions cannot produce here.
+        _check("failed-restore: the restore in this fixture actually succeeded",
+               "restore: ok" in err, err[-300:])
+
+
+def test_cleanup_is_skipped_when_the_checkout_restore_fails():
+    """The conditional cleanup itself (codex r2 MAJOR), by fault injection -- directory
+    permissions cannot produce a failing `checkout-index` for `.gitignore`, so the
+    dangerous ordering is unreachable with chmod alone and is injected instead."""
+    import subprocess as _sp
+    from harness.test_run_worktree import _setup
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td).resolve()
+        repo = _setup(tmp)
+        (repo / ".gitignore").write_text("secret.env\n")
+        (repo / "a.txt").write_text("a\n")
+        (repo / "sub").mkdir()
+        (repo / "sub" / "b.txt").write_text("b\n")
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "base")
+        _git(repo, "remote", "add", "origin", _URL)
+
+        def drop_the_rule():
+            Path(".gitignore").write_text("# rule removed\n")
+            Path("a.txt").write_text("a2\n")
+            Path("sub/b.txt").write_text("b2\n")
+            return "done"
+
+        out0 = tmp / "export0"
+        code, err = _run_fix(repo, _Doer(drop_the_rule), _export_args(tmp, out0))
+        assert code == 0, err[-300:]
+        m, d = ex.load_export(out0)
+        (repo / "secret.env").write_text("TOKEN=operator\n")
+        (repo / "sub").chmod(0o500)
+
+        real_run, seen = _sp.run, []
+
+        def fail_checkout(cmd, *a, **kw):
+            if isinstance(cmd, (list, tuple)) and len(cmd) > 1 and cmd[0] == "git":
+                seen.append(cmd[1])
+                if cmd[1] == "checkout-index":
+                    return _sp.CompletedProcess(cmd, 1, b"", b"injected failure")
+            return real_run(cmd, *a, **kw)
+
+        try:
+            _sp.run = fail_checkout
+            code, err, _out = _deliver(repo, out0, d)
+        finally:
+            _sp.run = real_run
+            (repo / "sub").chmod(0o700)
+
+        _check("skip: the restore was attempted and failed", "checkout-index" in seen)
+        _check("skip: `git clean` was NOT run after the failed restore",
+               "clean" not in seen, f"{seen}")
+        _check("skip: the refusal says the cleanup was skipped, and why",
+               "SKIPPED on purpose" in err and "ignored at" in err, err[-500:])
+        _check("skip: THE IGNORED OPERATOR FILE SURVIVES",
+               (repo / "secret.env").read_text() == "TOKEN=operator\n")
+        _check("skip: the refusal does not claim nothing was written",
+               "Nothing was written" not in err, err[-300:])
+
+
 def main() -> bool:
     for t in (test_refusals, test_patch_conflict_is_all_or_nothing,
               test_round_trip_and_once, test_import_without_export_refused,
               test_plain_run_still_delivers_directly,
-              test_write_phase_failure_is_not_reported_as_nothing_written):
+              test_write_phase_failure_is_not_reported_as_nothing_written,
+              test_failed_restore_does_not_clean_ignored_operator_files,
+              test_cleanup_is_skipped_when_the_checkout_restore_fails):
         t()
     ok_all = True
     for name, ok, detail in _results:

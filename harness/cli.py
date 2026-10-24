@@ -1450,7 +1450,15 @@ _REFUSAL_LABEL = {
 
 def _deliver_selected(root: Path, export_dir: Path, digest: str) -> dict:
     """Apply the result at `export_dir` whose manifest digest is `digest` to the operator
-    checkout at `root`, ONCE, or raise `_DeliveryRefused` having written nothing.
+    checkout at `root`, ONCE, or raise `_DeliveryRefused`.
+
+    A refusal writes nothing on every path EXCEPT one, which is named rather than
+    papered over (codex r2 MINOR): `git apply`'s write phase is not transactional, so a
+    failure during it can leave files written. That case refuses as
+    `partial_application`, restores to the verified baseline where it safely can, and
+    reports the digests and whether the restore succeeded. "All-or-nothing" therefore
+    describes `git apply`'s applicability CHECK plus this recovery, not an atomic
+    filesystem write that git does not provide.
 
     THE CONTRACT. Delivery runs no doer, no gate and no review. Every safeguard is
     checked before anything is written, in this order:
@@ -1479,8 +1487,9 @@ def _deliver_selected(root: Path, export_dir: Path, digest: str) -> dict:
          checked in a temp index; and no IGNORED path the change touches exists here
          (ignored files are outside the digest boundary, which is not authorization
          to clobber them).
-      5. `git apply --binary`: working tree only, all-or-nothing. No ref is written
-         and the real index is never used as scratch.
+      5. `git apply --binary`: working tree only. No ref is written and the real index
+         is never used as scratch. On failure the checkout is re-verified rather than
+         assumed clean, and a partial write is named and restored (see above).
 
     A refusal RETAINS the result -- the export directory is the copy, and it is only
     read -- and is never followed by a rebase or an overwrite.
@@ -1644,8 +1653,27 @@ def _deliver_selected(root: Path, export_dir: Path, digest: str) -> dict:
                     "verified unchanged afterwards", {"applies": True},
                     {"git_apply": stderr, "working_tree_digest": after})
             # Partial write. Restore to the verified baseline and say what happened.
-            restored = [git("checkout-index", "-a", "-f"),
-                        git("clean", "-fd", "--quiet")]
+            #
+            # ORDER AND CONDITION ARE LOAD-BEARING (codex r2 MAJOR). `clean -fd` must
+            # run ONLY if `checkout-index` succeeded. My premise for cleaning at all was
+            # that the baseline check proved there were no untracked-non-ignored files,
+            # so anything untracked now is the partial apply's -- but that premise holds
+            # only under the ORIGINAL ignore rules. If the partial apply modified
+            # `.gitignore` (dropping a rule) and the checkout restore then ALSO fails,
+            # `clean -fd` would run under the PARTIALLY APPLIED rules and delete operator
+            # files that were legitimately ignored at baseline -- `.env`, `.venv`, the
+            # very data-loss footgun `real_restore_tree` refuses `-x` to avoid. Those
+            # files need not overlap any patch path. So: no restored ignore rules, no
+            # clean, and say the recovery was incomplete.
+            checkout = git("checkout-index", "-a", "-f")
+            restored = [checkout]
+            if checkout.returncode == 0:
+                restored.append(git("clean", "-fd", "--quiet"))
+            else:
+                restored_note = ("checkout-index FAILED, so the cleanup was SKIPPED on "
+                                 "purpose: with the ignore rules possibly half-applied, "
+                                 "`git clean` could delete files that were ignored at "
+                                 "the baseline")
             try:
                 final = sr._output_tree_digest(root)
             except ck.CheckpointError as e:
@@ -1661,8 +1689,10 @@ def _deliver_selected(root: Path, export_dir: Path, digest: str) -> dict:
                 {"working_tree_digest": want_tree},
                 {"git_apply": stderr, "working_tree_digest_after_apply": after,
                  "working_tree_digest_after_restore": final,
-                 "restore": "ok" if all(r.returncode == 0 for r in restored)
-                            else "a restore command failed"})
+                 "restore": ("ok" if all(r.returncode == 0 for r in restored)
+                             else (restored_note if checkout.returncode != 0
+                                   else "the cleanup failed after a successful "
+                                        "checkout-index"))})
     return {"task_id": manifest["task_id"], "round": manifest["round"],
             "base_commit": base, "output_tree_digest": manifest["output_tree_digest"],
             "delivered_tree_digest": sr._output_tree_digest(root)}
@@ -1690,9 +1720,20 @@ def cmd_deliver(args):
                  f"{r.detail}."]
         lines += [f"  expected {k}: {v}" for k, v in r.expected.items()]
         lines += [f"  observed {k}: {v}" for k, v in r.observed.items()]
-        lines += ["  Nothing was written: HEAD, every ref, the index and the working "
-                  "tree are as they were. No rebase, no overwrite.",
-                  f"  The selected result is RETAINED, unchanged, at {export_dir} "
+        # The "nothing was written" footer is TRUE for every refusal kind except a
+        # partial application, where git's non-transactional write phase had already
+        # written files. Printing it there would be the inaccurate assurance this slice
+        # exists to remove -- found by the fault-injection test for the skipped cleanup,
+        # not by the review. What is known instead is the digests above and whether the
+        # restore succeeded.
+        if r.kind == "partial_application":
+            lines += ["  Files WERE written before the failure, and the lines above say "
+                      "what the checkout digests to now. No ref was written, the index "
+                      "was not used as scratch, and there was no rebase or overwrite."]
+        else:
+            lines += ["  Nothing was written: HEAD, every ref, the index and the working "
+                      "tree are as they were. No rebase, no overwrite."]
+        lines += [f"  The selected result is RETAINED, unchanged, at {export_dir} "
                   f"(manifest digest {args.manifest_digest})."]
         print("\n".join(lines), file=sys.stderr)
         if args.json_output:
