@@ -65,12 +65,27 @@ scratch.
 **byte-identical to pre-invocation**, and the selected result is **retained**. No rebase, no
 overwrite.
 
-**A16.** The refusal states captured **expected-vs-observed** facts, **distinguishes baseline drift
-from patch conflict**, and names **where the retained result is** — in the operator-facing message.
-It never says the tree *"changed during the run"* when it did not.
+**A16. AMENDED — scoped to the digest-bound delivery operation.** *As written this conflicted with
+A3, and the conflict was mine.* The refusal of `potluck deliver` states captured
+**expected-vs-observed** facts, **distinguishes baseline drift from patch conflict**, and names
+**where the retained result is**, in the operator-facing message. `_RunWorktree.deliver()` keeps its
+existing message, because **there it is accurate**: that path is reachable only for a plain run with
+no import and no export (verified — one caller, in the `else` branch of `if export_dir is not None`,
+and `--import-dir` now requires `--export-dir`), and a plain run's base is the HEAD captured when the
+run started, so a failed application means the tree really did change *during* the run. The message is
+wrong only in a fix round, and a fix round now always exports and is delivered by digest.
 
-**A17.** The `mkstemp` unapplied-patch fallback is **gone from the delivery path**: the retained
-export is the copy. A test asserts the refusal names a durable path, not a temp file.
+**A17. AMENDED — scoped the same way.** The `mkstemp` fallback is gone from the **digest-bound
+delivery path**, where the retained export *is* the copy. It **stays** in
+`_RunWorktree.deliver()`, because a plain run has **no export to retain the patch in**, so removing
+it would discard a passed run's work — which A3 forbids. A test asserts the new path's refusal names a
+durable path rather than a temp file.
+
+*Provenance of this amendment:* the run's own reviewer raised the unamended criteria as a MAJOR, the
+doer rejected it with the grep evidence above, and the reviewer conceded (`held_issues: []`). The
+doer argued it in the review log but did not amend here, so I did, having verified each claim against
+the code. Two criteria of mine that contradict each other for one code path is the same unchecked
+absolute as before, wearing a different coat.
 
 ## End to end
 

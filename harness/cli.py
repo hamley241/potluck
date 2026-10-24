@@ -654,7 +654,8 @@ def add_fix_parser(subparsers):
                         "cumulative patch applied to the run's fresh worktree at HEAD, "
                         "and the resulting tree must equal its attested "
                         "output_tree_digest before the doer runs. The directory is "
-                        "only read. Not supported with --resume.")
+                        "only read. Requires --export-dir: the result is delivered "
+                        "later by `potluck deliver`. Not supported with --resume.")
     p.add_argument("--json-output", action="store_true")
     p.add_argument("--log-file", type=str, default=None)
     p.set_defaults(func=cmd_fix)
@@ -1150,6 +1151,15 @@ def _cmd_fix(args, run: _RunWorktree):
                       file=sys.stderr)
                 sys.exit(1)
             _refuse_gate_inside_tree(gate_file)
+        if import_dir is not None and export_dir is None:
+            # Ruling 001 part 3: an importing run delivering directly would be a THIRD
+            # delivery path, landing an imported cumulative candidate with none of
+            # delivery's safeguards. Refused before anything runs.
+            print("Error: --import-dir requires --export-dir. An importing run does not "
+                  "deliver into your tree: run the round with --import-dir and "
+                  "--export-dir, then deliver the accepted result with `potluck deliver "
+                  "--export-dir <dir> --manifest-digest <digest>`.", file=sys.stderr)
+            sys.exit(1)
         if import_dir is not None:
             log_file = getattr(args, "log_file", None)
             import_patch, import_tree_digest, import_digest, import_base = _load_import(
@@ -1393,6 +1403,275 @@ def _cmd_fix(args, run: _RunWorktree):
 
 
 # ---------------------------------------------------------------------------
+# deliver — apply ONE exported result, selected by manifest digest (ruling 001 part 3)
+# ---------------------------------------------------------------------------
+
+def add_deliver_parser(subparsers):
+    p = subparsers.add_parser(
+        "deliver",
+        help="Apply ONE exported result, selected by its manifest digest, to this "
+             "checkout. Runs no doer, no gate and no review.")
+    p.add_argument("--export-dir", type=str, required=True,
+                   help="The directory holding the exported result (`potluck fix "
+                        "--export-dir`). Only read; it locates the result.")
+    p.add_argument("--manifest-digest", type=str, required=True,
+                   help="The sha256 of the result's export-manifest.json -- the "
+                        "result's IDENTITY. A directory whose manifest has any other "
+                        "digest is refused: a pathname alone never authorizes delivery.")
+    p.add_argument("--json-output", action="store_true")
+    p.set_defaults(func=cmd_deliver)
+
+
+class _DeliveryRefused(Exception):
+    """A structured refusal: `kind` says WHICH safeguard refused, `expected`/`observed`
+    are the captured facts. Raised only before anything is written to the checkout."""
+
+    def __init__(self, kind: str, detail: str, expected: dict | None = None,
+                 observed: dict | None = None):
+        super().__init__(detail)
+        self.kind, self.detail = kind, detail
+        self.expected, self.observed = expected or {}, observed or {}
+
+
+_REFUSAL_LABEL = {
+    "selection": "the selected result is not acceptable",
+    "identity": "REPOSITORY IDENTITY mismatch",
+    "baseline_drift": "BASELINE DRIFT -- this checkout is not the clean base the result "
+                      "was built against",
+    "result_invalid": "the result does not reproduce its own attested output",
+    "ignored_obstruction": "IGNORED-PATH OBSTRUCTION -- applying would overwrite an "
+                           "ignored path",
+    "patch_conflict": "PATCH CONFLICT -- the checkout matches the baseline, yet the "
+                      "patch does not apply",
+}
+
+
+def _deliver_selected(root: Path, export_dir: Path, digest: str) -> dict:
+    """Apply the result at `export_dir` whose manifest digest is `digest` to the operator
+    checkout at `root`, ONCE, or raise `_DeliveryRefused` having written nothing.
+
+    THE CONTRACT. Delivery runs no doer, no gate and no review. Every safeguard is
+    checked before anything is written, in this order:
+
+      1. SELECTION -- the directory is accepted by `load_export` (fail-closed) and its
+         manifest digest equals `digest`; the patch bytes applied are the accepted bytes.
+      2. IDENTITY -- `git remote get-url --push origin` and the root commits equal the
+         manifest's `push_url_raw` and `root_commits` EXACTLY. The raw URL carries the
+         weight (a fork shares the root commits); the roots bind against
+         delete-and-recreate, URL reuse and history replacement. A null `push_url_raw`
+         is refused: equality against null is vacuous. `repository.name` is never
+         compared -- a checkout can be renamed. This is conservative evidence
+         continuity, NOT canonical destination comparison (that is the caller's job,
+         with the fleet's one canonicaliser): equivalent URL spellings (`.git`,
+         `user@`) can cause a FALSE refusal, which the operator can recover from.
+      3. THE CAPTURED CLEAN BASELINE -- the clean checkout of `base_commit`, in three
+         parts, none optional: HEAD equals it (the tree half cannot see an empty
+         commit); the REAL index represents its tree, read without refreshing or
+         rewriting it (a temp-index digest cannot see staged changes the working tree
+         reverses); and the working tree digests, on the station's add-A boundary
+         (untracked-non-ignored in, ignored out), to `base_commit^{tree}`. Patch
+         applicability is NOT whole-tree equality: an unrelated foreign edit lets the
+         patch apply and leaves a tree the station never attested -- so it is refused.
+         An `--allow-dirty` export is therefore deliverable only onto the clean base.
+      4. The patch reproduces the attested `output_tree_digest` from `base_commit`,
+         checked in a temp index; and no IGNORED path the change touches exists here
+         (ignored files are outside the digest boundary, which is not authorization
+         to clobber them).
+      5. `git apply --binary`: working tree only, all-or-nothing. No ref is written
+         and the real index is never used as scratch.
+
+    A refusal RETAINS the result -- the export directory is the copy, and it is only
+    read -- and is never followed by a rebase or an overwrite.
+
+    WHAT "ONCE" MEANS. A digest-bound application with a baseline refusal: a second
+    delivery of the same result refuses, because the checkout is no longer the clean
+    base. Durable exactly-once acceptance across retries, crashes, empty patches (which
+    deliver as a no-op and leave the baseline intact) or two different results for one
+    task is NOT promised here -- that is the caller's orchestration, or a future
+    delivery-receipt contract."""
+    import subprocess
+    import tempfile
+    from . import checkpoint as ck
+    from . import export as ex
+    from . import station_run as sr
+
+    def git(*args, env=None, data=None):
+        # GIT_OPTIONAL_LOCKS=0: no opportunistic index refresh may write the real index.
+        return subprocess.run(["git", *args], cwd=str(root), input=data,
+                              env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", **(env or {})},
+                              capture_output=True)
+
+    # 1. Selection.
+    try:
+        manifest, got = ex.load_export(export_dir)
+        patch = (export_dir / ex.PATCH_FILENAME).read_bytes()
+    except (ex.ExportError, OSError) as e:
+        raise _DeliveryRefused("selection", f"the export is refused (fail-closed): {e}")
+    if got != digest:
+        raise _DeliveryRefused(
+            "selection", "the named directory's manifest is not the selected result; a "
+            "pathname alone never authorizes delivery",
+            {"manifest_digest": digest}, {"manifest_digest": got})
+    want_patch = manifest["payloads"][ex.PATCH_FILENAME]
+    if hashlib.sha256(patch).hexdigest() != want_patch:
+        raise _DeliveryRefused(
+            "selection", f"{ex.PATCH_FILENAME} changed after the export was accepted",
+            {"patch_digest": want_patch},
+            {"patch_digest": hashlib.sha256(patch).hexdigest()})
+
+    # 2. Identity.
+    rec = manifest["repository"]
+    want_url, want_roots = rec.get("push_url_raw"), rec.get("root_commits")
+    if not isinstance(want_url, str) or not want_url:
+        raise _DeliveryRefused(
+            "identity", "the manifest records no push_url_raw (origin was unreadable at "
+            "export), so the expected repository cannot be checked -- equality against "
+            "null is vacuous. Give the repository an origin and re-export the round",
+            {"push_url_raw": want_url})
+    if (not isinstance(want_roots, list) or not want_roots
+            or not all(isinstance(r, str) for r in want_roots)):
+        raise _DeliveryRefused("identity", "the manifest records no root_commits",
+                               {"root_commits": want_roots})
+    pushed = git("remote", "get-url", "--push", "origin")
+    roots = git("rev-list", "--max-parents=0", "HEAD")
+    observed = {"push_url_raw": (pushed.stdout.decode().strip()
+                                 if pushed.returncode == 0 else None),
+                "root_commits": (sorted(roots.stdout.decode().split())
+                                 if roots.returncode == 0 else None)}
+    expected = {"push_url_raw": want_url, "root_commits": sorted(want_roots)}
+    if observed != expected:
+        raise _DeliveryRefused(
+            "identity", "this checkout is not the repository the result was exported "
+            "from (exact comparison of recorded evidence; an equivalent URL spelling "
+            "is refused too -- canonical comparison is the caller's)", expected, observed)
+
+    # 3. The captured clean baseline: HEAD, the real index, the working tree.
+    base = manifest["base_commit"]
+    head = git("rev-parse", "--verify", "-q", "HEAD")
+    head = head.stdout.decode().strip() if head.returncode == 0 else None
+    if head != base:
+        raise _DeliveryRefused(
+            "baseline_drift", "HEAD is not the result's base_commit", {"head": base},
+            {"head": head})
+    staged = git("diff-index", "--cached", "--name-status", base)
+    if staged.returncode != 0 or staged.stdout.strip():
+        raise _DeliveryRefused(
+            "baseline_drift", "the real index does not represent base_commit's tree "
+            "(staged changes, even ones the working tree reverses)",
+            {"index_vs_base": "no differences"},
+            {"index_vs_base": (staged.stdout.decode().strip()
+                               if staged.returncode == 0
+                               else f"unverifiable: {staged.stderr.decode()[:200]}")})
+    try:
+        base_tree = git("rev-parse", f"{base}^{{tree}}").stdout.decode().strip()
+        want_tree = ck._tree_digest(root, base_tree)
+        got_tree = sr._output_tree_digest(root)
+    except ck.CheckpointError as e:
+        raise _DeliveryRefused("baseline_drift", f"the working tree is unverifiable: {e}")
+    if got_tree != want_tree:
+        raise _DeliveryRefused(
+            "baseline_drift", "the working tree (tracked + untracked-non-ignored) is not "
+            "base_commit's tree -- whatever changed it, applying would yield a tree the "
+            "station never attested, even if the patch applies",
+            {"working_tree_digest": want_tree}, {"working_tree_digest": got_tree})
+
+    # 4. The patch reproduces the attested output, and obstructs no ignored path.
+    with tempfile.TemporaryDirectory() as td:
+        env = {"GIT_INDEX_FILE": os.path.join(td, "index")}
+        steps = [git("read-tree", base, env=env)]
+        if patch:
+            steps.append(git("apply", "--cached", "--binary", "-", env=env, data=patch))
+        steps.append(git("write-tree", env=env))
+    failed = next((p for p in steps if p.returncode != 0), None)
+    out_tree = steps[-1].stdout.decode().strip()
+    try:
+        out_digest = None if failed else ck._tree_digest(root, out_tree)
+    except ck.CheckpointError as e:
+        failed, out_digest = None, f"unverifiable: {e}"
+    if failed is not None or out_digest != manifest["output_tree_digest"]:
+        raise _DeliveryRefused(
+            "result_invalid", "the result's patch, applied to base_commit, does not "
+            "produce its attested output tree",
+            {"output_tree_digest": manifest["output_tree_digest"]},
+            {"output_tree_digest": (out_digest if failed is None
+                                    else f"patch does not apply to base_commit: "
+                                         f"{failed.stderr.decode().strip()[:300]}")})
+    touched = [p for p in git("diff-tree", "-r", "--no-renames", "--name-only", "-z",
+                              base_tree, out_tree).stdout.decode(
+                                  errors="surrogateescape").split("\0") if p]
+    ignored = [i.rstrip("/") for i in git(
+        "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"
+    ).stdout.decode(errors="surrogateescape").split("\0") if i]
+    hits = sorted({i for i in ignored for p in touched
+                   if p == i or p.startswith(i + "/") or i.startswith(p + "/")})
+    if hits:
+        raise _DeliveryRefused(
+            "ignored_obstruction", "the change writes where an ignored path exists in "
+            "this checkout", {"ignored_paths_in_the_way": []},
+            {"ignored_paths_in_the_way": hits})
+
+    # 5. Apply: working tree only, all-or-nothing.
+    if patch:
+        applied = git("apply", "--binary", "-", data=patch)
+        if applied.returncode != 0:
+            raise _DeliveryRefused(
+                "patch_conflict", "git apply refused the patch and wrote nothing",
+                {"applies": True},
+                {"git_apply": applied.stderr.decode().strip()[:500]})
+    return {"task_id": manifest["task_id"], "round": manifest["round"],
+            "base_commit": base, "output_tree_digest": manifest["output_tree_digest"],
+            "delivered_tree_digest": sr._output_tree_digest(root)}
+
+
+def cmd_deliver(args):
+    """`potluck deliver`: the explicit delivery operation. Never builds an orchestrator,
+    so no model is called; see `_deliver_selected` for the contract."""
+    import subprocess
+    export_dir = Path(args.export_dir).resolve()
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
+                         text=True)
+    out = {"manifest_digest": args.manifest_digest, "retained_result": str(export_dir)}
+    try:
+        if top.returncode != 0:
+            raise _DeliveryRefused("identity", "run `potluck deliver` inside the "
+                                   "operator's git checkout",
+                                   observed={"cwd": os.getcwd()})
+        facts = _deliver_selected(Path(top.stdout.strip()), export_dir,
+                                  args.manifest_digest)
+    except _DeliveryRefused as r:
+        out.update(outcome="refused", refusal_kind=r.kind, reason=r.detail,
+                   expected=r.expected, observed=r.observed)
+        lines = [f"Error: delivery REFUSED -- {_REFUSAL_LABEL.get(r.kind, r.kind)}: "
+                 f"{r.detail}."]
+        lines += [f"  expected {k}: {v}" for k, v in r.expected.items()]
+        lines += [f"  observed {k}: {v}" for k, v in r.observed.items()]
+        lines += ["  Nothing was written: HEAD, every ref, the index and the working "
+                  "tree are as they were. No rebase, no overwrite.",
+                  f"  The selected result is RETAINED, unchanged, at {export_dir} "
+                  f"(manifest digest {args.manifest_digest})."]
+        print("\n".join(lines), file=sys.stderr)
+        if args.json_output:
+            print(json.dumps(out, indent=2))
+        sys.exit(1)
+    ok = facts["delivered_tree_digest"] == facts["output_tree_digest"]
+    out.update(outcome="delivered" if ok else "delivered_unverified", **facts)
+    if args.json_output:
+        print(json.dumps(out, indent=2))
+    elif ok:
+        print(f"potluck: delivered result {args.manifest_digest} (task "
+              f"{facts['task_id']}, round {facts['round']}) onto {facts['base_commit']} "
+              f"as uncommitted change; the tree now matches the attested output "
+              f"{facts['output_tree_digest']}. No ref was written; the index is "
+              f"untouched.")
+    if not ok:
+        print(f"Error: the patch WAS applied, but the tree now digests to "
+              f"{facts['delivered_tree_digest']}, not the attested "
+              f"{facts['output_tree_digest']} -- something changed the checkout during "
+              f"delivery. The result is retained at {export_dir}.", file=sys.stderr)
+    sys.exit(0 if ok else 1)
+
+
+# ---------------------------------------------------------------------------
 # resolve / doctor — model wiring for this machine
 # ---------------------------------------------------------------------------
 
@@ -1517,6 +1796,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="command")
     add_fix_parser(sub)
+    add_deliver_parser(sub)
     add_resolve_parser(sub)
     add_doctor_parser(sub)
     add_setup_parser(sub)

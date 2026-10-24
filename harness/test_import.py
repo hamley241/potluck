@@ -66,8 +66,17 @@ class _Seeing(_Doer):
         return await super().implement(spec, acceptance)
 
 
+def _exporting(tmp: Path) -> list[str]:
+    """Part 3 refuses --import-dir without --export-dir, so every importing run here
+    also exports (to a directory disjoint from the import)."""
+    return ["--run-dir", str(tmp / "run1"), "--export-dir", str(tmp / "export1"),
+            "--export-task", "t"]
+
+
 def _round0(tmp: Path) -> tuple[Path, Path]:
     repo = _setup_rich(tmp)
+    # An origin, so the export records push_url_raw and its result is deliverable.
+    _git(repo, "remote", "add", "origin", "https://example.invalid/o/repo.git")
     out0 = tmp / "export0"
     code, err = _run_fix(repo, _Doer(_rich_change), _export_args(tmp, out0))
     assert code == 0, err[-600:]
@@ -164,7 +173,7 @@ def _refusal_case(name: str, mutate, *needles: str):
         mutate(out0, bad)
         before, bad_before = _operator_state(repo), _dir_state(bad)
         doer = _Doer(lambda: "x")
-        code, err = _run_fix(repo, doer, ["--import-dir", str(bad)])
+        code, err = _run_fix(repo, doer, ["--import-dir", str(bad), *_exporting(tmp)])
         missing = [n(out0) if callable(n) else n for n in needles]
         missing = [n for n in missing if n not in err]
         _check(f"{name}: refused, naming the reason", code == 1 and not missing,
@@ -233,15 +242,27 @@ def test_retry_restores_imported_state():
         repo, out0 = _round0(tmp)
         want = ex.load_export(out0)[0]["output_tree_digest"]
         doer = _HangOnce()
+        # AMENDED IN PART 3 (deliver-by-digest spec, design point 3), deliberately: this
+        # test used to run `--import-dir` alone and assert the run DELIVERED both rounds'
+        # work directly. Part 3 refuses an importing run without --export-dir -- direct
+        # delivery of an imported candidate was a third delivery path with none of the
+        # ruling's required safeguards -- so the run now exports, and the result is
+        # delivered explicitly by its manifest digest. The retry claim is unchanged.
         code, err = _run_fix(repo, doer, ["--import-dir", str(out0),
-                                          "--doer-timeout", "1"])
+                                          "--doer-timeout", "1", *_exporting(tmp)])
         _check("retry: the run passes after a timed-out attempt", code == 0,
                f"code={code} err={err[-600:]}")
         _check("retry: both attempts start from the imported tree digest (A14)",
                len(doer.seen) == 2 and doer.seen == [want, want], f"{doer.seen}")
+        _check("retry: the importing run delivered NOTHING itself (part 3)",
+               not (repo / "round1.txt").exists())
+        from harness.test_deliver import _deliver
+        code, err, _ = _deliver(repo, tmp / "export1",
+                                ex.load_export(tmp / "export1")[1])
         _check("retry: delivery carries both rounds' work, not the dead attempt",
-               (repo / "feature.txt").exists() and (repo / "round1.txt").exists()
-               and not (repo / "junk.txt").exists())
+               code == 0 and (repo / "feature.txt").exists()
+               and (repo / "round1.txt").exists() and not (repo / "junk.txt").exists(),
+               f"code={code} err={err[-600:]}")
         ok, detail = _no_worktree_left(repo)
         _check("retry: no worktree survives", ok, detail)
 
@@ -274,7 +295,7 @@ def test_resume_refused_by_name():
         def crash():
             raise RuntimeError("doer crashed")
         code, _ = _run_fix(repo, _Doer(crash), ["--import-dir", str(out0),
-                                                "--run-dir", str(run)])
+                                                *_exporting(tmp)])
         _check("resume: the crashed importing run marks its run-dir",
                code == 1 and (run / cli._IMPORT_MARKER_NAME).exists())
         for label, extra in (("without --import-dir", ["--resume", str(run)]),
@@ -305,7 +326,9 @@ def test_run_dir_overlapping_import_refused():
             before, export_before = _operator_state(repo), _dir_state(out0)
             doer = _Doer(lambda: "x")
             code, err = _run_fix(repo, doer, ["--import-dir", str(out0),
-                                              "--run-dir", str(rd)])
+                                              "--run-dir", str(rd),
+                                              "--export-dir", str(tmp / "e"),
+                                              "--export-task", "t"])
             _check(f"overlap: --run-dir {label} --import-dir is refused by name (A11)",
                    code == 1 and "--import-dir and --run-dir overlap" in err,
                    f"code={code} err={err[-400:]}")
@@ -404,7 +427,7 @@ def test_moved_head_refused():
         head = _git(repo, "rev-parse", "HEAD")
         before, export_before = _operator_state(repo), _dir_state(out0)
         doer = _Doer(lambda: "x")
-        code, err = _run_fix(repo, doer, ["--import-dir", str(out0)])
+        code, err = _run_fix(repo, doer, ["--import-dir", str(out0), *_exporting(tmp)])
         _check("base: an import onto a moved HEAD is refused, naming both commits",
                code == 1 and "import refused" in err and head in err and base0 in err
                and "base_commit" in err, f"code={code} err={err[-600:]}")
@@ -428,7 +451,8 @@ def test_doer_commit_still_refused():
             subprocess.run(["git", "commit", "-qm", "doer"], check=True)
             Path("d.txt").write_text("d\n")
             return "done"
-        code, err = _run_fix(repo, _Doer(commit), ["--import-dir", str(out0)])
+        code, err = _run_fix(repo, _Doer(commit), ["--import-dir", str(out0),
+                                                   *_exporting(tmp)])
         _check("commit: an importing run whose doer commits is refused (A17)",
                code == 1 and "the doer COMMITTED in the run's worktree (HEAD moved "
                "off the base)" in err, f"code={code} err={err[-600:]}")
