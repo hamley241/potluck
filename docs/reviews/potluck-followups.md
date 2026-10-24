@@ -135,3 +135,12 @@ regression to assert the header on both paths.
 relies on these messages to classify a failure — which is the next slice in the ruling's sequence. The
 contract is one layer short of the honesty it claims, and it is the third instance in this contract of
 a message asserting more than it knows.
+
+## FU-progress-docstring-resume-read — `progress.py` says it is never read on resume
+
+**Status: OPEN, found 2026-10-23 by codex (NIT, watch-and-stop review r2; no round remained, so
+filed rather than folded).** The module docstring and the slice spec say `progress.json` is "never
+read on resume". Since the r1 fold, a new writer reads the existing record's `seq` only, so `seq`
+strictly increases across a `--resume`. No execution state is recovered. A maintainer trusting the
+docstring could delete the read and reintroduce the reset. **Remedy:** say "only `seq` is recovered;
+no run state is read". **Trip condition:** the next edit to `harness/progress.py`.
