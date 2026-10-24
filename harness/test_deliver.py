@@ -349,10 +349,63 @@ def test_plain_run_still_delivers_directly():
            "Durable exactly-once acceptance" in src and "caller's" in src)
 
 
+def test_write_phase_failure_is_not_reported_as_nothing_written():
+    """codex r1 MAJOR: `git apply` checks applicability BEFORE writing, but its write
+    phase is NOT transactional -- `write_out_one_result`/`write_out_results` in apply.c
+    remove and recreate files sequentially and return on a write error without rolling
+    earlier files back. So a nonzero exit does not prove nothing was written, and
+    reporting `patch_conflict` ("wrote nothing") would be a false assurance in the one
+    message the operator acts on.
+
+    The fixture: two tracked files, the second inside a readable but NON-WRITABLE
+    directory. Every baseline check passes (a directory's mode is not in the tree), the
+    first file is written, the second fails."""
+    from harness.test_run_worktree import _setup
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td).resolve()
+        repo = _setup(tmp)
+        (repo / "a.txt").write_text("a\n")
+        (repo / "sub").mkdir()
+        (repo / "sub" / "b.txt").write_text("b\n")
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "two files")
+        _git(repo, "remote", "add", "origin", _URL)
+
+        def touch_both():
+            Path("a.txt").write_text("a2\n")
+            Path("sub/b.txt").write_text("b2\n")
+            return "done"
+
+        out0 = tmp / "export0"
+        code, err = _run_fix(repo, _Doer(touch_both), _export_args(tmp, out0))
+        _check("write-phase: the two-file round exported", code == 0, f"{code} {err[-300:]}")
+        m, d = ex.load_export(out0)
+        patch = (out0 / ex.PATCH_FILENAME).read_text()
+        _check("write-phase: the patch touches a.txt before sub/b.txt",
+               patch.index("a.txt") < patch.index("sub/b.txt"))
+        before = _operator_state(repo)
+        (repo / "sub").chmod(0o500)
+        try:
+            code, err, _out = _deliver(repo, out0, d)
+        finally:
+            (repo / "sub").chmod(0o700)
+        _check("write-phase: refused", code == 1, f"code={code}")
+        _check("write-phase: NOT reported as patch_conflict / 'wrote nothing'",
+               "wrote nothing" not in err and "PATCH CONFLICT" not in err, err[-500:])
+        _check("write-phase: named PARTIAL APPLICATION, and says the write phase is "
+               "not transactional",
+               "PARTIAL APPLICATION" in err and "not transactional" in err, err[-500:])
+        _check("write-phase: the restore returned the checkout to the base",
+               _operator_state(repo) == before,
+               "a.txt=%r" % (repo / "a.txt").read_text())
+        _check("write-phase: the result is retained and named",
+               str(out0) in err and ex.load_export(out0)[1] == d)
+
+
 def main() -> bool:
     for t in (test_refusals, test_patch_conflict_is_all_or_nothing,
               test_round_trip_and_once, test_import_without_export_refused,
-              test_plain_run_still_delivers_directly):
+              test_plain_run_still_delivers_directly,
+              test_write_phase_failure_is_not_reported_as_nothing_written):
         t()
     ok_all = True
     for name, ok, detail in _results:

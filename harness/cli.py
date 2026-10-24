@@ -1443,6 +1443,8 @@ _REFUSAL_LABEL = {
                            "ignored path",
     "patch_conflict": "PATCH CONFLICT -- the checkout matches the baseline, yet the "
                       "patch does not apply",
+    "partial_application": "PARTIAL APPLICATION -- git apply wrote some files and then "
+                           "failed; its write phase is not transactional",
 }
 
 
@@ -1610,14 +1612,57 @@ def _deliver_selected(root: Path, export_dir: Path, digest: str) -> dict:
             "this checkout", {"ignored_paths_in_the_way": []},
             {"ignored_paths_in_the_way": hits})
 
-    # 5. Apply: working tree only, all-or-nothing.
+    # 5. Apply: working tree only. `git apply` checks applicability BEFORE writing, but
+    # its write phase is NOT transactional (codex r1 MAJOR, with the upstream sources:
+    # `write_out_one_result` / `write_out_results` in apply.c remove and recreate files
+    # SEQUENTIALLY and return on a write error without rolling earlier files back). So a
+    # nonzero exit does NOT prove nothing was written -- a patch touching two tracked
+    # files whose second lives in a readable but non-writable directory passes every
+    # baseline check and still mutates the first. Reporting that as "wrote nothing"
+    # would be a false assurance in the one message the operator acts on.
+    #
+    # We can tell the two apart, and recover, precisely BECAUSE the baseline was
+    # verified above: the working tree was byte-for-byte `base^{tree}` on the add-A
+    # boundary, so there were no untracked-non-ignored files, and any that exist now
+    # were created by the partial apply.
     if patch:
         applied = git("apply", "--binary", "-", data=patch)
         if applied.returncode != 0:
+            stderr = applied.stderr.decode().strip()[:500]
+            try:
+                after = sr._output_tree_digest(root)
+            except ck.CheckpointError as e:
+                raise _DeliveryRefused(
+                    "partial_application",
+                    "git apply failed and the checkout could not be re-verified, so "
+                    "whether anything was written is UNKNOWN -- inspect it before "
+                    "retrying", {"working_tree_digest": want_tree},
+                    {"git_apply": stderr, "re_verification": f"failed: {e}"})
+            if after == want_tree:
+                raise _DeliveryRefused(
+                    "patch_conflict", "git apply refused the patch, and the checkout is "
+                    "verified unchanged afterwards", {"applies": True},
+                    {"git_apply": stderr, "working_tree_digest": after})
+            # Partial write. Restore to the verified baseline and say what happened.
+            restored = [git("checkout-index", "-a", "-f"),
+                        git("clean", "-fd", "--quiet")]
+            try:
+                final = sr._output_tree_digest(root)
+            except ck.CheckpointError as e:
+                final = f"unverifiable: {e}"
             raise _DeliveryRefused(
-                "patch_conflict", "git apply refused the patch and wrote nothing",
-                {"applies": True},
-                {"git_apply": applied.stderr.decode().strip()[:500]})
+                "partial_application",
+                "git apply wrote SOME files and then failed -- its write phase is not "
+                "transactional. The checkout was restored to the result's base"
+                if final == want_tree else
+                "git apply wrote SOME files and then failed -- its write phase is not "
+                "transactional, AND the restore did not return the checkout to the "
+                "result's base; inspect it before retrying",
+                {"working_tree_digest": want_tree},
+                {"git_apply": stderr, "working_tree_digest_after_apply": after,
+                 "working_tree_digest_after_restore": final,
+                 "restore": "ok" if all(r.returncode == 0 for r in restored)
+                            else "a restore command failed"})
     return {"task_id": manifest["task_id"], "round": manifest["round"],
             "base_commit": base, "output_tree_digest": manifest["output_tree_digest"],
             "delivered_tree_digest": sr._output_tree_digest(root)}

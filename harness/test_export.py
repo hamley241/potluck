@@ -50,7 +50,22 @@ def _check(name: str, cond: bool, detail: str = "") -> None:
 
 def _operator_state(repo: Path) -> dict:
     """Every observable the export must not write: refs, HEAD, index, and the bytes
-    and modes of every file in the working tree (ignored ones included)."""
+    and modes of every file in the working tree (ignored ones included).
+
+    The index is compared by its ACTUAL BYTES (codex MINOR on the delivery slice):
+    `ls-files -s` shows entries, not the stat cache or the index extensions, so a
+    metadata-only index rewrite would pass an assertion labelled "byte-identical". The
+    bytes are read FIRST, before any other git command here -- `git status` can refresh
+    the index itself -- and every git call below runs with GIT_OPTIONAL_LOCKS=0 so no
+    observation in this helper can write what it is observing."""
+    idx = subprocess.run(["git", "rev-parse", "--git-path", "index"], cwd=repo,
+                         capture_output=True, text=True,
+                         env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}).stdout.strip()
+    idx_path = (repo / idx) if not os.path.isabs(idx) else Path(idx)
+    try:
+        index_bytes = hashlib.sha256(idx_path.read_bytes()).hexdigest()
+    except OSError:
+        index_bytes = "absent"
     files = {}
     for p in sorted(repo.rglob("*")):
         if ".git" in p.relative_to(repo).parts:
@@ -61,7 +76,7 @@ def _operator_state(repo: Path) -> dict:
             files[str(p)] = (oct(p.stat().st_mode), hashlib.sha256(p.read_bytes()).hexdigest())
     return {"refs": _git(repo, "for-each-ref"), "head": _git(repo, "rev-parse", "HEAD"),
             "symref": _git(repo, "symbolic-ref", "HEAD"),
-            "index": _git(repo, "ls-files", "-s"),
+            "index": _git(repo, "ls-files", "-s"), "index_bytes": index_bytes,
             "status": _git(repo, "status", "--porcelain", "--ignored", "-uall"),
             "files": files}
 
